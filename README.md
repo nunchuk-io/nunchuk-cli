@@ -181,7 +181,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | `sandbox create` | Create a new group wallet sandbox |
 | `sandbox list` | List sandbox IDs |
 | `sandbox get <id>` | Get sandbox details from server |
-| `sandbox join <id>` | Join an existing sandbox |
+| `sandbox join <id-or-url>` | Join an existing sandbox by ID or URL |
 | `sandbox add-key <id>` | Add a signer key to a slot |
 | `sandbox finalize <id>` | Finalize sandbox into an active wallet |
 | `sandbox delete <id>` | Delete a sandbox |

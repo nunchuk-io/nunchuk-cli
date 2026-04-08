@@ -198,16 +198,17 @@ Get details of a specific sandbox.
 nunchuk sandbox get abc123
 ```
 
-### `nunchuk sandbox join <sandbox-id>`
+### `nunchuk sandbox join <sandbox-id-or-url>`
 
 Join an existing sandbox as a participant.
 
 | Argument | Description |
 |----------|-------------|
-| `<sandbox-id>` | Sandbox ID (shared by the sandbox creator) |
+| `<sandbox-id-or-url>` | Sandbox ID or join URL |
 
 ```bash
 nunchuk sandbox join abc123
+nunchuk sandbox join https://nunchuk.io/join/abc123
 ```
 
 ### `nunchuk sandbox add-key <sandbox-id>`
@@ -699,12 +700,15 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 |--------|----------|-------------|
 | `--wallet <wallet-id>` | Yes | Wallet ID |
 | `--to <address>` | Yes | Recipient Bitcoin address |
-| `--amount <satoshis>` | Yes | Amount in satoshis |
+| `--amount <value>` | Yes | Amount to send (default unit: sat) |
+| `--currency <code>` | No | Currency for amount. Supports BTC, USD, and fiat codes |
 
 Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback).
 
 ```bash
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000
+nunchuk tx create --wallet w123 --to bc1q... --amount 0.001 --currency BTC
+nunchuk tx create --wallet w123 --to bc1q... --amount 50 --currency USD
 ```
 
 ### `nunchuk tx sign`
