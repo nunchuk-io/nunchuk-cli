@@ -5,7 +5,7 @@ Command-line interface for Nunchuk group wallet management.
 ## Installation
 
 ```bash
-npm install -g @nunchuk/nunchuk-cli
+npm install -g nunchuk-cli
 ```
 
 This installs the `nunchuk` command globally, available from any directory.
