@@ -4,8 +4,9 @@ import type { ApiClient } from "./api-client.js";
 import type { Network } from "./config.js";
 import type { WalletData } from "./storage.js";
 import { encryptWalletPayload, decryptWalletPayload } from "./wallet-keys.js";
-import { deriveMultisigPayment } from "./address.js";
-import { parseSignerDescriptor } from "./descriptor.js";
+import { deriveDescriptorPayment, deriveMultisigPayment } from "./address.js";
+import { parseDescriptor, parseSignerDescriptor } from "./descriptor.js";
+import { selectMiniscriptSpendingPlan } from "./miniscript-spend.js";
 
 export type SpendingLimitInterval = "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY";
 
@@ -35,6 +36,7 @@ export interface PlatformKeyPolicies {
 
 export interface PlatformKeyConfig {
   policies: PlatformKeyPolicies;
+  slots?: string[];
 }
 
 const VALID_INTERVALS: SpendingLimitInterval[] = ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
@@ -338,6 +340,19 @@ export async function fetchBackendPubkey(client: ApiClient): Promise<string> {
 // BIP125 RBF max sequence (matches Bitcoin Core's createpsbt with replaceable=true)
 const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
 
+function getDummyTxSequenceAndLockTime(wallet: WalletData): { lockTime: number; sequence: number } {
+  const parsed = parseDescriptor(wallet.descriptor);
+  if (parsed.kind !== "miniscript") {
+    return { lockTime: 0, sequence: MAX_BIP125_RBF_SEQUENCE };
+  }
+
+  const plan = selectMiniscriptSpendingPlan(parsed.miniscript!);
+  return {
+    lockTime: plan.lockTime,
+    sequence: plan.sequence || MAX_BIP125_RBF_SEQUENCE,
+  };
+}
+
 // Create a dummy PSBT for dummy transaction signing.
 // Reference: GetHealthCheckDummyTx (nunchukutils.cpp:733-781)
 //
@@ -351,7 +366,9 @@ export function createDummyPsbt(
   requestBody: string,
   network: Network,
 ): Transaction {
+  const parsed = parseDescriptor(wallet.descriptor);
   const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
+  const { lockTime, sequence } = getDummyTxSequenceAndLockTime(wallet);
 
   // Step 1: SHA256(requestBody) → fake txid for Tx1's input
   const bodyBytes = new TextEncoder().encode(requestBody);
@@ -359,22 +376,14 @@ export function createDummyPsbt(
   const bodyHash = Buffer.from(hashBytes).toString("hex");
 
   // Step 2: Derive multisig payments at index 1 (Tx1 output / Tx2 input) and index 2 (Tx2 output)
-  const payment1 = deriveMultisigPayment(
-    wallet.signers,
-    wallet.m,
-    wallet.addressType,
-    network,
-    0,
-    1,
-  );
-  const payment2 = deriveMultisigPayment(
-    wallet.signers,
-    wallet.m,
-    wallet.addressType,
-    network,
-    0,
-    2,
-  );
+  const payment1 =
+    parsed.kind === "multisig"
+      ? deriveMultisigPayment(wallet.signers, wallet.m, wallet.addressType, network, 0, 1)
+      : deriveDescriptorPayment(wallet.descriptor, network, 0, 1);
+  const payment2 =
+    parsed.kind === "multisig"
+      ? deriveMultisigPayment(wallet.signers, wallet.m, wallet.addressType, network, 0, 2)
+      : deriveDescriptorPayment(wallet.descriptor, network, 0, 2);
 
   // Step 3: Build Tx1 (fake previous transaction) to compute its txid
   // Uses RBF sequence (0xfffffffd) to match lib's CoreUtils::CreatePsbt(replaceable=true)
@@ -384,14 +393,18 @@ export function createDummyPsbt(
   const prevTxId = prevTx.id;
 
   // Step 4: Build Tx2 (the dummy transaction to be signed)
-  const dummyTx = new Transaction();
+  const dummyTx = new Transaction({
+    lockTime,
+    allowUnknownInputs: parsed.kind === "miniscript",
+    disableScriptCheck: parsed.kind === "miniscript",
+  });
 
   const input: Record<string, unknown> = {
     txid: prevTxId,
     index: 0,
     witnessUtxo: { script: payment1.script, amount: 10150n },
     bip32Derivation: payment1.bip32Derivation,
-    sequence: MAX_BIP125_RBF_SEQUENCE,
+    sequence,
   };
   if (payment1.witnessScript) input.witnessScript = payment1.witnessScript;
   if (payment1.redeemScript) input.redeemScript = payment1.redeemScript;

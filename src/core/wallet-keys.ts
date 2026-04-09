@@ -8,7 +8,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { sha512 } from "@noble/hashes/sha2.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { secretBox, secretOpen } from "./crypto.js";
-import { buildAnyDescriptor } from "./descriptor.js";
+import { buildAnyDescriptorForParsed, parseDescriptor } from "./descriptor.js";
 import type { WalletData } from "./storage.js";
 
 const BIP85_HASH_KEY = "bip-entropy-from-k";
@@ -153,7 +153,7 @@ export async function encryptWalletPayload(
   plaintext: unknown,
 ): Promise<{ version: number; msg: string; sig: string }> {
   const secretboxKey = new Uint8Array(Buffer.from(wallet.secretboxKey, "base64"));
-  const descriptor = buildAnyDescriptor(wallet.signers, wallet.m, wallet.addressType);
+  const descriptor = buildAnyDescriptorForParsed(parseDescriptor(wallet.descriptor));
   const msg = secretBox(JSON.stringify(plaintext), secretboxKey);
   const sig = await signWalletMessage(descriptor, msg);
   return { version: 1, msg, sig };

@@ -137,11 +137,16 @@ export function getWalletId(signers: string[], m: number, addressType: number): 
 // Reference: libnunchuk ParseOutputDescriptors (descriptor.cpp:598-626),
 //            ParseSignerString (descriptor.cpp:386-401)
 
+export type DescriptorKind = "miniscript" | "multisig";
+
 export interface ParsedDescriptor {
+  descriptor: string;
+  kind: DescriptorKind;
   m: number;
   n: number;
   addressType: number; // 3=NATIVE_SEGWIT, 2=NESTED_SEGWIT, 1=LEGACY
   signers: string[]; // ["[xfp/path]xpub", ...] — paths use ' notation
+  miniscript?: string;
 }
 
 // Wrapper prefixes → addressType, ordered longest-first to avoid false matches
@@ -153,6 +158,91 @@ const WRAPPER_PREFIXES: Array<{ prefix: string; suffix: string; addressType: num
 
 // Regex to strip child path suffixes from xpub: /0/*, /*, /<0;1>/*
 const CHILD_PATH_SUFFIX = /(?:\/\d+\/\*|\/\*|\/<[^>]+>\/\*)$/;
+const MINISCRIPT_SIGNER_TOKEN = /\[[0-9a-fA-F]+\/[^\]]*\][^,(){}#\s]+/g;
+
+function normalizeSignerDescriptor(desc: string): string {
+  const s = parseSignerDescriptor(desc.replace(CHILD_PATH_SUFFIX, ""));
+  const xfp = s.masterFingerprint.toLowerCase();
+  const path = formalizePath(s.derivationPath);
+  return `[${xfp}${path}]${s.xpub}`;
+}
+
+function normalizeMiniscriptBody(body: string, childPath: string): string {
+  return body.replace(MINISCRIPT_SIGNER_TOKEN, (match) => {
+    return `${normalizeSignerDescriptor(match)}${childPath}`;
+  });
+}
+
+function extractMiniscriptSigners(body: string): string[] {
+  const matches = body.match(MINISCRIPT_SIGNER_TOKEN) ?? [];
+  const signers: string[] = [];
+  const seen = new Set<string>();
+
+  for (const match of matches) {
+    const signer = normalizeSignerDescriptor(match);
+    if (seen.has(signer)) {
+      continue;
+    }
+    seen.add(signer);
+    signers.push(signer);
+  }
+
+  return signers;
+}
+
+function requireMiniscriptBody(parsed: ParsedDescriptor): string {
+  if (parsed.kind !== "miniscript" || !parsed.miniscript) {
+    throw new Error("Parsed descriptor does not contain a miniscript body");
+  }
+  return parsed.miniscript;
+}
+
+function buildMiniscriptDescriptorBody(
+  miniscript: string,
+  addressType: number,
+  childPath: string,
+): string {
+  if (addressType !== 3) {
+    throw new Error("Only native segwit miniscript descriptors are currently supported");
+  }
+  return `wsh(${normalizeMiniscriptBody(miniscript, childPath)})`;
+}
+
+export function buildWalletDescriptorForParsed(parsed: ParsedDescriptor): string {
+  if (parsed.kind === "multisig") {
+    return buildWalletDescriptor(parsed.signers, parsed.m, parsed.addressType);
+  }
+  return addChecksum(
+    buildMiniscriptDescriptorBody(requireMiniscriptBody(parsed), parsed.addressType, "/<0;1>/*"),
+  );
+}
+
+export function buildAnyDescriptorForParsed(parsed: ParsedDescriptor): string {
+  if (parsed.kind === "multisig") {
+    return buildAnyDescriptor(parsed.signers, parsed.m, parsed.addressType);
+  }
+  return addChecksum(
+    buildMiniscriptDescriptorBody(requireMiniscriptBody(parsed), parsed.addressType, "/*"),
+  );
+}
+
+export function buildExternalDescriptorForParsed(parsed: ParsedDescriptor): string {
+  if (parsed.kind === "multisig") {
+    return buildExternalDescriptor(parsed.signers, parsed.m, parsed.addressType);
+  }
+  return addChecksum(
+    buildMiniscriptDescriptorBody(requireMiniscriptBody(parsed), parsed.addressType, "/0/*"),
+  );
+}
+
+export function getWalletIdForParsed(parsed: ParsedDescriptor): string {
+  if (parsed.kind === "multisig") {
+    return getWalletId(parsed.signers, parsed.m, parsed.addressType);
+  }
+  return descriptorChecksum(
+    buildMiniscriptDescriptorBody(requireMiniscriptBody(parsed), parsed.addressType, "/0/*"),
+  );
+}
 
 /**
  * Parse a descriptor string into wallet components.
@@ -183,6 +273,20 @@ export function parseDescriptor(descriptor: string): ParsedDescriptor {
     }
   }
   if (innerContent === null) {
+    if (body.startsWith("wsh(") && body.endsWith(")")) {
+      const miniscript = normalizeMiniscriptBody(body.slice(4, -1), "/<0;1>/*");
+      const signers = extractMiniscriptSigners(miniscript);
+      return {
+        descriptor: addChecksum(`wsh(${miniscript})`),
+        kind: "miniscript",
+        m: 0,
+        n: signers.length,
+        addressType: 3,
+        signers,
+        miniscript,
+      };
+    }
+
     throw new Error("Could not parse descriptor: unsupported wrapper");
   }
 
@@ -208,7 +312,14 @@ export function parseDescriptor(descriptor: string): ParsedDescriptor {
     signers.push(`[${xfp}${path}]${s.xpub}`);
   }
 
-  return { m, n: signers.length, addressType, signers };
+  return {
+    descriptor: addChecksum(body),
+    kind: "multisig",
+    m,
+    n: signers.length,
+    addressType,
+    signers,
+  };
 }
 
 /** Split sortedmulti inner content by top-level commas (not inside brackets). */
@@ -247,6 +358,9 @@ export async function parseBsmsRecord(
   }
 
   const parsed = parseDescriptor(lines[1]);
+  if (parsed.kind !== "multisig") {
+    throw new Error("Invalid BSMS record: miniscript descriptors are not yet supported");
+  }
 
   if (lines[2] !== "/0/*,/1/*" && lines[2] !== "No path restrictions") {
     throw new Error(`Invalid BSMS record: invalid path restriction "${lines[2]}"`);

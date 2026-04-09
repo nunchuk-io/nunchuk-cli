@@ -5,7 +5,11 @@ import {
   buildAnyDescriptor,
   buildExternalDescriptor,
   buildWalletDescriptor,
+  buildAnyDescriptorForParsed,
+  buildExternalDescriptorForParsed,
+  buildWalletDescriptorForParsed,
   getWalletId,
+  getWalletIdForParsed,
   descriptorChecksum,
   parseSignerDescriptor,
 } from "../descriptor.js";
@@ -21,6 +25,12 @@ const EXTERNAL_DESC = buildExternalDescriptor(TEST_SIGNERS, 2, 3);
 const ANY_DESC = buildAnyDescriptor(TEST_SIGNERS, 2, 3);
 const WALLET_DESC = buildWalletDescriptor(TEST_SIGNERS, 2, 3);
 const WALLET_ID = getWalletId(TEST_SIGNERS, 2, 3);
+const MINISCRIPT_EXTERNAL_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/0/*),pk(${TEST_SIGNERS[1]}/0/*)))`;
+const MINISCRIPT_EXTERNAL_DESC = `${MINISCRIPT_EXTERNAL_BODY}#${descriptorChecksum(MINISCRIPT_EXTERNAL_BODY)}`;
+const MINISCRIPT_ANY_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/*),pk(${TEST_SIGNERS[1]}/*)))`;
+const MINISCRIPT_ANY_DESC = `${MINISCRIPT_ANY_BODY}#${descriptorChecksum(MINISCRIPT_ANY_BODY)}`;
+const MINISCRIPT_WALLET_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/<0;1>/*),pk(${TEST_SIGNERS[1]}/<0;1>/*)))`;
+const MINISCRIPT_WALLET_DESC = `${MINISCRIPT_WALLET_BODY}#${descriptorChecksum(MINISCRIPT_WALLET_BODY)}`;
 
 describe("parseDescriptor", () => {
   it("parses NATIVE_SEGWIT (wsh) descriptor with /0/* child path", () => {
@@ -130,6 +140,27 @@ describe("parseDescriptor", () => {
     expect(signer.masterFingerprint).toBe("534a4a82");
     expect(signer.derivationPath).toBe("");
   });
+
+  it("parses miniscript descriptor and normalizes it to wallet form", () => {
+    const result = parseDescriptor(MINISCRIPT_EXTERNAL_DESC);
+    expect(result.kind).toBe("miniscript");
+    expect(result.addressType).toBe(3);
+    expect(result.m).toBe(0);
+    expect(result.n).toBe(2);
+    expect(result.signers).toEqual(TEST_SIGNERS);
+    expect(result.miniscript).toBe(
+      `and_v(v:pk(${TEST_SIGNERS[0]}/<0;1>/*),pk(${TEST_SIGNERS[1]}/<0;1>/*))`,
+    );
+    expect(result.descriptor).toBe(MINISCRIPT_WALLET_DESC);
+  });
+
+  it("rebuilds miniscript descriptors for wallet, external, and any paths", () => {
+    const result = parseDescriptor(MINISCRIPT_EXTERNAL_DESC);
+    expect(buildWalletDescriptorForParsed(result)).toBe(MINISCRIPT_WALLET_DESC);
+    expect(buildExternalDescriptorForParsed(result)).toBe(MINISCRIPT_EXTERNAL_DESC);
+    expect(buildAnyDescriptorForParsed(result)).toBe(MINISCRIPT_ANY_DESC);
+    expect(getWalletIdForParsed(result)).toBe(descriptorChecksum(MINISCRIPT_EXTERNAL_BODY));
+  });
 });
 
 describe("parseBsmsRecord", () => {
@@ -180,6 +211,11 @@ describe("parseBsmsRecord", () => {
   it("rejects record with too few lines", async () => {
     const content = "BSMS 1.0\nwsh(sortedmulti(2,...))#xxx";
     await expect(parseBsmsRecord(content, "testnet")).rejects.toThrow("at least 4 lines");
+  });
+
+  it("rejects miniscript descriptors in BSMS records", async () => {
+    const content = `BSMS 1.0\n${MINISCRIPT_ANY_DESC}\nNo path restrictions\ntb1qexample`;
+    await expect(parseBsmsRecord(content, "testnet")).rejects.toThrow("miniscript descriptors");
   });
 });
 
