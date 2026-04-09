@@ -1,9 +1,20 @@
 import { publicBox, publicOpen } from "./crypto.js";
-import { buildWalletDescriptor, buildAnyDescriptor, getWalletId } from "./descriptor.js";
+import {
+  buildAnyDescriptorForParsed,
+  buildWalletDescriptorForParsed,
+  getWalletIdForParsed,
+} from "./descriptor.js";
+import type { ParsedDescriptor } from "./descriptor.js";
 import { deriveRootKeyFromDescriptor, deriveSecretboxKey, deriveGID } from "./wallet-keys.js";
 import type { Network } from "./config.js";
 import type { PlatformKeyPolicies, PlatformKeyConfig } from "./platform-key.js";
 import { ADDRESS_TYPE_TO_NUMBER, type AddressType } from "./address-type.js";
+import {
+  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  miniscriptTemplateToMiniscript,
+  parseSignerNames,
+  validateMiniscriptTemplate,
+} from "./miniscript.js";
 import { isRecord } from "./utils.js";
 
 const VERSION = 1;
@@ -33,10 +44,21 @@ export function buildCreateGroupBody(
   addressType: AddressType,
   ephemeralPub: string,
   ephemeralPriv: string,
+  miniscriptTemplate = "",
 ): string {
+  const resolvedAddressType = ADDRESS_TYPE_TO_NUMBER[addressType];
+  const normalizedTemplate = miniscriptTemplate.trim();
+  let resolvedM = m;
+  let resolvedN = n;
+  if (normalizedTemplate) {
+    const metadata = getMiniscriptTemplateMetadata(normalizedTemplate, resolvedAddressType);
+    resolvedM = metadata.keypathM;
+    resolvedN = metadata.slotNames.length;
+  }
+
   // Build signers array — "[]" is the empty placeholder matching C++ SingleSigner::get_descriptor()
   const signers: string[] = [];
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < resolvedN; i++) {
     signers.push("[]");
   }
 
@@ -46,11 +68,11 @@ export function buildCreateGroupBody(
   state[ephemeralPub] = publicBox(plaintext, ephemeralPub, ephemeralPriv, ephemeralPub);
 
   const pubstate = {
-    m,
-    n,
-    addressType: ADDRESS_TYPE_TO_NUMBER[addressType],
+    m: resolvedM,
+    n: resolvedN,
+    addressType: resolvedAddressType,
     walletTemplate: 0,
-    miniscriptTemplate: "",
+    miniscriptTemplate: normalizedTemplate,
     name,
     occupied: [] as unknown[],
     added: [] as number[],
@@ -159,14 +181,145 @@ function mergeSigners(base: string[], incoming: string[]): void {
 export interface GroupDisplayState {
   addressType: number;
   added: number[];
+  kind: "miniscript" | "multisig";
   m: number;
+  miniscriptTemplate: string;
   n: number;
   name: string;
   occupied: Array<{ slot: number; ts: number; uid: string }>;
   participants: number;
   signers: string[];
+  slotNames: string[];
   status: string;
+  typeLabel: string;
   url: string;
+}
+
+interface GroupDescriptorMetadata {
+  kind: "miniscript" | "multisig";
+  m: number;
+  miniscriptTemplate: string;
+  n: number;
+  slotNames: string[];
+  typeLabel: string;
+}
+
+function getMiniscriptTemplateMetadata(
+  miniscriptTemplate: string,
+  addressType: number,
+): { keypathM: number; slotNames: string[] } {
+  if (addressType !== MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT) {
+    throw new Error("Only native segwit miniscript sandboxes are supported yet");
+  }
+
+  const validation = validateMiniscriptTemplate(
+    miniscriptTemplate,
+    MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  );
+  if (!validation.ok) {
+    throw new Error(validation.error ?? "Invalid miniscript template");
+  }
+
+  const { keypathM, names } = parseSignerNames(miniscriptTemplate);
+  return { keypathM, slotNames: names };
+}
+
+function getGroupDescriptorMetadata(pubstate: Record<string, unknown>): GroupDescriptorMetadata {
+  const miniscriptTemplate =
+    typeof pubstate.miniscriptTemplate === "string" ? pubstate.miniscriptTemplate.trim() : "";
+
+  if (miniscriptTemplate.length > 0) {
+    const { keypathM, slotNames } = getMiniscriptTemplateMetadata(
+      miniscriptTemplate,
+      Number(pubstate.addressType ?? 0),
+    );
+    return {
+      kind: "miniscript",
+      m: keypathM,
+      miniscriptTemplate,
+      n: slotNames.length,
+      slotNames,
+      typeLabel: "MINISCRIPT",
+    };
+  }
+
+  const m = Number(pubstate.m ?? 0);
+  const n = Number(pubstate.n ?? 0);
+  return {
+    kind: "multisig",
+    m,
+    miniscriptTemplate: "",
+    n,
+    slotNames: Array.from({ length: n }, (_, index) => String(index)),
+    typeLabel: `${m}-of-${n}`,
+  };
+}
+
+function normalizePlatformKeySlots(slots: string[]): string[] {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const slot of slots) {
+    const trimmed = slot.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+
+  return normalized;
+}
+
+function getConfiguredPlatformKeySlots(plaintext: Record<string, unknown>): string[] {
+  return Array.isArray(plaintext.platformKeySlots)
+    ? normalizePlatformKeySlots(
+        plaintext.platformKeySlots.filter((slot): slot is string => typeof slot === "string"),
+      )
+    : [];
+}
+
+function buildParsedDescriptorFromGroup(
+  signers: string[],
+  pubstate: Record<string, unknown>,
+): ParsedDescriptor {
+  const addressType = Number(pubstate.addressType ?? 0);
+  const metadata = getGroupDescriptorMetadata(pubstate);
+
+  if (metadata.kind === "multisig") {
+    return {
+      descriptor: "",
+      kind: "multisig",
+      m: metadata.m,
+      n: metadata.n,
+      addressType,
+      signers,
+    };
+  }
+
+  if (metadata.slotNames.length !== signers.length) {
+    throw new Error("Invalid miniscript signer set");
+  }
+
+  const namedSigners = Object.fromEntries(
+    metadata.slotNames.map((name, index) => [name, signers[index]] as const),
+  );
+  const miniscript = miniscriptTemplateToMiniscript(
+    metadata.miniscriptTemplate,
+    namedSigners,
+    "/<0;1>/*",
+    MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  );
+
+  return {
+    descriptor: "",
+    kind: "miniscript",
+    m: metadata.m,
+    n: metadata.n,
+    addressType,
+    signers,
+    miniscript,
+  };
 }
 
 export function getGroupDisplayState(
@@ -176,9 +329,10 @@ export function getGroupDisplayState(
 ): GroupDisplayState {
   const { data } = getGroupPhaseData(groupJson);
   const pubstate = data.pubstate as Record<string, unknown>;
+  const metadata = getGroupDescriptorMetadata(pubstate);
   const state = (data.state ?? {}) as Record<string, string>;
   const modified = (data.modified ?? {}) as Record<string, Record<string, string>>;
-  const n = Number(pubstate.n ?? 0);
+  const n = metadata.n;
 
   let signers = Array.from({ length: n }, () => "[]");
   const stateSigners = decryptSignerSet(state[ephemeralPub], ephemeralPriv);
@@ -228,13 +382,17 @@ export function getGroupDisplayState(
   return {
     addressType: Number(pubstate.addressType ?? 0),
     added: derivedAdded.length > 0 ? derivedAdded : fallbackAdded,
-    m: Number(pubstate.m ?? 0),
+    kind: metadata.kind,
+    m: metadata.m,
+    miniscriptTemplate: metadata.miniscriptTemplate,
     n,
     name: String(pubstate.name ?? ""),
     occupied,
     participants: Object.keys(state).length,
     signers,
+    slotNames: metadata.slotNames,
     status: String(groupJson.status ?? ""),
+    typeLabel: metadata.typeLabel,
     url: String(groupJson.url ?? ""),
   };
 }
@@ -265,6 +423,10 @@ function updateSignersJson(
   index: number,
   n: number,
 ): string[] {
+  if (index < 0 || index >= n) {
+    throw new Error(`Invalid slot index: ${index}`);
+  }
+
   // Normalize empty slots to "[]" (C++ placeholder)
   const signers = currentSigners.map((s) => (isEmptySigner(s) ? "[]" : s));
   for (const desc of signers) {
@@ -480,21 +642,21 @@ export async function buildFinalizeBody(
   network: Network,
 ): Promise<FinalizeResult> {
   const { signers, pubstate, stateId } = decryptSigners(groupJson, ephemeralPub, ephemeralPriv);
-
-  const m = pubstate.m as number;
-  const n = pubstate.n as number;
-  const addressType = pubstate.addressType as number;
+  const parsed = buildParsedDescriptorFromGroup(signers, pubstate);
+  const m = parsed.m;
+  const n = parsed.n;
+  const addressType = parsed.addressType;
   const name = pubstate.name as string;
 
   // Step 2: Build wallet descriptor (<0;1>/* format for storage/display)
-  const descriptor = buildWalletDescriptor(signers, m, addressType);
+  const descriptor = buildWalletDescriptorForParsed(parsed);
 
   // Step 3: Derive local wallet ID
-  const walletId = getWalletId(signers, m, addressType);
+  const walletId = getWalletIdForParsed(parsed);
 
   // Step 4: Derive BIP32 root key from ANY descriptor (/* format for PBKDF2)
   // Must use DescriptorPath::ANY for backward compatibility with SoftwareSigner
-  const anyDescriptor = buildAnyDescriptor(signers, m, addressType);
+  const anyDescriptor = buildAnyDescriptorForParsed(parsed);
   const rootKey = await deriveRootKeyFromDescriptor(anyDescriptor);
 
   // Step 5: Derive Secretbox key (BIP85)
@@ -527,7 +689,8 @@ export async function buildFinalizeBody(
       n,
       addressType,
       walletTemplate: 0,
-      miniscriptTemplate: "",
+      miniscriptTemplate:
+        typeof pubstate.miniscriptTemplate === "string" ? pubstate.miniscriptTemplate : "",
       name,
       occupied: [],
       added,
@@ -616,25 +779,49 @@ export function buildEnablePlatformKeyBody(
   backendPubkey: string,
   ephemeralPub: string,
   ephemeralPriv: string,
+  requestedSlots: string[] = [],
 ): string {
   const { plaintext, signers, init, state, pubstate, stateId, n, occupied } = decryptInitState(
     groupJson,
     ephemeralPub,
     ephemeralPriv,
   );
+  const metadata = getGroupDescriptorMetadata(pubstate);
+  const slots = normalizePlatformKeySlots(requestedSlots);
 
   if (plaintext.platformKey != null) {
     throw new Error("Platform key is already enabled on this sandbox");
   }
+  if (metadata.kind === "multisig" && slots.length > 0) {
+    throw new Error("Platform key slots must be empty for multisig sandboxes");
+  }
+  if (metadata.kind === "miniscript" && slots.length === 0) {
+    throw new Error("Platform key slots are required for miniscript sandboxes");
+  }
 
-  // Clear last signer slot (reserved for platform key in multisig)
-  const platformIndex = n - 1;
-  signers[platformIndex] = "[]";
-  pubstate.occupied = updateOccupiedJson(occupied, platformIndex);
+  if (metadata.kind === "miniscript") {
+    for (const slot of slots) {
+      if (!metadata.slotNames.includes(slot)) {
+        throw new Error(`Unknown miniscript platform key slot: ${slot}`);
+      }
+    }
+  }
+
+  if (metadata.kind === "multisig") {
+    // Clear last signer slot (reserved for platform key in multisig)
+    const platformIndex = n - 1;
+    signers[platformIndex] = "[]";
+    pubstate.occupied = updateOccupiedJson(occupied, platformIndex);
+  }
 
   // Set platform key in plaintext
   plaintext.signers = signers;
   plaintext.platformKey = { policies: {} };
+  if (slots.length > 0) {
+    plaintext.platformKeySlots = slots;
+  } else {
+    delete plaintext.platformKeySlots;
+  }
 
   const plaintextStr = JSON.stringify(plaintext);
 
@@ -662,15 +849,30 @@ export function buildDisablePlatformKeyBody(
     ephemeralPub,
     ephemeralPriv,
   );
+  const metadata = getGroupDescriptorMetadata(pubstate);
+  const configuredSlots = getConfiguredPlatformKeySlots(plaintext);
 
   if (plaintext.platformKey == null) {
     throw new Error("Platform key is not enabled on this sandbox");
   }
 
-  // Clear last signer slot
-  const platformIndex = n - 1;
-  signers[platformIndex] = "[]";
-  pubstate.occupied = updateOccupiedJson(occupied, platformIndex);
+  if (metadata.kind === "multisig") {
+    // Clear last signer slot
+    const platformIndex = n - 1;
+    signers[platformIndex] = "[]";
+    pubstate.occupied = updateOccupiedJson(occupied, platformIndex);
+  } else {
+    let nextOccupied = occupied;
+    for (const slot of configuredSlots) {
+      const index = metadata.slotNames.indexOf(slot);
+      if (index === -1) {
+        continue;
+      }
+      signers[index] = "[]";
+      nextOccupied = updateOccupiedJson(nextOccupied, index);
+    }
+    pubstate.occupied = nextOccupied;
+  }
 
   // Remove platform key fields
   plaintext.signers = signers;
@@ -742,8 +944,13 @@ export function getGroupPlatformKeyState(
 
     const plaintext = JSON.parse(publicOpen(ciphertext, ephemeralPriv)) as {
       platformKey?: PlatformKeyConfig;
+      platformKeySlots?: string[];
     };
-    return plaintext.platformKey ?? null;
+    if (!plaintext.platformKey) {
+      return null;
+    }
+    const slots = getConfiguredPlatformKeySlots(plaintext);
+    return slots.length > 0 ? { ...plaintext.platformKey, slots } : plaintext.platformKey;
   } catch {
     return null;
   }
@@ -760,17 +967,17 @@ export async function recoverFinalizedGroup(
     ephemeralPub,
     ephemeralPriv,
   );
-
-  const m = pubstate.m as number;
-  const n = pubstate.n as number;
-  const addressType = pubstate.addressType as number;
+  const parsed = buildParsedDescriptorFromGroup(signers, pubstate);
+  const m = parsed.m;
+  const n = parsed.n;
+  const addressType = parsed.addressType;
   const name = pubstate.name as string;
-  const descriptor = buildWalletDescriptor(signers, m, addressType);
-  const anyDescriptor = buildAnyDescriptor(signers, m, addressType);
+  const descriptor = buildWalletDescriptorForParsed(parsed);
+  const anyDescriptor = buildAnyDescriptorForParsed(parsed);
   const rootKey = await deriveRootKeyFromDescriptor(anyDescriptor);
   const secretboxKey = deriveSecretboxKey(rootKey);
   const derivedGid = deriveGID(rootKey, network === "mainnet" ? "mainnet" : "testnet");
-  const derivedWalletId = getWalletId(signers, m, addressType);
+  const derivedWalletId = getWalletIdForParsed(parsed);
 
   if (derivedGid !== gid) {
     throw new Error("Recovered wallet GID does not match finalized group data");

@@ -8,19 +8,33 @@ import { listWallets, loadWallet, removeWallet, saveWallet } from "../core/stora
 import type { WalletData } from "../core/storage.js";
 import { print, printError, printTable, printWalletResult } from "../output.js";
 import {
-  buildWalletDescriptor,
-  buildExternalDescriptor,
-  buildAnyDescriptor,
+  buildWalletDescriptorForParsed,
+  buildExternalDescriptorForParsed,
+  buildAnyDescriptorForParsed,
   parseDescriptor,
   parseBsmsRecord,
 } from "../core/descriptor.js";
 import { buildMultisigConfig, parseMultisigConfig } from "../core/multisig-config.js";
 import { deriveFirstAddress } from "../core/address.js";
+import {
+  MINISCRIPT_ADDRESS_TYPE_ANY,
+  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  MINISCRIPT_ADDRESS_TYPE_TAPROOT,
+  buildMiniscriptDescriptor,
+  type MiniscriptAddressType,
+  validateMiniscriptTemplate,
+} from "../core/miniscript.js";
+import {
+  formatMiniscriptPreimageRequirement,
+  type MiniscriptPreimageRequirement,
+} from "../core/miniscript-preimage.js";
+import { describeMiniscriptSpendingPlans } from "../core/miniscript-spend.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
 import { recoverWallet } from "../core/wallet.js";
 import { ElectrumClient } from "../core/electrum.js";
 import { getNextReceiveAddress, getWalletBalance } from "../core/transaction.js";
 import { formatBtc } from "../core/format.js";
+import { signWalletPsbtWithKey } from "../core/psbt-sign.js";
 import {
   getWalletPlatformKeyConfig,
   buildGlobalPolicyFromFlags,
@@ -57,7 +71,39 @@ function looksLikeMultisigConfig(content: string): boolean {
     /(^|\n)\s*[0-9a-fA-F]{8}\s*:/i.test(content)
   );
 }
+function parseMiniscriptAddressTypeOption(value: string): MiniscriptAddressType {
+  const upper = value.toUpperCase().replace(/-/g, "_");
 
+  if (upper === "ANY") {
+    return MINISCRIPT_ADDRESS_TYPE_ANY;
+  }
+  if (upper === "NATIVE_SEGWIT") {
+    return MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT;
+  }
+  if (upper === "TAPROOT") {
+    return MINISCRIPT_ADDRESS_TYPE_TAPROOT;
+  }
+
+  throw new InvalidArgumentError(
+    `Invalid miniscript address type: ${value}. Use ANY, NATIVE_SEGWIT, or TAPROOT`,
+  );
+}
+
+function parseNonNegativeIntegerOption(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError(`${label} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+function parseMiniscriptTimelockOption(value: string): number {
+  return parseNonNegativeIntegerOption(value, "--locktime");
+}
+
+function parseMiniscriptSequenceOption(value: string): number {
+  return parseNonNegativeIntegerOption(value, "--sequence");
+}
 function formatWalletOutput<T extends { addressType?: number }>(
   wallet: T,
 ):
@@ -73,6 +119,61 @@ function formatWalletOutput<T extends { addressType?: number }>(
     ...wallet,
     addressType: formatAddressType(wallet.addressType),
   };
+}
+
+function parseWalletDescriptor(wallet: WalletData) {
+  return parseDescriptor(wallet.descriptor);
+}
+
+function getWalletTypeLabel(wallet: WalletData): string {
+  return parseWalletDescriptor(wallet).kind === "miniscript"
+    ? "MINISCRIPT"
+    : `${wallet.m}-of-${wallet.n}`;
+}
+
+function toWalletView(wallet: WalletData) {
+  const { gid: _gid, secretboxKey: _secretboxKey, descriptor: _descriptor, ...walletView } = wallet;
+
+  return { ...walletView, typeLabel: getWalletTypeLabel(wallet) };
+}
+
+function formatMiniscriptSignerName(value: string): string {
+  const match = value.match(/^\[([0-9a-fA-F]{8})/);
+  return match ? match[1].toLowerCase() : value;
+}
+
+function printMiniscriptPlanTable(
+  plans: Array<{
+    index: number;
+    supported: boolean;
+    satisfiable: boolean;
+    preimageRequirements: MiniscriptPreimageRequirement[];
+    requiredSignatures: number;
+    lockTime: number;
+    sequence: number;
+    signerNames: string[];
+    unsupportedReason?: string;
+  }>,
+): void {
+  printTable(
+    plans.map((plan) => ({
+      path: plan.index,
+      supported: plan.supported ? "yes" : "no",
+      satisfiable: plan.satisfiable ? "yes" : "no",
+      required: plan.requiredSignatures,
+      lockTime: plan.lockTime,
+      sequence: plan.sequence,
+      preimages:
+        plan.preimageRequirements.length > 0
+          ? plan.preimageRequirements.map(formatMiniscriptPreimageRequirement).join(",")
+          : "(none)",
+      signers:
+        plan.signerNames.length > 0
+          ? plan.signerNames.map(formatMiniscriptSignerName).join(",")
+          : "(none)",
+      reason: plan.unsupportedReason ?? "",
+    })),
+  );
 }
 
 walletCommand
@@ -100,12 +201,11 @@ walletCommand
 
           const results = [];
           for (const w of wallets) {
-            const balance = await getWalletBalance(w, network, electrum);
             results.push({
               walletId: w.walletId,
               name: w.name,
-              type: `${w.m}-of-${w.n}`,
-              balance: formatBtc(balance),
+              type: getWalletTypeLabel(w),
+              balance: formatBtc(await getWalletBalance(w, network, electrum)),
               createdAt: w.createdAt,
             });
           }
@@ -123,7 +223,7 @@ walletCommand
       const results = wallets.map((w) => ({
         walletId: w.walletId,
         name: w.name,
-        type: `${w.m}-of-${w.n}`,
+        type: getWalletTypeLabel(w),
         createdAt: w.createdAt,
       }));
       if (globals.json) {
@@ -153,12 +253,7 @@ walletCommand
         return;
       }
 
-      const {
-        gid: _gid,
-        secretboxKey: _secretboxKey,
-        descriptor: _descriptor,
-        ...walletView
-      } = wallet;
+      const walletView = toWalletView(wallet);
       const client = new ApiClient(requireApiKey(globals.apiKey, globals.network), network);
       const pkConfig = await getWalletPlatformKeyConfig(client, wallet);
 
@@ -275,11 +370,13 @@ walletCommand
         return;
       }
 
+      const parsed = parseWalletDescriptor(wallet);
+
       if (type === "descriptor") {
         const descriptor =
           format === "all"
-            ? buildExternalDescriptor(wallet.signers, wallet.m, wallet.addressType)
-            : buildWalletDescriptor(wallet.signers, wallet.m, wallet.addressType);
+            ? buildExternalDescriptorForParsed(parsed)
+            : buildWalletDescriptorForParsed(parsed);
 
         if (globals.json) {
           print({ descriptor }, cmd);
@@ -307,9 +404,20 @@ walletCommand
           );
         }
       } else {
+        if (parsed.kind !== "multisig") {
+          printError(
+            {
+              error: "UNSUPPORTED",
+              message: "BSMS export is only supported for multisig wallets",
+            },
+            cmd,
+          );
+          return;
+        }
+
         const bsms = {
           version: "BSMS 1.0",
-          descriptor: buildAnyDescriptor(wallet.signers, wallet.m, wallet.addressType),
+          descriptor: buildAnyDescriptorForParsed(parsed),
           pathRestrictions: "No path restrictions",
           firstAddress: deriveFirstAddress(wallet.signers, wallet.m, wallet.addressType, network),
         };
@@ -326,6 +434,239 @@ walletCommand
           );
         }
       }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+const miniscriptCommand = walletCommand
+  .command("miniscript")
+  .description("Inspect and validate miniscript wallets and descriptors");
+
+miniscriptCommand
+  .command("inspect")
+  .description("Inspect miniscript signing paths for a wallet")
+  .argument("<wallet-id>", "Wallet ID")
+  .option(
+    "--locktime <value>",
+    "Evaluate satisfiability at this locktime",
+    parseMiniscriptTimelockOption,
+  )
+  .option(
+    "--sequence <value>",
+    "Evaluate satisfiability at this input sequence",
+    parseMiniscriptSequenceOption,
+  )
+  .action((walletId, options, cmd) => {
+    try {
+      const globals = cmd.optsWithGlobals();
+      const network = getNetwork(globals.network);
+      const email = requireEmail(globals.network);
+      const wallet = loadWallet(email, network, walletId);
+      if (!wallet) {
+        printError({ error: "NOT_FOUND", message: `Wallet ${walletId} not found locally` }, cmd);
+        return;
+      }
+
+      const parsed = parseWalletDescriptor(wallet);
+      if (parsed.kind !== "miniscript" || !parsed.miniscript) {
+        printError(
+          {
+            error: "UNSUPPORTED",
+            message: "Wallet is not a miniscript wallet",
+          },
+          cmd,
+        );
+        return;
+      }
+
+      const hasTxState = options.locktime != null || options.sequence != null;
+      const txState = hasTxState
+        ? {
+            lockTime: options.locktime ?? 0,
+            inputs: [{ nSequence: options.sequence ?? 0 }],
+          }
+        : undefined;
+      const plans = describeMiniscriptSpendingPlans(parsed.miniscript, txState);
+      const result = {
+        walletId: wallet.walletId,
+        name: wallet.name,
+        addressType: formatAddressType(parsed.addressType),
+        miniscript: parsed.miniscript,
+        txState: txState
+          ? { lockTime: txState.lockTime, sequence: txState.inputs[0].nSequence }
+          : undefined,
+        paths: plans.map((plan) => ({
+          index: plan.index,
+          supported: plan.supported,
+          satisfiable: plan.satisfiable,
+          preimageRequirements: plan.preimageRequirements,
+          requiredSignatures: plan.requiredSignatures,
+          lockTime: plan.lockTime,
+          sequence: plan.sequence,
+          signerNames: plan.signerNames,
+          unsupportedReason: plan.unsupportedReason,
+        })),
+      };
+
+      if (globals.json) {
+        print(result, cmd);
+        return;
+      }
+
+      console.log(`Wallet: ${wallet.name} (${wallet.walletId})`);
+      console.log(`Address Type: ${formatAddressType(parsed.addressType)}`);
+      console.log(`Miniscript: ${parsed.miniscript}`);
+      if (txState) {
+        console.log(
+          `Tx State: locktime=${txState.lockTime} sequence=${txState.inputs[0].nSequence}`,
+        );
+      }
+      console.log("");
+      printMiniscriptPlanTable(plans);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+miniscriptCommand
+  .command("validate")
+  .description("Validate a miniscript wallet, descriptor, or expression")
+  .option("--wallet <wallet-id>", "Local wallet ID")
+  .option("--descriptor <descriptor>", "Miniscript descriptor to validate")
+  .option("--miniscript <expression>", "Bare miniscript expression to validate")
+  .option(
+    "--address-type <type>",
+    "Address type for --miniscript (ANY, NATIVE_SEGWIT, TAPROOT)",
+    parseMiniscriptAddressTypeOption,
+    MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  )
+  .action((options, cmd) => {
+    try {
+      const sources = [options.wallet, options.descriptor, options.miniscript].filter(
+        (value) => typeof value === "string" && value.trim().length > 0,
+      );
+      if (sources.length !== 1) {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: "Provide exactly one of --wallet, --descriptor, or --miniscript",
+          },
+          cmd,
+        );
+        return;
+      }
+
+      let miniscript: string;
+      let addressType: MiniscriptAddressType;
+      let descriptor: string | undefined;
+      let walletId: string | undefined;
+
+      if (options.wallet) {
+        const globals = cmd.optsWithGlobals();
+        const network = getNetwork(globals.network);
+        const email = requireEmail(globals.network);
+        const wallet = loadWallet(email, network, options.wallet);
+        if (!wallet) {
+          printError(
+            { error: "NOT_FOUND", message: `Wallet ${options.wallet} not found locally` },
+            cmd,
+          );
+          return;
+        }
+
+        const parsed = parseWalletDescriptor(wallet);
+        if (parsed.kind !== "miniscript" || !parsed.miniscript) {
+          printError(
+            {
+              error: "UNSUPPORTED",
+              message: "Wallet is not a miniscript wallet",
+            },
+            cmd,
+          );
+          return;
+        }
+
+        miniscript = parsed.miniscript;
+        addressType = parsed.addressType as MiniscriptAddressType;
+        descriptor = buildWalletDescriptorForParsed(parsed);
+        walletId = wallet.walletId;
+      } else if (options.descriptor) {
+        const parsed = parseDescriptor(options.descriptor);
+        if (parsed.kind !== "miniscript" || !parsed.miniscript) {
+          printError(
+            {
+              error: "UNSUPPORTED",
+              message: "Descriptor is not a miniscript descriptor",
+            },
+            cmd,
+          );
+          return;
+        }
+
+        miniscript = parsed.miniscript;
+        addressType = parsed.addressType as MiniscriptAddressType;
+        descriptor = buildWalletDescriptorForParsed(parsed);
+      } else {
+        miniscript = String(options.miniscript).trim();
+        addressType = options.addressType;
+        const validation = validateMiniscriptTemplate(miniscript, addressType);
+        if (!validation.ok) {
+          printError(
+            {
+              error: "INVALID_MINISCRIPT",
+              message: validation.error ?? "Invalid miniscript expression",
+            },
+            cmd,
+          );
+          return;
+        }
+        if (addressType !== MINISCRIPT_ADDRESS_TYPE_ANY) {
+          descriptor = buildMiniscriptDescriptor(miniscript, addressType);
+        }
+      }
+
+      const plans = describeMiniscriptSpendingPlans(miniscript);
+      const result = {
+        ok: true,
+        walletId,
+        addressType:
+          addressType === MINISCRIPT_ADDRESS_TYPE_ANY ? "ANY" : formatAddressType(addressType),
+        miniscript,
+        descriptor,
+        pathCount: plans.length,
+        paths: plans.map((plan) => ({
+          index: plan.index,
+          supported: plan.supported,
+          preimageRequirements: plan.preimageRequirements,
+          requiredSignatures: plan.requiredSignatures,
+          lockTime: plan.lockTime,
+          sequence: plan.sequence,
+          signerNames: plan.signerNames,
+          unsupportedReason: plan.unsupportedReason,
+        })),
+      };
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print(result, cmd);
+        return;
+      }
+
+      console.log("Miniscript is valid.");
+      if (walletId) {
+        console.log(`Wallet: ${walletId}`);
+      }
+      console.log(
+        `Address Type: ${addressType === MINISCRIPT_ADDRESS_TYPE_ANY ? "ANY" : formatAddressType(addressType)}`,
+      );
+      console.log(`Miniscript: ${miniscript}`);
+      if (descriptor) {
+        console.log(`Descriptor: ${descriptor}`);
+      }
+      console.log(`Paths: ${plans.length}`);
+      console.log("");
+      printMiniscriptPlanTable(plans);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -375,12 +716,7 @@ walletCommand
 
       wallet.name = options.name;
       saveWallet(email, network, wallet);
-      const {
-        gid: _gid,
-        secretboxKey: _secretboxKey,
-        descriptor: _descriptor,
-        ...walletView
-      } = wallet;
+      const walletView = toWalletView(wallet);
       const client = new ApiClient(requireApiKey(globals.apiKey, globals.network), network);
       const pkConfig = await getWalletPlatformKeyConfig(client, wallet);
       printWalletResult({ ...walletView, platformKey: pkConfig.platformKey ?? undefined }, cmd);
@@ -436,7 +772,16 @@ walletCommand
         name: options.name,
       });
 
-      print({ ...result, wallet: formatWalletOutput(result.wallet) }, cmd);
+      print(
+        {
+          ...result,
+          wallet: formatWalletOutput({
+            ...result.wallet,
+            typeLabel: getWalletTypeLabel(result.wallet),
+          }),
+        },
+        cmd,
+      );
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -753,27 +1098,7 @@ dummyTxCommand
       for (const matched of toSign) {
         const dummyPsbt = createDummyPsbt(wallet, dummyTx.requestBody, network);
         const xfpInt = parseInt(matched.signerXfp, 16);
-
-        for (let i = 0; i < dummyPsbt.inputsLength; i++) {
-          const inp = dummyPsbt.getInput(i);
-          const bip32Derivation = inp.bip32Derivation as
-            | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
-            | undefined;
-
-          if (!bip32Derivation) continue;
-
-          for (const [, { fingerprint, path }] of bip32Derivation) {
-            if (fingerprint === xfpInt) {
-              const chain = path[path.length - 2];
-              const index = path[path.length - 1];
-              const childKey = matched.signerKey.deriveChild(chain).deriveChild(index);
-              if (childKey.privateKey) {
-                dummyPsbt.signIdx(childKey.privateKey, i);
-              }
-              break;
-            }
-          }
-        }
+        signWalletPsbtWithKey(dummyPsbt, matched.signerKey, xfpInt, wallet.descriptor);
 
         const signature = extractPartialSignature(dummyPsbt, xfpInt);
         requestTokens.push(`${matched.signerXfp}.${signature}`);

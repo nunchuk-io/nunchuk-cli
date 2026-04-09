@@ -1,16 +1,23 @@
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import { Transaction } from "@scure/btc-signer";
-import { HDKey } from "@scure/bip32";
 import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
 import type { Network } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/electrum.js";
-import { deriveAddresses } from "../core/address.js";
+import { deriveDescriptorAddresses } from "../core/address.js";
 import { loadWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
+import { signWalletPsbtWithKey } from "../core/psbt-sign.js";
+import { parseDescriptor } from "../core/descriptor.js";
+import { finalizeMiniscriptPsbt } from "../core/miniscript-finalize.js";
+import {
+  addMiniscriptPreimagesToPsbt,
+  formatMiniscriptPreimageRequirement,
+  type MiniscriptPreimageRequirement,
+} from "../core/miniscript-preimage.js";
 import {
   createTransaction,
   uploadTransaction,
@@ -31,6 +38,53 @@ import {
 } from "../core/format.js";
 import { convertAmount, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
 import { print, printError } from "../output.js";
+
+function parseMiniscriptPathOption(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("--miniscript-path must be a non-negative integer");
+  }
+  return parsed;
+}
+
+function parsePreimageOption(value: string, previous: string[]): string[] {
+  const next = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return [...previous, ...next];
+}
+
+function printMiniscriptPathSummary(
+  miniscriptPath:
+    | {
+        index: number;
+        lockTime: number;
+        preimageRequirements: MiniscriptPreimageRequirement[];
+        requiredSignatures: number;
+        sequence: number;
+        signerNames: string[];
+      }
+    | undefined,
+  indent = "  ",
+): void {
+  if (!miniscriptPath) {
+    return;
+  }
+
+  console.log(`${indent}Miniscript path: #${miniscriptPath.index}`);
+  console.log(`${indent}Required signers: ${miniscriptPath.requiredSignatures}`);
+  console.log(`${indent}Locktime: ${miniscriptPath.lockTime}`);
+  console.log(`${indent}Sequence: ${miniscriptPath.sequence}`);
+  if (miniscriptPath.preimageRequirements.length > 0) {
+    console.log(
+      `${indent}Hash preimages: ${miniscriptPath.preimageRequirements.map(formatMiniscriptPreimageRequirement).join(", ")}`,
+    );
+  }
+  console.log(
+    `${indent}Path signers: ${miniscriptPath.signerNames.length > 0 ? miniscriptPath.signerNames.join(", ") : "(none)"}`,
+  );
+}
 
 function getGlobals(cmd: Command): { apiKey: string; network: Network; email: string } {
   const globals = cmd.optsWithGlobals();
@@ -66,6 +120,17 @@ txCommand
     "--currency <code>",
     "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
   )
+  .option(
+    "--preimage <hex>",
+    "Attach a 32-byte miniscript hash preimage (repeat or comma-separate)",
+    parsePreimageOption,
+    [],
+  )
+  .option(
+    "--miniscript-path <index>",
+    "Select a miniscript signing path by index",
+    parseMiniscriptPathOption,
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -93,6 +158,8 @@ txCommand
           electrum,
           toAddress: options.to,
           amount: sendAmount,
+          miniscriptPath: options.miniscriptPath,
+          preimages: options.preimage,
           // Fee rate always estimated from Nunchuk API (with Electrum fallback)
         });
 
@@ -107,6 +174,7 @@ txCommand
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
+              miniscriptPath: result.miniscriptPath,
             },
             cmd,
           );
@@ -122,6 +190,7 @@ txCommand
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
         }
+        printMiniscriptPathSummary(result.miniscriptPath);
         console.log(
           `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId} --xprv <your-xprv>`,
         );
@@ -153,30 +222,6 @@ function hasSignerAlreadySigned(tx: Transaction, xfpInt: number): boolean {
   return false;
 }
 
-/** Sign PSBT inputs for a matched signer key. */
-function signPsbtWithKey(tx: Transaction, signerKey: HDKey, xfpInt: number): void {
-  for (let i = 0; i < tx.inputsLength; i++) {
-    const inp = tx.getInput(i);
-    const bip32Derivation = inp.bip32Derivation as
-      | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
-      | undefined;
-
-    if (!bip32Derivation) continue;
-
-    for (const [, { fingerprint, path }] of bip32Derivation) {
-      if (fingerprint === xfpInt) {
-        const chain = path[path.length - 2];
-        const index = path[path.length - 1];
-        const childKey = signerKey.deriveChild(chain).deriveChild(index);
-        if (childKey.privateKey) {
-          tx.signIdx(childKey.privateKey, i);
-        }
-        break;
-      }
-    }
-  }
-}
-
 // tx sign — Sign PSBT locally, re-upload to server
 // Reference: NunchukImpl::SignTransaction (nunchukimpl.cpp:1297-1371)
 // Reference: SoftwareSigner::SignTx (softwaresigner.cpp:192-216)
@@ -188,6 +233,12 @@ txCommand
   .option("--psbt <psbt>", "Signed PSBT to merge into the current pending transaction")
   .option("--xprv <xprv>", "Extended private key for signing")
   .option("--fingerprint <xfp>", "Fingerprint of a stored key")
+  .option(
+    "--preimage <hex>",
+    "Attach a 32-byte miniscript hash preimage (repeat or comma-separate)",
+    parsePreimageOption,
+    [],
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -196,6 +247,10 @@ txCommand
 
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
       let nextPsbtB64: string;
+      const hasPreimages = Array.isArray(options.preimage) && options.preimage.length > 0;
+      const wantsLocalSigning = Boolean(options.xprv || options.fingerprint);
+      let didAddPreimages = false;
+      let didLocalSign = false;
 
       if (options.psbt) {
         if (options.xprv || options.fingerprint) {
@@ -208,32 +263,59 @@ txCommand
           );
           return;
         }
-        nextPsbtB64 = String(options.psbt).trim();
+        const tx = Transaction.fromPSBT(Buffer.from(String(options.psbt).trim(), "base64"));
+        if (hasPreimages) {
+          addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, options.preimage);
+          didAddPreimages = true;
+        }
+        nextPsbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
       } else {
         const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
-        const resolved = resolveSignerKeys(options, email, network, wallet.signers);
-        if ("error" in resolved) {
-          printError({ error: "INVALID_PARAM", message: resolved.error }, cmd);
+        if (!wantsLocalSigning && !hasPreimages) {
+          printError(
+            {
+              error: "INVALID_PARAM",
+              message: "Provide --psbt, a signer (--xprv/--fingerprint), or --preimage",
+            },
+            cmd,
+          );
           return;
         }
 
-        // Filter out signers that already signed
-        const toSign = resolved.matched.filter(
-          (m) => !hasSignerAlreadySigned(tx, parseInt(m.signerXfp, 16)),
-        );
+        if (wantsLocalSigning) {
+          const resolved = resolveSignerKeys(options, email, network, wallet.signers);
+          if ("error" in resolved) {
+            printError({ error: "INVALID_PARAM", message: resolved.error }, cmd);
+            return;
+          }
 
-        if (toSign.length === 0) {
-          const names = resolved.matched
-            .map((m) => (m.keyName ? `${m.keyName} (${m.signerXfp})` : m.signerXfp))
-            .join(", ");
-          printError({ error: "ALREADY_SIGNED", message: `Already signed by: ${names}` }, cmd);
-          return;
+          const toSign = resolved.matched.filter(
+            (m) => !hasSignerAlreadySigned(tx, parseInt(m.signerXfp, 16)),
+          );
+
+          if (toSign.length === 0 && !hasPreimages) {
+            const names = resolved.matched
+              .map((m) => (m.keyName ? `${m.keyName} (${m.signerXfp})` : m.signerXfp))
+              .join(", ");
+            printError({ error: "ALREADY_SIGNED", message: `Already signed by: ${names}` }, cmd);
+            return;
+          }
+
+          for (const matched of toSign) {
+            signWalletPsbtWithKey(
+              tx,
+              matched.signerKey,
+              parseInt(matched.signerXfp, 16),
+              wallet.descriptor,
+            );
+            didLocalSign = true;
+          }
         }
 
-        for (const matched of toSign) {
-          signPsbtWithKey(tx, matched.signerKey, parseInt(matched.signerXfp, 16));
+        if (hasPreimages) {
+          addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, options.preimage);
+          didAddPreimages = true;
         }
-
         nextPsbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
       }
 
@@ -258,7 +340,13 @@ txCommand
         await uploadTransaction(client, wallet, merged.psbtB64, options.txId);
       }
 
-      const detail = decodePsbtDetail(merged.psbtB64, network, wallet.m, wallet.signers);
+      const detail = decodePsbtDetail(
+        merged.psbtB64,
+        network,
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
@@ -267,6 +355,7 @@ txCommand
             updated: merged.changed,
             status: detail?.status ?? "PENDING_SIGNATURES",
             signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
+            miniscriptPath: detail?.miniscriptPath,
           },
           cmd,
         );
@@ -280,6 +369,18 @@ txCommand
             ? "Transaction PSBT combined and uploaded to group server."
             : "Provided PSBT added no new data. Group server PSBT unchanged.",
         );
+      } else if (didLocalSign && didAddPreimages) {
+        console.log(
+          merged.changed
+            ? "Transaction updated with signatures and miniscript preimages and uploaded to group server."
+            : "Transaction update produced no new PSBT changes.",
+        );
+      } else if (didAddPreimages) {
+        console.log(
+          merged.changed
+            ? "Transaction updated with miniscript preimages and uploaded to group server."
+            : "Transaction update produced no new PSBT changes.",
+        );
       } else {
         console.log(
           merged.changed
@@ -289,6 +390,7 @@ txCommand
       }
       console.log(`  Transaction ID: ${options.txId}`);
       console.log(`  Status: ${detail?.status ?? "PENDING_SIGNATURES"}${sigInfo}`);
+      printMiniscriptPathSummary(detail?.miniscriptPath);
       if (detail?.status === "READY_TO_BROADCAST") {
         console.log(
           `\nBroadcast with: nunchuk tx broadcast --wallet ${options.wallet} --tx-id ${options.txId}`,
@@ -314,17 +416,26 @@ txCommand
 
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
       const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
+      const parsedDescriptor = parseDescriptor(wallet.descriptor);
 
       // If PSBT is already finalized (e.g. by mobile app), skip finalize()
       // Reference: finalize() clears partialSig and sets finalScriptWitness/finalScriptSig
       // Calling finalize() again on an already-finalized PSBT fails because partialSig is empty
       if (!tx.isFinal) {
         try {
-          tx.finalize();
+          if (parsedDescriptor.kind === "miniscript") {
+            finalizeMiniscriptPsbt(tx, wallet.descriptor, network);
+          } else {
+            tx.finalize();
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`Error: Failed to finalize transaction: ${msg}`);
-          console.error(`Wallet requires ${wallet.m} signatures to broadcast.`);
+          if (parsedDescriptor.kind === "miniscript") {
+            console.error(`Error: Failed to finalize miniscript transaction: ${msg}`);
+          } else {
+            console.error(`Error: Failed to finalize transaction: ${msg}`);
+            console.error(`Wallet requires ${wallet.m} signatures to broadcast.`);
+          }
           process.exit(1);
         }
       }
@@ -395,7 +506,13 @@ txCommand
         print(
           {
             pending: pending.map((p) => {
-              const detail = decodePsbtDetail(p.psbt, network, wallet.m, wallet.signers);
+              const detail = decodePsbtDetail(
+                p.psbt,
+                network,
+                wallet.m,
+                wallet.signers,
+                wallet.descriptor,
+              );
               return {
                 txId: p.txId,
                 status: detail?.status ?? "PENDING_SIGNATURES",
@@ -403,6 +520,7 @@ txCommand
                 fee: detail?.fee,
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
+                miniscriptPath: detail?.miniscriptPath,
                 outputs: detail?.outputs,
                 signers: detail?.signers,
               };
@@ -432,7 +550,13 @@ txCommand
       if (pending.length > 0) {
         console.log("Pending transactions (from group server):");
         pending.forEach((p, i) => {
-          const detail = decodePsbtDetail(p.psbt, network, wallet.m, wallet.signers);
+          const detail = decodePsbtDetail(
+            p.psbt,
+            network,
+            wallet.m,
+            wallet.signers,
+            wallet.descriptor,
+          );
           const status = detail?.status ?? "PENDING_SIGNATURES";
           const sigInfo = detail
             ? ` (${detail.signedCount}/${detail.requiredCount} signatures)`
@@ -455,6 +579,7 @@ txCommand
                 .join("  ");
               console.log(`     Signers: ${signerStr}`);
             }
+            printMiniscriptPathSummary(detail.miniscriptPath, "     ");
           }
         });
       }
@@ -519,7 +644,7 @@ txCommand
 
           // Derive change addresses to detect change outputs
           const changeAddrs = new Set(
-            deriveAddresses(wallet.signers, wallet.m, wallet.addressType, network, 1, 0, 20),
+            deriveDescriptorAddresses(wallet.descriptor, network, 1, 0, 20),
           );
 
           let totalOut = 0n;
@@ -582,15 +707,7 @@ txCommand
           let height = 0;
           let blocktime = 0;
           // Check both receive (chain=0) and change (chain=1) addresses
-          const receiveAddrs = deriveAddresses(
-            wallet.signers,
-            wallet.m,
-            wallet.addressType,
-            network,
-            0,
-            0,
-            20,
-          );
+          const receiveAddrs = deriveDescriptorAddresses(wallet.descriptor, network, 0, 0, 20);
           const allAddrs = [...receiveAddrs, ...changeAddrs];
           for (const addr of allAddrs) {
             const sh = addressToScripthash(addr, network);
@@ -682,7 +799,7 @@ txCommand
           const plain = secretOpen(data.transaction.data.msg, secretboxKey);
           const parsed = JSON.parse(plain);
           const detail = parsed.psbt
-            ? decodePsbtDetail(parsed.psbt, network, wallet.m, wallet.signers)
+            ? decodePsbtDetail(parsed.psbt, network, wallet.m, wallet.signers, wallet.descriptor)
             : null;
           const status = detail?.status ?? "PENDING_SIGNATURES";
 
@@ -697,6 +814,7 @@ txCommand
                 fee: detail?.fee,
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
+                miniscriptPath: detail?.miniscriptPath,
                 outputs: detail?.outputs,
                 signers: detail?.signers,
                 psbt: parsed.psbt,
@@ -728,6 +846,7 @@ txCommand
                 .join("  ");
               console.log(`Signers: ${signerStr}`);
             }
+            printMiniscriptPathSummary(detail.miniscriptPath, "");
           }
           if (parsed.psbt) {
             console.log(`PSBT: ${parsed.psbt}`);
