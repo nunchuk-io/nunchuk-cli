@@ -362,6 +362,58 @@ describe("createTransaction miniscript", () => {
     }
   });
 
+  it("reports partial progress for miniscript multi branches", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:multi(2,${TEST_WALLET.signers[0]}/<0;1>/*,${TEST_WALLET.signers[1]}/<0;1>/*,${TEST_WALLET.signers[2]}/<0;1>/*),after(1))`,
+      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[0], TEST_WALLET.signers[1], TEST_WALLET.signers[2]],
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
+
+      const detail = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { currentHeight: 1 },
+      );
+
+      expect(detail?.status).toBe("PENDING_SIGNATURES");
+      expect(detail?.signedCount).toBe(1);
+      expect(detail?.requiredCount).toBe(2);
+      expect(detail?.signers).toEqual({
+        "8317a853": true,
+        b9a14f1a: false,
+        ecfed4c1: false,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("finalizes a signed miniscript PSBT locally", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
