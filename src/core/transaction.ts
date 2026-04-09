@@ -417,15 +417,15 @@ function getMiniscriptPlanProgress(
           const present = leaf.keys.filter((key) =>
             signatures.signedKeyExpressions.has(key),
           ).length;
+          if (inputIndex === 0) {
+            inputSignedCount += Math.min(present, leaf.k);
+          }
           if (present < leaf.k) {
             return {
               ready: false,
               signedCount: inputIndex === 0 ? inputSignedCount : signedCount,
               signedFingerprints,
             };
-          }
-          if (inputIndex === 0) {
-            inputSignedCount += leaf.k;
           }
           break;
         }
