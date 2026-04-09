@@ -248,7 +248,8 @@ txCommand
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
       let nextPsbtB64: string;
       const hasPreimages = Array.isArray(options.preimage) && options.preimage.length > 0;
-      const wantsLocalSigning = Boolean(options.xprv || options.fingerprint);
+      const hasExplicitSigner = Boolean(options.xprv || options.fingerprint);
+      const wantsLocalSigning = !options.psbt && (hasExplicitSigner || !hasPreimages);
       let didAddPreimages = false;
       let didLocalSign = false;
 
@@ -271,17 +272,6 @@ txCommand
         nextPsbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
       } else {
         const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
-        if (!wantsLocalSigning && !hasPreimages) {
-          printError(
-            {
-              error: "INVALID_PARAM",
-              message: "Provide --psbt, a signer (--xprv/--fingerprint), or --preimage",
-            },
-            cmd,
-          );
-          return;
-        }
-
         if (wantsLocalSigning) {
           const resolved = resolveSignerKeys(options, email, network, wallet.signers);
           if ("error" in resolved) {
