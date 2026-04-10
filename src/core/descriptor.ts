@@ -357,18 +357,14 @@ export async function parseBsmsRecord(
     throw new Error(`Invalid BSMS record: unsupported version "${lines[0]}"`);
   }
 
-  const parsed = parseDescriptor(lines[1]);
-  if (parsed.kind !== "multisig") {
-    throw new Error("Invalid BSMS record: miniscript descriptors are not yet supported");
-  }
-
   if (lines[2] !== "/0/*,/1/*" && lines[2] !== "No path restrictions") {
     throw new Error(`Invalid BSMS record: invalid path restriction "${lines[2]}"`);
   }
 
   // Dynamic import to avoid circular dependency (address.ts imports from descriptor.ts)
-  const { deriveFirstAddress } = await import("./address.js");
-  const expectedAddress = deriveFirstAddress(parsed.signers, parsed.m, parsed.addressType, network);
+  const parsed = parseDescriptor(lines[1]);
+  const { deriveDescriptorFirstAddress } = await import("./address.js");
+  const expectedAddress = deriveDescriptorFirstAddress(parsed.descriptor, network);
   if (lines[3] !== expectedAddress) {
     throw new Error("Invalid BSMS record: first address does not match descriptor");
   }

@@ -213,9 +213,14 @@ describe("parseBsmsRecord", () => {
     await expect(parseBsmsRecord(content, "testnet")).rejects.toThrow("at least 4 lines");
   });
 
-  it("rejects miniscript descriptors in BSMS records", async () => {
-    const content = `BSMS 1.0\n${MINISCRIPT_ANY_DESC}\nNo path restrictions\ntb1qexample`;
-    await expect(parseBsmsRecord(content, "testnet")).rejects.toThrow("miniscript descriptors");
+  it("parses miniscript descriptors in BSMS records", async () => {
+    const { deriveDescriptorFirstAddress } = await import("../address.js");
+    const firstAddr = deriveDescriptorFirstAddress(MINISCRIPT_ANY_DESC, "testnet");
+    const content = `BSMS 1.0\n${MINISCRIPT_ANY_DESC}\nNo path restrictions\n${firstAddr}`;
+    const result = await parseBsmsRecord(content, "testnet");
+    expect(result.kind).toBe("miniscript");
+    expect(result.signers).toEqual(TEST_SIGNERS);
+    expect(result.descriptor).toBe(MINISCRIPT_WALLET_DESC);
   });
 });
 

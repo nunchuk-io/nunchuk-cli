@@ -15,7 +15,7 @@ import {
   parseBsmsRecord,
 } from "../core/descriptor.js";
 import { buildMultisigConfig, parseMultisigConfig } from "../core/multisig-config.js";
-import { deriveFirstAddress } from "../core/address.js";
+import { deriveDescriptorFirstAddress } from "../core/address.js";
 import {
   MINISCRIPT_ADDRESS_TYPE_ANY,
   MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
@@ -404,22 +404,12 @@ walletCommand
           );
         }
       } else {
-        if (parsed.kind !== "multisig") {
-          printError(
-            {
-              error: "UNSUPPORTED",
-              message: "BSMS export is only supported for multisig wallets",
-            },
-            cmd,
-          );
-          return;
-        }
-
+        const descriptor = buildAnyDescriptorForParsed(parsed);
         const bsms = {
           version: "BSMS 1.0",
-          descriptor: buildAnyDescriptorForParsed(parsed),
+          descriptor,
           pathRestrictions: "No path restrictions",
-          firstAddress: deriveFirstAddress(wallet.signers, wallet.m, wallet.addressType, network),
+          firstAddress: deriveDescriptorFirstAddress(descriptor, network),
         };
 
         if (globals.json) {
