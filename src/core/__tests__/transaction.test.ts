@@ -153,6 +153,9 @@ function createMiniscriptElectrumMock(
           ? [{ tx_hash: txid, tx_pos: 0, height, value: Number(fundingAmount) }]
           : [],
       ),
+      getHistory: vi.fn(async (hash: string) =>
+        hash === scripthash ? [{ tx_hash: txid, height }] : [],
+      ),
     } as unknown as ElectrumClient,
   };
 }

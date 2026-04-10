@@ -814,9 +814,10 @@ export async function getWalletBalance(
     while (consecutiveEmpty < GAP_LIMIT) {
       const addresses = deriveWalletAddresses(wallet, network, chain, startIndex, 1);
       const scripthash = addressToScripthash(addresses[0], network);
-      const bal = await electrum.getBalance(scripthash);
+      const history = await electrum.getHistory(scripthash);
 
-      if (bal.confirmed !== 0 || bal.unconfirmed !== 0) {
+      if (history.length > 0) {
+        const bal = await electrum.getBalance(scripthash);
         total += BigInt(bal.confirmed) + BigInt(bal.unconfirmed);
         consecutiveEmpty = 0;
       } else {
@@ -877,6 +878,7 @@ export async function scanUtxos(
       const addr = addresses[0];
       const scripthash = addressToScripthash(addr, network);
       const unspent = await electrum.listUnspent(scripthash);
+      const isUsed = unspent.length > 0 || (await electrum.getHistory(scripthash)).length > 0;
 
       if (unspent.length > 0) {
         for (const u of unspent) {
@@ -889,6 +891,9 @@ export async function scanUtxos(
             address: addr,
           });
         }
+      }
+
+      if (isUsed) {
         consecutiveEmpty = 0;
         if (chain === 1) nextChangeIndex = startIndex + 1;
       } else {
