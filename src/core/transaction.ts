@@ -912,7 +912,7 @@ export async function scanUtxos(
             txPos: u.tx_pos,
             value: BigInt(u.value),
             chain,
-            index: startIndex,
+            index: startIndex + offset,
             address: addr,
           });
         }

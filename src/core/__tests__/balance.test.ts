@@ -280,6 +280,23 @@ describe("scanUtxos", () => {
     });
   });
 
+  it("records the address index for a UTXO at a non-zero batch offset", async () => {
+    const funded = getMiniscriptScripthash(0, 5);
+    const electrum = createMockUtxoElectrum({
+      [funded]: [{ tx_hash: "funded-offset", tx_pos: 1, height: 1, value: 6789 }],
+    });
+
+    const result = await scanUtxos(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(result.utxos).toHaveLength(1);
+    expect(result.utxos[0]).toMatchObject({
+      txHash: "funded-offset",
+      txPos: 1,
+      value: 6789n,
+      chain: 0,
+      index: 5,
+    });
+  });
+
   it("advances change index past spent change addresses", async () => {
     const spentChange = getMiniscriptScripthash(1, 0);
     const electrum = createMockUtxoElectrum(
