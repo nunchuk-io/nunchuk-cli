@@ -316,27 +316,41 @@ src/
   commands/         # CLI command definitions
     auth.ts         # Authentication commands
     config.ts       # Config and Electrum endpoint commands
+    currency.ts     # Currency conversion commands
+    invitation.ts   # Group invitation commands
     key.ts          # Key generation and derivation
+    miniscript.ts   # Miniscript inspection and validation commands
     network.ts      # Network selection
     sandbox.ts      # Sandbox lifecycle (create, add-key, finalize, etc.)
     tx.ts           # Transaction commands (create, sign, broadcast, list, get)
-    currency.ts     # Currency conversion commands
     wallet.ts       # Wallet management and export
   core/             # Business logic (importable as library)
-    address.ts      # Bitcoin address derivation (multisig)
+    address-type.ts # Address type constants and labels
+    address.ts      # Bitcoin address derivation (multisig and miniscript)
     api-client.ts   # HTTP client for Nunchuk API
+    bip39.ts        # BIP39 mnemonic utilities
     config.ts       # Config file management (~/.nunchuk-cli/config.json)
     crypto.ts       # NaCl encryption (Publicbox, Secretbox)
-    descriptor.ts   # Bitcoin output descriptor builder + checksum
+    currency.ts     # Fiat/BTC/sat conversion helpers
+    descriptor.ts   # Bitcoin output descriptor parsing/building + checksum
     electrum.ts     # Electrum protocol client
+    fees.ts         # Fee estimation helpers
     format.ts       # Formatting utilities (BTC, sats, dates)
     keygen.ts       # BIP39 mnemonic generation and BIP32 key derivation
+    miniscript.ts   # Miniscript parser, compiler, and descriptor helpers
+    miniscript-finalize.ts # Miniscript witness finalization
+    miniscript-preimage.ts # Miniscript hash-preimage requirements
+    miniscript-spend.ts    # Miniscript spending path analysis
+    multisig-config.ts # Multisig config export/recovery helpers
+    paths.ts        # BIP32 derivation path helpers
     platform-key.ts # Platform key types, validation, policy builders
+    psbt-sign.ts    # Local PSBT signing helpers
     sandbox.ts      # Sandbox event builders (create, add-key, finalize, platform-key)
+    signer-key.ts   # Signer key parsing and matching
     storage.ts      # Local encrypted per-account SQLite storage (sandboxes, wallets, keys)
     transaction.ts  # Transaction operations (create, upload, fetch, broadcast)
-    types.ts        # Shared types (AddressType)
     wallet-keys.ts  # BIP32/BIP85 key derivation (Secretbox key, GID, signing)
+    wallet.ts       # Wallet metadata helpers
   index.ts          # CLI entry point
   output.ts         # Output formatting (human-readable / JSON)
 ```
