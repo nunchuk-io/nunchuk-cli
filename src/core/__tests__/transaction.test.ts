@@ -137,25 +137,31 @@ function createMiniscriptElectrumMock(
   const receiveAddress = deriveDescriptorAddresses(descriptor, "testnet", 0, 0, 1)[0];
   const { rawHex, txid } = createFundingHex(receiveAddress, fundingAmount);
   const scripthash = addressToScripthash(receiveAddress, "testnet");
+  const getTransaction = vi.fn(async (hash: string) => {
+    if (hash !== txid) {
+      throw new Error("unknown tx");
+    }
+    return rawHex;
+  });
+  const listUnspent = vi.fn(async (hash: string) =>
+    hash === scripthash ? [{ tx_hash: txid, tx_pos: 0, height, value: Number(fundingAmount) }] : [],
+  );
+  const getHistory = vi.fn(async (hash: string) =>
+    hash === scripthash ? [{ tx_hash: txid, height }] : [],
+  );
 
   return {
     txid,
     electrum: {
       estimateFee: vi.fn(async () => 0.00001),
-      getTransaction: vi.fn(async (hash: string) => {
-        if (hash !== txid) {
-          throw new Error("unknown tx");
-        }
-        return rawHex;
-      }),
-      listUnspent: vi.fn(async (hash: string) =>
-        hash === scripthash
-          ? [{ tx_hash: txid, tx_pos: 0, height, value: Number(fundingAmount) }]
-          : [],
+      getTransaction,
+      getTransactionBatch: vi.fn(async (hashes: string[]) =>
+        Promise.all(hashes.map(getTransaction)),
       ),
-      getHistory: vi.fn(async (hash: string) =>
-        hash === scripthash ? [{ tx_hash: txid, height }] : [],
-      ),
+      listUnspent,
+      listUnspentBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(listUnspent))),
+      getHistory,
+      getHistoryBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(getHistory))),
     } as unknown as ElectrumClient,
   };
 }

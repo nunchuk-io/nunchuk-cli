@@ -9,11 +9,19 @@ import type { ElectrumProtocol, Network } from "./config.js";
 
 const REQUEST_TIMEOUT = 30_000;
 const CONNECT_TIMEOUT = 10_000;
+export const ELECTRUM_BATCH_LIMIT = 100;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  method: string;
+  params: unknown[];
+  id: number;
 }
 
 export interface HistoryItem {
@@ -32,6 +40,16 @@ export interface UnspentItem {
 export interface ScripthashBalance {
   confirmed: number;
   unconfirmed: number;
+}
+
+function getJsonRpcErrorMessage(error: unknown): string {
+  if (typeof error === "object" && error !== null) {
+    const message = (error as Record<string, unknown>).message;
+    if (typeof message === "string") {
+      return message;
+    }
+  }
+  return JSON.stringify(error);
 }
 
 export class ElectrumClient {
@@ -111,18 +129,46 @@ export class ElectrumClient {
     return this.call("blockchain.scripthash.get_history", [scripthash]) as Promise<HistoryItem[]>;
   }
 
+  async getHistoryBatch(scripthashes: string[]): Promise<HistoryItem[][]> {
+    return this.batchCall(
+      "blockchain.scripthash.get_history",
+      scripthashes.map((scripthash) => [scripthash]),
+    ) as Promise<HistoryItem[][]>;
+  }
+
   async getTransaction(txHash: string): Promise<string> {
     return this.call("blockchain.transaction.get", [txHash]) as Promise<string>;
+  }
+
+  async getTransactionBatch(txHashes: string[]): Promise<string[]> {
+    return this.batchCall(
+      "blockchain.transaction.get",
+      txHashes.map((txHash) => [txHash]),
+    ) as Promise<string[]>;
   }
 
   async listUnspent(scripthash: string): Promise<UnspentItem[]> {
     return this.call("blockchain.scripthash.listunspent", [scripthash]) as Promise<UnspentItem[]>;
   }
 
+  async listUnspentBatch(scripthashes: string[]): Promise<UnspentItem[][]> {
+    return this.batchCall(
+      "blockchain.scripthash.listunspent",
+      scripthashes.map((scripthash) => [scripthash]),
+    ) as Promise<UnspentItem[][]>;
+  }
+
   async getBalance(scripthash: string): Promise<ScripthashBalance> {
     return this.call("blockchain.scripthash.get_balance", [
       scripthash,
     ]) as Promise<ScripthashBalance>;
+  }
+
+  async getBalanceBatch(scripthashes: string[]): Promise<ScripthashBalance[]> {
+    return this.batchCall(
+      "blockchain.scripthash.get_balance",
+      scripthashes.map((scripthash) => [scripthash]),
+    ) as Promise<ScripthashBalance[]>;
   }
 
   async broadcast(rawTx: string): Promise<string> {
@@ -136,6 +182,13 @@ export class ElectrumClient {
   // Returns block header as hex string (80 bytes = 160 hex chars)
   async getBlockHeader(height: number): Promise<string> {
     return this.call("blockchain.block.header", [height]) as Promise<string>;
+  }
+
+  async getBlockHeaderBatch(heights: number[]): Promise<string[]> {
+    return this.batchCall(
+      "blockchain.block.header",
+      heights.map((height) => [height]),
+    ) as Promise<string[]>;
   }
 
   // Subscribe to headers — returns current tip {height, hex}
@@ -163,6 +216,53 @@ export class ElectrumClient {
     });
   }
 
+  private async batchCall(method: string, paramsList: unknown[][]): Promise<unknown[]> {
+    if (paramsList.length === 0) {
+      return [];
+    }
+
+    const results: unknown[] = [];
+    for (let start = 0; start < paramsList.length; start += ELECTRUM_BATCH_LIMIT) {
+      results.push(
+        ...(await this.batchCallChunk(
+          method,
+          paramsList.slice(start, start + ELECTRUM_BATCH_LIMIT),
+        )),
+      );
+    }
+    return results;
+  }
+
+  private batchCallChunk(method: string, paramsList: unknown[][]): Promise<unknown[]> {
+    if (paramsList.length === 0) {
+      return Promise.resolve([]);
+    }
+
+    return new Promise((resolve, reject) => {
+      if (!this.socket) {
+        reject(new Error("Not connected"));
+        return;
+      }
+
+      const requests: JsonRpcRequest[] = [];
+      const promises = paramsList.map(
+        (params) =>
+          new Promise<unknown>((resolveRequest, rejectRequest) => {
+            const id = this.nextId++;
+            const timer = setTimeout(() => {
+              this.pending.delete(id);
+              rejectRequest(new Error(`Request timeout: ${method}`));
+            }, REQUEST_TIMEOUT);
+            this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
+            requests.push({ jsonrpc: "2.0", method, params, id });
+          }),
+      );
+
+      Promise.all(promises).then(resolve, reject);
+      this.socket.write(JSON.stringify(requests) + "\n");
+    });
+  }
+
   private onData(chunk: string): void {
     this.buffer += chunk;
     const lines = this.buffer.split("\n");
@@ -171,18 +271,38 @@ export class ElectrumClient {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-        const req = this.pending.get(msg.id);
-        if (!req) continue;
-        this.pending.delete(msg.id);
-        clearTimeout(req.timer);
-        if (msg.error) {
-          req.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
-        } else {
-          req.resolve(msg.result);
-        }
+        this.handleMessage(msg);
       } catch {
         // ignore malformed lines
       }
+    }
+  }
+
+  private handleMessage(msg: unknown): void {
+    if (Array.isArray(msg)) {
+      for (const item of msg) {
+        this.handleMessage(item);
+      }
+      return;
+    }
+    if (typeof msg !== "object" || msg === null) {
+      return;
+    }
+
+    const response = msg as Record<string, unknown>;
+    if (typeof response.id !== "number") {
+      return;
+    }
+
+    const req = this.pending.get(response.id);
+    if (!req) return;
+    this.pending.delete(response.id);
+    clearTimeout(req.timer);
+
+    if (response.error) {
+      req.reject(new Error(getJsonRpcErrorMessage(response.error)));
+    } else {
+      req.resolve(response.result);
     }
   }
 
