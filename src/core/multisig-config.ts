@@ -1,5 +1,10 @@
 import { HDKey } from "@scure/bip32";
-import { formalizePath, parseSignerDescriptor, type ParsedDescriptor } from "./descriptor.js";
+import {
+  buildWalletDescriptor,
+  formalizePath,
+  parseSignerDescriptor,
+  type ParsedDescriptor,
+} from "./descriptor.js";
 import type { Network } from "./config.js";
 import { MAINNET_VERSIONS, TESTNET_VERSIONS } from "./address.js";
 
@@ -157,5 +162,12 @@ export function parseMultisigConfig(content: string, network: Network): ParsedDe
     throw new Error("Invalid parameters n, m");
   }
 
-  return { m, n, addressType, signers };
+  return {
+    descriptor: buildWalletDescriptor(signers, m, addressType),
+    kind: "multisig",
+    m,
+    n,
+    addressType,
+    signers,
+  };
 }

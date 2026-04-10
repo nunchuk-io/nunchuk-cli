@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSignerDescriptor } from "../descriptor.js";
+import { buildWalletDescriptor, parseSignerDescriptor } from "../descriptor.js";
 import { buildMultisigConfig, parseMultisigConfig } from "../multisig-config.js";
 
 const TEST_SIGNERS = [
@@ -75,6 +75,8 @@ describe("parseMultisigConfig", () => {
     const parsed = parseMultisigConfig(content, "testnet");
 
     expect(parsed).toEqual({
+      descriptor: buildWalletDescriptor(TEST_SIGNERS, 2, 3),
+      kind: "multisig",
       m: 2,
       n: 2,
       addressType: 3,
