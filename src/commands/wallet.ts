@@ -14,6 +14,7 @@ import {
   parseDescriptor,
   parseBsmsRecord,
 } from "../core/descriptor.js";
+import { buildMultisigConfig, parseMultisigConfig } from "../core/multisig-config.js";
 import { deriveFirstAddress } from "../core/address.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
 import { recoverWallet } from "../core/wallet.js";
@@ -48,6 +49,13 @@ function parseSigningDelayOption(value: string): number {
   } catch (err) {
     throw new InvalidArgumentError((err as Error).message);
   }
+}
+
+function looksLikeMultisigConfig(content: string): boolean {
+  return (
+    /(^|\n)\s*(name|policy|format|derivation)\s*:/i.test(content) ||
+    /(^|\n)\s*[0-9a-fA-F]{8}\s*:/i.test(content)
+  );
 }
 
 function formatWalletOutput<T extends { addressType?: number }>(
@@ -215,9 +223,13 @@ walletCommand
 
 walletCommand
   .command("export")
-  .description("Export wallet descriptor and/or BSMS record")
+  .description("Export wallet descriptor, multisig config, or BSMS record")
   .argument("<wallet-id>", "Local wallet ID")
-  .option("--type <type>", "Export type: descriptor (default) or bsms", "descriptor")
+  .option(
+    "--type <type>",
+    "Export type: descriptor (default), multisig-config, or bsms",
+    "descriptor",
+  )
   .option(
     "--format <format>",
     "Descriptor format: internal (default, BIP-389) or all (/0/*)",
@@ -238,9 +250,12 @@ walletCommand
       const type = options.type as string;
       const format = options.format as string;
 
-      if (!["descriptor", "bsms"].includes(type)) {
+      if (!["descriptor", "multisig-config", "bsms"].includes(type)) {
         printError(
-          { error: "INVALID_TYPE", message: `Unknown type: ${type}. Use descriptor or bsms` },
+          {
+            error: "INVALID_TYPE",
+            message: `Unknown type: ${type}. Use descriptor, multisig-config, or bsms`,
+          },
           cmd,
         );
         return;
@@ -252,7 +267,7 @@ walletCommand
         );
         return;
       }
-      if (type === "bsms" && format !== "internal") {
+      if (type !== "descriptor" && format !== "internal") {
         printError(
           { error: "INVALID_OPTION", message: "--format is only valid with --type descriptor" },
           cmd,
@@ -272,6 +287,23 @@ walletCommand
           console.log(descriptor);
           console.error(
             "\nTip: Save to file for recovery: nunchuk wallet export <id> > wallet-backup.txt",
+          );
+        }
+      } else if (type === "multisig-config") {
+        const multisigConfig = buildMultisigConfig(
+          wallet.name,
+          wallet.signers,
+          wallet.m,
+          wallet.n,
+          wallet.addressType,
+        );
+
+        if (globals.json) {
+          print({ multisigConfig }, cmd);
+        } else {
+          console.log(multisigConfig);
+          console.error(
+            "\nTip: Save to file for multisig config import: nunchuk wallet export <id> --type multisig-config > wallet-backup.txt",
           );
         }
       } else {
@@ -357,12 +389,12 @@ walletCommand
     }
   });
 
-// wallet recover — Recover a group wallet from a descriptor/BSMS backup file
+// wallet recover — Recover a group wallet from a descriptor/BSMS/multisig config backup file
 // Reference: libnunchuk RecoverGroupWallet (nunchukgroupwallet.cpp:539-552)
 walletCommand
   .command("recover")
-  .description("Recover a group wallet from a descriptor or BSMS backup file")
-  .requiredOption("--file <path>", "Path to BSMS or descriptor backup file")
+  .description("Recover a group wallet from a descriptor, multisig config, or BSMS backup file")
+  .requiredOption("--file <path>", "Path to BSMS, descriptor, or multisig config backup file")
   .option("--name <name>", "Wallet name", "Group wallet")
   .action(async (options, cmd) => {
     try {
@@ -383,9 +415,17 @@ walletCommand
         return;
       }
 
-      const parsed = fileContent.startsWith("BSMS 1.0")
-        ? await parseBsmsRecord(fileContent, network)
-        : parseDescriptor(fileContent);
+      const parsed = await (async () => {
+        if (fileContent.startsWith("BSMS 1.0")) {
+          return parseBsmsRecord(fileContent, network);
+        }
+
+        if (looksLikeMultisigConfig(fileContent)) {
+          return parseMultisigConfig(fileContent, network);
+        }
+
+        return parseDescriptor(fileContent);
+      })();
 
       const client = new ApiClient(apiKey, network);
       const result = await recoverWallet({

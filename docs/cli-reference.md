@@ -475,11 +475,11 @@ nunchuk wallet address get wallet_abc123
 
 ### `nunchuk wallet export <wallet-id>`
 
-Export wallet descriptor or BSMS record for backup and recovery. Output is raw content suitable for piping to a file.
+Export wallet descriptor, multisig config, or BSMS record for backup and interoperability. Output is raw content suitable for piping to a file.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--type <type>` | `descriptor` | Export type: `descriptor` or `bsms` |
+| `--type <type>` | `descriptor` | Export type: `descriptor`, `multisig-config`, or `bsms` |
 | `--format <format>` | `internal` | Descriptor format: `internal` (BIP-389 `/<0;1>/*`) or `all` (`/0/*`). Only valid with `--type descriptor` |
 
 ```bash
@@ -489,11 +489,15 @@ nunchuk wallet export wallet_abc123
 # Export descriptor with external format
 nunchuk wallet export wallet_abc123 --format all
 
+# Export multisig config
+nunchuk wallet export wallet_abc123 --type multisig-config
+
 # Export BSMS record
 nunchuk wallet export wallet_abc123 --type bsms
 
-# Save to file for recovery
+# Save to file
 nunchuk wallet export wallet_abc123 > wallet-backup.txt
+nunchuk wallet export wallet_abc123 --type multisig-config > wallet-multisig-config.txt
 nunchuk wallet export wallet_abc123 --type bsms > wallet-backup.bsms
 ```
 
@@ -524,16 +528,19 @@ nunchuk wallet delete wallet_abc123
 
 ### `nunchuk wallet recover`
 
-Recover a group wallet from a descriptor or BSMS 1.0 backup file. The command parses the file, derives the wallet's group ID, verifies the wallet exists on the server, calls the recover API, and saves the wallet locally.
+Recover a group wallet from a descriptor, multisig config, or BSMS 1.0 backup file. The command parses the file, derives the wallet's group ID, verifies the wallet exists on the server, calls the recover API, and saves the wallet locally.
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
-| `--file <path>` | Yes | — | Path to BSMS or descriptor backup file |
+| `--file <path>` | Yes | — | Path to BSMS, descriptor, or multisig config backup file |
 | `--name <name>` | No | `Group wallet` | Wallet name |
 
 ```bash
 # Recover from a BSMS backup
 nunchuk wallet recover --file wallet-backup.bsms
+
+# Recover from a multisig config file
+nunchuk wallet recover --file wallet-multisig-config.txt
 
 # Recover from a descriptor file with a custom name
 nunchuk wallet recover --file descriptor.txt --name "Recovered Vault"

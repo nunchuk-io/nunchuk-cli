@@ -72,12 +72,12 @@ interface SignerDescriptor {
 }
 
 export function parseSignerDescriptor(desc: string): SignerDescriptor {
-  // Parse "[xfp/path]xpub" format
-  const match = desc.match(/^\[([0-9a-fA-F]+)(\/[^\]]*)\](.+)$/);
+  // Parse "[xfp/path]xpub" or "[xfp]xpub" format
+  const match = desc.match(/^\[([0-9a-fA-F]+)(\/[^\]]*)?\](.+)$/);
   if (!match) throw new Error(`Invalid signer descriptor: ${desc}`);
   return {
     masterFingerprint: match[1],
-    derivationPath: match[2],
+    derivationPath: match[2] ?? "",
     xpub: match[3],
   };
 }

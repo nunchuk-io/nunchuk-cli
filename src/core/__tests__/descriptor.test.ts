@@ -121,6 +121,15 @@ describe("parseDescriptor", () => {
     const result = parseDescriptor(`${body}#${checksum}`);
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
+
+  it("parses signer descriptor without derivation path", () => {
+    const signer = parseSignerDescriptor(
+      "[534a4a82]tpubDFeha94AzbvqSzMLj6iihYeP1zwfW3KgNcmd7oXvKD9dApjWK4KT1RzzbSNUgmsgBs8sshky7pLTUZahkfPTNVck2fwS5wXyn1nTAy8jZCJ",
+    );
+
+    expect(signer.masterFingerprint).toBe("534a4a82");
+    expect(signer.derivationPath).toBe("");
+  });
 });
 
 describe("parseBsmsRecord", () => {
