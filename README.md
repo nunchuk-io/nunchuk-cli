@@ -5,7 +5,7 @@ A command-line tool that lets AI agents use Bitcoin safely. Agents operate withi
 Built for integration with AI agent frameworks. See [agent-skills](https://github.com/nunchuk-io/agent-skills) for ready-made skills.
 
 - ✅ Group Wallet (m-of-n multisig)
-- 🛠 Miniscript Wallet
+- ✅ Miniscript Wallet (native segwit; Taproot next phase)
 
 ## Prerequisites
 
@@ -53,6 +53,10 @@ nunchuk --network testnet auth login
 # Create a 2-of-3 sandbox (defaults to NATIVE_SEGWIT)
 nunchuk sandbox create --name "My Wallet" --m 2 --n 3
 
+# Or create a native-segwit miniscript sandbox from a signer-name template
+nunchuk sandbox create --name "Mini Wallet" \
+  --miniscript-template "or_d(multi(2,key_0_0,key_1_0,key_2_0),and_v(v:pk(key_3_0),after(1785542400)))"
+
 # Invite participants by email
 nunchuk invitation send <sandbox-id> alice@example.com bob@example.com
 
@@ -65,6 +69,9 @@ nunchuk invitation deny <invitation-id>
 
 # Add stored key to sandbox (auto-derives descriptor)
 nunchuk sandbox add-key <sandbox-id> --slot 0 --fingerprint <xfp>
+
+# For miniscript sandboxes, use the signer names from the template as slots
+nunchuk sandbox add-key <sandbox-id> --slot key_0_0 --fingerprint <xfp>
 
 # Or provide the full signer descriptor directly
 nunchuk sandbox add-key <sandbox-id> --slot 1 \
@@ -88,6 +95,10 @@ nunchuk wallet list --no-balance
 # Get a fresh receive address
 nunchuk wallet address get <wallet-id>
 
+# Inspect or validate miniscript spending paths
+nunchuk wallet miniscript inspect <wallet-id>
+nunchuk wallet miniscript validate --wallet <wallet-id>
+
 # Export wallet descriptor and BSMS for backup/recovery
 nunchuk wallet export <wallet-id>
 
@@ -103,11 +114,18 @@ nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --psbt <signed-psbt>
 nunchuk tx broadcast --wallet <wallet-id> --tx-id <tx-id>
 
+# For miniscript, optionally choose a path and attach required hash preimages
+nunchuk tx create --wallet <wallet-id> --to <address> --amount 100000 --miniscript-path 0
+nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --preimage <32-byte-hex>
+
 # View transaction history
 nunchuk tx list --wallet <wallet-id>
 
 # Enable platform key (auto-signing by Nunchuk backend)
 nunchuk sandbox platform-key enable <sandbox-id>
+
+# For miniscript, enable platform key for one or more named signer slots
+nunchuk sandbox platform-key enable <sandbox-id> --slot key_3_0
 
 # Set global policy with spending limit
 nunchuk sandbox platform-key set-policy <sandbox-id> \
@@ -153,84 +171,87 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 
 ### `auth`
 
-| Command | Description |
-|---------|-------------|
-| `auth login` | Authenticate with API key (use `--api-key` for non-interactive login) |
-| `auth status` | Show authentication status for the selected network |
-| `auth logout` | Remove the stored API key for the selected network |
+| Command       | Description                                                           |
+| ------------- | --------------------------------------------------------------------- |
+| `auth login`  | Authenticate with API key (use `--api-key` for non-interactive login) |
+| `auth status` | Show authentication status for the selected network                   |
+| `auth logout` | Remove the stored API key for the selected network                    |
 
 ### `network`
 
-| Command | Description |
-|---------|-------------|
+| Command                 | Description                          |
+| ----------------------- | ------------------------------------ |
 | `network set <network>` | Set network (`mainnet` or `testnet`) |
-| `network get` | Show current network |
+| `network get`           | Show current network                 |
 
 ### `key`
 
-| Command | Description |
-|---------|-------------|
-| `key generate` | Generate a new BIP39 mnemonic and save locally |
-| `key info` | Derive signer info from a stored key, mnemonic, or xprv |
-| `key list` | List locally stored keys |
+| Command        | Description                                             |
+| -------------- | ------------------------------------------------------- |
+| `key generate` | Generate a new BIP39 mnemonic and save locally          |
+| `key info`     | Derive signer info from a stored key, mnemonic, or xprv |
+| `key list`     | List locally stored keys                                |
 
 ### `sandbox`
 
-| Command | Description |
-|---------|-------------|
-| `sandbox create` | Create a new group wallet sandbox |
-| `sandbox list` | List sandbox IDs |
-| `sandbox get <id>` | Get sandbox details from server |
-| `sandbox join <id-or-url>` | Join an existing sandbox by ID or URL |
-| `sandbox add-key <id>` | Add a signer key to a slot |
-| `sandbox finalize <id>` | Finalize sandbox into an active wallet |
-| `sandbox delete <id>` | Delete a sandbox |
-| `sandbox platform-key enable <id>` | Enable platform key on a sandbox |
-| `sandbox platform-key disable <id>` | Disable platform key on a sandbox |
-| `sandbox platform-key set-policy <id>` | Set platform key policies |
-| `sandbox platform-key get <id>` | Get platform key status and policies |
+| Command                                | Description                                               |
+| -------------------------------------- | --------------------------------------------------------- |
+| `sandbox create`                       | Create a new multisig or native-segwit miniscript sandbox |
+| `sandbox list`                         | List sandbox IDs                                          |
+| `sandbox get <id>`                     | Get sandbox details from server                           |
+| `sandbox join <id-or-url>`             | Join an existing sandbox by ID or URL                     |
+| `sandbox add-key <id>`                 | Add a signer key to a slot                                |
+| `sandbox finalize <id>`                | Finalize sandbox into an active wallet                    |
+| `sandbox delete <id>`                  | Delete a sandbox                                          |
+| `sandbox platform-key enable <id>`     | Enable platform key on a sandbox                          |
+| `sandbox platform-key disable <id>`    | Disable platform key on a sandbox                         |
+| `sandbox platform-key set-policy <id>` | Set platform key policies                                 |
+| `sandbox platform-key get <id>`        | Get platform key status and policies                      |
 
 ### `invitation`
 
-| Command | Description |
-|---------|-------------|
-| `invitation send <sandbox-id> <emails...>` | Invite participants by email |
-| `invitation list [sandbox-id]` | List invitations for the current user or a sandbox |
-| `invitation accept <id>` | Accept an invitation and join its sandbox |
-| `invitation deny <id>` | Deny an invitation |
+| Command                                    | Description                                        |
+| ------------------------------------------ | -------------------------------------------------- |
+| `invitation send <sandbox-id> <emails...>` | Invite participants by email                       |
+| `invitation list [sandbox-id]`             | List invitations for the current user or a sandbox |
+| `invitation accept <id>`                   | Accept an invitation and join its sandbox          |
+| `invitation deny <id>`                     | Deny an invitation                                 |
 
 ### `wallet`
 
-| Command | Description |
-|---------|-------------|
-| `wallet list` | List wallets |
-| `wallet get <id>` | Get wallet details |
-| `wallet address get <id>` | Get a new receive address |
-| `wallet export <id>` | Export wallet descriptor and/or BSMS record |
-| `wallet delete <id>` | Delete a wallet |
-| `wallet rename <id>` | Rename a wallet locally |
-| `wallet recover` | Recover a wallet from a descriptor or BSMS backup file |
-| `wallet platform-key get <id>` | Get platform key policies for a wallet |
-| `wallet platform-key update <id>` | Request a platform key policy update |
-| `wallet dummy-tx list <id>` | List pending dummy transactions |
-| `wallet dummy-tx get <id>` | Get dummy transaction details |
-| `wallet dummy-tx sign <id>` | Sign a dummy transaction |
-| `wallet dummy-tx cancel <id>` | Cancel a dummy transaction |
+| Command                           | Description                                             |
+| --------------------------------- | ------------------------------------------------------- |
+| `wallet list`                     | List wallets                                            |
+| `wallet get <id>`                 | Get wallet details                                      |
+| `wallet address get <id>`         | Get a new receive address                               |
+| `wallet export <id>`              | Export wallet descriptor and/or BSMS record             |
+| `wallet delete <id>`              | Delete a wallet                                         |
+| `wallet rename <id>`              | Rename a wallet locally                                 |
+| `wallet recover`                  | Recover a wallet from a descriptor or BSMS backup file  |
+| `wallet miniscript inspect <id>`  | Inspect miniscript spending paths                       |
+| `wallet miniscript validate`      | Validate a miniscript wallet, descriptor, or expression |
+| `wallet platform-key get <id>`    | Get platform key policies for a wallet                  |
+| `wallet platform-key update <id>` | Request a platform key policy update                    |
+| `wallet dummy-tx list <id>`       | List pending dummy transactions                         |
+| `wallet dummy-tx get <id>`        | Get dummy transaction details                           |
+| `wallet dummy-tx sign <id>`       | Sign a dummy transaction                                |
+| `wallet dummy-tx cancel <id>`     | Cancel a dummy transaction                              |
 
 ### `tx`
 
-| Command | Description |
-|---------|-------------|
-| `tx create` | Create a new transaction |
-| `tx sign` | Sign a transaction locally (auto-detect, `--fingerprint`, or `--xprv`), or merge a signed PSBT with `--psbt` |
-| `tx broadcast` | Broadcast a fully signed transaction |
-| `tx list` | List transactions for a wallet |
-| `tx get` | Get transaction details |
+| Command        | Description                                                                                   |
+| -------------- | --------------------------------------------------------------------------------------------- |
+| `tx create`    | Create a new transaction, optionally selecting miniscript path/preimages                      |
+| `tx sign`      | Sign a transaction locally, attach miniscript preimages, or merge a signed PSBT with `--psbt` |
+| `tx broadcast` | Broadcast a fully signed transaction                                                          |
+| `tx list`      | List transactions for a wallet                                                                |
+| `tx get`       | Get transaction details                                                                       |
 
 #### `tx create`
 
 ```bash
 nunchuk tx create --wallet <id> --to <address> --amount <sats>
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --miniscript-path 0
 ```
 
 Fee rate is automatically estimated from the Nunchuk API.
@@ -241,6 +262,7 @@ Fee rate is automatically estimated from the Nunchuk API.
 nunchuk tx sign --wallet <id> --tx-id <txid>                             # auto-detect
 nunchuk tx sign --wallet <id> --tx-id <txid> --fingerprint <xfp>         # specific key
 nunchuk tx sign --wallet <id> --tx-id <txid> --xprv <extended-private-key>
+nunchuk tx sign --wallet <id> --tx-id <txid> --preimage <32-byte-hex>    # miniscript hash preimage
 nunchuk tx sign --wallet <id> --tx-id <txid> --psbt <signed-psbt-base64> # merge signed PSBT
 ```
 
@@ -252,28 +274,28 @@ nunchuk tx broadcast --wallet <id> --tx-id <txid>
 
 ### `config`
 
-| Command | Description |
-|---------|-------------|
-| `config show` | Display current configuration |
-| `config electrum get` | Show the active Electrum server for the selected network |
+| Command                        | Description                                                                             |
+| ------------------------------ | --------------------------------------------------------------------------------------- |
+| `config show`                  | Display current configuration                                                           |
+| `config electrum get`          | Show the active Electrum server for the selected network                                |
 | `config electrum set <server>` | Persist a custom Electrum server (`host:port`, `tcp://host:port`, or `ssl://host:port`) |
-| `config electrum reset` | Reset the Electrum server to the selected network default |
+| `config electrum reset`        | Reset the Electrum server to the selected network default                               |
 
 Mainnet now defaults to `ssl://mainnet.nunchuk.io:52002`.
 When the protocol is omitted, the CLI tries `ssl://` first, then `tcp://`, and only saves the server if the Electrum connection succeeds.
 
 ### `currency`
 
-| Command | Description |
-|---------|-------------|
+| Command                                 | Description                                        |
+| --------------------------------------- | -------------------------------------------------- |
 | `currency convert <amount> <from> <to>` | Convert between BTC, sat, USD, and fiat currencies |
 
 ## Global Options
 
-| Option | Description |
-|--------|-------------|
-| `--json` | Output in JSON format |
-| `--api-key <key>` | Override stored API key |
+| Option                | Description                       |
+| --------------------- | --------------------------------- |
+| `--json`              | Output in JSON format             |
+| `--api-key <key>`     | Override stored API key           |
 | `--network <network>` | Override network for this command |
 
 ## Webhooks
@@ -313,7 +335,6 @@ src/
   index.ts          # CLI entry point
   output.ts         # Output formatting (human-readable / JSON)
 ```
-
 
 ## Development
 

@@ -1,6 +1,6 @@
 # Nunchuk CLI Reference
 
-Command-line interface for Nunchuk group wallet management.
+Command-line interface for Nunchuk group and native-segwit miniscript wallet management.
 
 ## Installation
 
@@ -22,10 +22,10 @@ npm link       # links local build as global `nunchuk` command
 
 ## Global Options
 
-| Flag | Description |
-|------|-------------|
-| `--json` | Output in JSON format (useful for scripting and AI agents) |
-| `--api-key <key>` | Override stored API key for this command |
+| Flag                  | Description                                                                           |
+| --------------------- | ------------------------------------------------------------------------------------- |
+| `--json`              | Output in JSON format (useful for scripting and AI agents)                            |
+| `--api-key <key>`     | Override stored API key for this command                                              |
 | `--network <network>` | Override network (`mainnet` or `testnet`), including the selected stored auth profile |
 
 ## Configuration
@@ -33,6 +33,7 @@ npm link       # links local build as global `nunchuk` command
 Session settings are stored in `~/.nunchuk-cli/config.json` (file mode `0600`). Secrets and per-user metadata live in encrypted per-account SQLite databases at `~/.nunchuk-cli/data/<emailHash>/<network>/storage.sqlite`.
 
 Fields in `config.json`:
+
 - `network` — Active network (`mainnet` or `testnet`)
 - `mainnet.email` / `testnet.email` — Active user profile pointer for that network
 - `mainnet.electrumServer` / `testnet.electrumServer` — Optional custom Electrum endpoint override
@@ -42,6 +43,7 @@ API key resolution order: `--api-key` flag > `NUNCHUK_API_KEY` env var > selecte
 Network resolution order: `--network` flag > config file > `mainnet` default.
 
 Electrum defaults:
+
 - `mainnet` — `ssl://mainnet.nunchuk.io:52002`
 - `testnet` — `tcp://testnet.nunchuk.io:50001`
 
@@ -66,6 +68,7 @@ nunchuk auth login
 ```
 
 Output:
+
 ```
   status: authenticated
   email: user@example.com
@@ -73,6 +76,7 @@ Output:
 ```
 
 JSON output (`--json`):
+
 ```json
 {
   "status": "authenticated",
@@ -90,6 +94,7 @@ nunchuk auth status
 ```
 
 Output (authenticated):
+
 ```
   status: authenticated
   network: testnet
@@ -98,6 +103,7 @@ Output (authenticated):
 ```
 
 Output (not authenticated):
+
 ```
   status: not_authenticated
   network: testnet
@@ -112,6 +118,7 @@ nunchuk auth logout
 ```
 
 Output:
+
 ```
   status: logged_out
   network: testnet
@@ -123,6 +130,7 @@ Output:
 ## Network Commands
 
 Select between mainnet and testnet. Each network uses a different API server:
+
 - **mainnet**: `https://api.nunchuk.io`
 - **testnet**: `https://api-testnet.nunchuk.io`
 
@@ -130,8 +138,8 @@ Select between mainnet and testnet. Each network uses a different API server:
 
 Set the active network.
 
-| Argument | Description |
-|----------|-------------|
+| Argument    | Description            |
+| ----------- | ---------------------- |
 | `<network>` | `mainnet` or `testnet` |
 
 ```bash
@@ -147,6 +155,7 @@ nunchuk network get
 ```
 
 Output:
+
 ```
   network: testnet
 ```
@@ -155,20 +164,23 @@ Output:
 
 ## Sandbox Commands
 
-Manage group wallet sandboxes. A sandbox is a pre-wallet state where participants assemble their signer keys before finalizing into an active multisig wallet.
+Manage group wallet sandboxes. A sandbox is a pre-wallet state where participants assemble their signer keys before finalizing into an active multisig or native-segwit miniscript wallet.
 
 ### `nunchuk sandbox create`
 
-Create a new group wallet sandbox. The sandbox state is end-to-end encrypted using the selected network's ephemeral keypair generated during login.
+Create a new group wallet sandbox. Use `--m` and `--n` for standard multisig, or `--miniscript-template` for native-segwit miniscript. The sandbox state is end-to-end encrypted using the selected network's ephemeral keypair generated during login.
 
-| Option | Required | Default | Description |
-|--------|----------|---------|-------------|
-| `--name <name>` | Yes | — | Wallet name |
-| `--m <number>` | Yes | — | Required signatures (must be <= n) |
-| `--n <number>` | Yes | — | Total signers (must be >= 2) |
-| `--address-type <type>` | No | `NATIVE_SEGWIT` | Address type |
+| Option                             | Required        | Default         | Description                                                 |
+| ---------------------------------- | --------------- | --------------- | ----------------------------------------------------------- |
+| `--name <name>`                    | Yes             | —               | Wallet name                                                 |
+| `--m <number>`                     | Multisig only   | —               | Required signatures (must be <= n)                          |
+| `--n <number>`                     | Multisig only   | —               | Total signers (must be >= 2)                                |
+| `--miniscript-template <template>` | Miniscript only | —               | Bare miniscript template using signer names, e.g. `key_0_0` |
+| `--address-type <type>`            | No              | `NATIVE_SEGWIT` | Address type                                                |
 
-Valid address types: `NATIVE_SEGWIT`, `NESTED_SEGWIT`, `LEGACY`, `TAPROOT`
+Valid multisig address types: `NATIVE_SEGWIT`, `NESTED_SEGWIT`, `LEGACY`, `TAPROOT`.
+
+Miniscript sandboxes currently support `NATIVE_SEGWIT` only. Taproot/tapscript miniscript is not supported in this phase. Do not combine `--miniscript-template` with `--m` or `--n`; the signer count is derived from the signer names in the template.
 
 ```bash
 # Uses default NATIVE_SEGWIT
@@ -176,6 +188,10 @@ nunchuk sandbox create --name "Team Vault" --m 2 --n 3
 
 # Explicit address type
 nunchuk sandbox create --name "Team Vault" --m 2 --n 3 --address-type NESTED_SEGWIT
+
+# Native-segwit miniscript
+nunchuk sandbox create --name "Mini Vault" \
+  --miniscript-template "or_d(multi(2,key_0_0,key_1_0,key_2_0),and_v(v:pk(key_3_0),after(1785542400)))"
 ```
 
 ### `nunchuk sandbox list`
@@ -190,9 +206,9 @@ nunchuk sandbox list
 
 Get details of a specific sandbox.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
+| Argument       | Description |
+| -------------- | ----------- |
+| `<sandbox-id>` | Sandbox ID  |
 
 ```bash
 nunchuk sandbox get abc123
@@ -202,8 +218,8 @@ nunchuk sandbox get abc123
 
 Join an existing sandbox as a participant.
 
-| Argument | Description |
-|----------|-------------|
+| Argument              | Description            |
+| --------------------- | ---------------------- |
 | `<sandbox-id-or-url>` | Sandbox ID or join URL |
 
 ```bash
@@ -215,20 +231,23 @@ nunchuk sandbox join https://nunchuk.io/join/abc123
 
 Add a signer key to a specific slot in the sandbox.
 
-| Argument / Option | Required | Description |
-|-------------------|----------|-------------|
-| `<sandbox-id>` | Yes | Sandbox ID |
-| `--slot <number>` | Yes | Slot index (0-based) |
-| `--fingerprint <xfp>` | Conditionally | Master fingerprint (8 hex chars). Alone = look up stored key and auto-derive descriptor. With `--xpub` + `--path` = manual descriptor |
-| `--descriptor <descriptor>` | Conditionally | Full signer descriptor in `[xfp/path]xpub` format (`h` and `'` both supported) |
-| `--xpub <xpub>` | Conditionally | Extended public key (requires `--fingerprint` and `--path`) |
-| `--path <path>` | Conditionally | BIP derivation path, e.g. `m/48h/0h/0h/2h` (requires `--fingerprint` and `--xpub`) |
+| Argument / Option           | Required      | Description                                                                                                                           |
+| --------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `<sandbox-id>`              | Yes           | Sandbox ID                                                                                                                            |
+| `--slot <slot>`             | Yes           | Slot index for multisig, or signer name from the miniscript template                                                                  |
+| `--fingerprint <xfp>`       | Conditionally | Master fingerprint (8 hex chars). Alone = look up stored key and auto-derive descriptor. With `--xpub` + `--path` = manual descriptor |
+| `--descriptor <descriptor>` | Conditionally | Full signer descriptor in `[xfp/path]xpub` format (`h` and `'` both supported)                                                        |
+| `--xpub <xpub>`             | Conditionally | Extended public key (requires `--fingerprint` and `--path`)                                                                           |
+| `--path <path>`             | Conditionally | BIP derivation path, e.g. `m/48h/0h/0h/2h` (requires `--fingerprint` and `--xpub`)                                                    |
 
-Three modes: `--fingerprint` alone (stored key), `--descriptor`, or `--fingerprint` + `--xpub` + `--path`.
+Three key input modes: `--fingerprint` alone (stored key), `--descriptor`, or `--fingerprint` + `--xpub` + `--path`.
 
 ```bash
 # Use a stored key (simplest)
 nunchuk sandbox add-key abc123 --slot 0 --fingerprint 73c5da0a
+
+# Use a stored key for a miniscript named slot
+nunchuk sandbox add-key abc123 --slot key_0_0 --fingerprint 73c5da0a
 
 # Or provide a full descriptor
 nunchuk sandbox add-key abc123 \
@@ -247,9 +266,9 @@ nunchuk sandbox add-key abc123 \
 
 Finalize a sandbox into an active wallet. All signer slots must be filled before finalizing.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
+| Argument       | Description |
+| -------------- | ----------- |
+| `<sandbox-id>` | Sandbox ID  |
 
 ```bash
 nunchuk sandbox finalize abc123
@@ -259,9 +278,9 @@ nunchuk sandbox finalize abc123
 
 Delete a sandbox permanently.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
+| Argument       | Description |
+| -------------- | ----------- |
+| `<sandbox-id>` | Sandbox ID  |
 
 ```bash
 nunchuk sandbox delete abc123
@@ -269,23 +288,29 @@ nunchuk sandbox delete abc123
 
 ### `nunchuk sandbox platform-key enable <sandbox-id>`
 
-Enable platform key on a sandbox. Reserves the last signer slot (index `n-1`) for the Nunchuk-held platform key and adds the backend's public key to the encrypted group state.
+Enable platform key on a sandbox. For multisig sandboxes, this reserves the last signer slot (index `n-1`) for the Nunchuk-held platform key. For miniscript sandboxes, pass one or more named signer slots with `--slot`; those slots are filled by the backend platform key.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
+| Argument / Option | Description                                                              |
+| ----------------- | ------------------------------------------------------------------------ |
+| `<sandbox-id>`    | Sandbox ID                                                               |
+| `--slot <slot>`   | Miniscript signer slot name; repeat or comma-separate for multiple slots |
 
 ```bash
+# Multisig
 nunchuk sandbox platform-key enable abc123
+
+# Miniscript
+nunchuk sandbox platform-key enable abc123 --slot key_3_0
+nunchuk sandbox platform-key enable abc123 --slot key_2_0,key_3_0
 ```
 
 ### `nunchuk sandbox platform-key disable <sandbox-id>`
 
 Disable platform key on a sandbox. Removes the backend's public key from the group state and frees the last signer slot.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
+| Argument       | Description |
+| -------------- | ----------- |
+| `<sandbox-id>` | Sandbox ID  |
 
 ```bash
 nunchuk sandbox platform-key disable abc123
@@ -299,14 +324,14 @@ Three input modes:
 
 **1. CLI flags** (one policy at a time):
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--signer <xfp>` | string | _(none — global)_ | Target signer fingerprint (per-signer policy) |
-| `--auto-broadcast` | boolean | `false` | Auto-broadcast after signing |
-| `--signing-delay <duration>` | string | `0` | Delay before signing as seconds or `30s`, `15m`, `24h`, `7d` |
-| `--limit-amount <amount>` | string | _(none)_ | Spending limit amount |
-| `--limit-currency <currency>` | string | _(none)_ | Spending limit currency (USD, BTC, sat) |
-| `--limit-interval <interval>` | string | _(none)_ | DAILY, WEEKLY, MONTHLY, YEARLY |
+| Option                        | Type    | Default           | Description                                                  |
+| ----------------------------- | ------- | ----------------- | ------------------------------------------------------------ |
+| `--signer <xfp>`              | string  | _(none — global)_ | Target signer fingerprint (per-signer policy)                |
+| `--auto-broadcast`            | boolean | `false`           | Auto-broadcast after signing                                 |
+| `--signing-delay <duration>`  | string  | `0`               | Delay before signing as seconds or `30s`, `15m`, `24h`, `7d` |
+| `--limit-amount <amount>`     | string  | _(none)_          | Spending limit amount                                        |
+| `--limit-currency <currency>` | string  | _(none)_          | Spending limit currency (USD, BTC, sat)                      |
+| `--limit-interval <interval>` | string  | _(none)_          | DAILY, WEEKLY, MONTHLY, YEARLY                               |
 
 ```bash
 # Global policy
@@ -355,15 +380,16 @@ Global and per-signer policies are mutually exclusive. When using `--signer` wit
 
 Show platform key status and policies for a sandbox.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
+| Argument       | Description |
+| -------------- | ----------- |
+| `<sandbox-id>` | Sandbox ID  |
 
 ```bash
 nunchuk sandbox platform-key get abc123
 ```
 
 Output when enabled:
+
 ```
 Platform Key:    Enabled
 Policy Type:     Global
@@ -373,6 +399,7 @@ Spending Limit:  1000 USD / DAILY
 ```
 
 Output when disabled:
+
 ```
 Platform Key:    Disabled
 ```
@@ -387,10 +414,10 @@ Manage wallet invitations.
 
 Invite one or more people to a sandbox by email.
 
-| Argument | Description |
-|----------|-------------|
-| `<sandbox-id>` | Sandbox ID |
-| `<emails...>` | One or more recipient emails |
+| Argument       | Description                  |
+| -------------- | ---------------------------- |
+| `<sandbox-id>` | Sandbox ID                   |
+| `<emails...>`  | One or more recipient emails |
 
 The command accepts either space-separated emails or comma-separated batches.
 
@@ -430,14 +457,14 @@ nunchuk invitation deny 9d53f7aa-1234-4567-89ab-0123456789ab
 
 ## Wallet Commands
 
-Manage finalized group wallets.
+Manage finalized group wallets, including multisig and native-segwit miniscript wallets.
 
 ### `nunchuk wallet list`
 
 List all wallets stored locally.
 
-| Option | Description |
-|--------|-------------|
+| Option         | Description                                                        |
+| -------------- | ------------------------------------------------------------------ |
 | `--no-balance` | Skip Electrum balance lookup and return local wallet metadata only |
 
 ```bash
@@ -450,10 +477,10 @@ nunchuk wallet list --no-balance
 
 Get locally stored wallet details.
 
-| Argument / Option | Description |
-|-------------------|-------------|
-| `<wallet-id>` | Wallet ID |
-| `--no-balance` | Skip Electrum balance lookup and return local wallet metadata only |
+| Argument / Option | Description                                                        |
+| ----------------- | ------------------------------------------------------------------ |
+| `<wallet-id>`     | Wallet ID                                                          |
+| `--no-balance`    | Skip Electrum balance lookup and return local wallet metadata only |
 
 ```bash
 nunchuk wallet get wallet_abc123
@@ -465,9 +492,9 @@ nunchuk wallet get wallet_abc123 --no-balance
 
 Get a fresh receive address for a wallet. The CLI scans receive-chain history with Electrum, finds the highest used receive index, and returns the next receive address to avoid reuse.
 
-| Argument | Description |
-|----------|-------------|
-| `<wallet-id>` | Wallet ID |
+| Argument      | Description |
+| ------------- | ----------- |
+| `<wallet-id>` | Wallet ID   |
 
 ```bash
 nunchuk wallet address get wallet_abc123
@@ -475,12 +502,12 @@ nunchuk wallet address get wallet_abc123
 
 ### `nunchuk wallet export <wallet-id>`
 
-Export wallet descriptor, multisig config, or BSMS record for backup and interoperability. Output is raw content suitable for piping to a file.
+Export wallet descriptor, multisig config, or BSMS record for backup and interoperability. Descriptor and BSMS exports support both multisig and miniscript wallets. Output is raw content suitable for piping to a file.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--type <type>` | `descriptor` | Export type: `descriptor`, `multisig-config`, or `bsms` |
-| `--format <format>` | `internal` | Descriptor format: `internal` (BIP-389 `/<0;1>/*`) or `all` (`/0/*`). Only valid with `--type descriptor` |
+| Option              | Default      | Description                                                                                               |
+| ------------------- | ------------ | --------------------------------------------------------------------------------------------------------- |
+| `--type <type>`     | `descriptor` | Export type: `descriptor`, `multisig-config`, or `bsms`                                                   |
+| `--format <format>` | `internal`   | Descriptor format: `internal` (BIP-389 `/<0;1>/*`) or `all` (`/0/*`). Only valid with `--type descriptor` |
 
 ```bash
 # Export descriptor (default)
@@ -505,10 +532,10 @@ nunchuk wallet export wallet_abc123 --type bsms > wallet-backup.bsms
 
 Rename a wallet locally. This only changes the local name; it does not update the server.
 
-| Argument / Option | Required | Description |
-|-------------------|----------|-------------|
-| `<wallet-id>` | Yes | Wallet ID |
-| `--name <name>` | Yes | New wallet name |
+| Argument / Option | Required | Description     |
+| ----------------- | -------- | --------------- |
+| `<wallet-id>`     | Yes      | Wallet ID       |
+| `--name <name>`   | Yes      | New wallet name |
 
 ```bash
 nunchuk wallet rename wallet_abc123 --name "Savings Vault"
@@ -518,9 +545,9 @@ nunchuk wallet rename wallet_abc123 --name "Savings Vault"
 
 Delete a wallet from the server and remove local data.
 
-| Argument | Description |
-|----------|-------------|
-| `<wallet-id>` | Wallet ID |
+| Argument      | Description |
+| ------------- | ----------- |
+| `<wallet-id>` | Wallet ID   |
 
 ```bash
 nunchuk wallet delete wallet_abc123
@@ -528,12 +555,12 @@ nunchuk wallet delete wallet_abc123
 
 ### `nunchuk wallet recover`
 
-Recover a group wallet from a descriptor, multisig config, or BSMS 1.0 backup file. The command parses the file, derives the wallet's group ID, verifies the wallet exists on the server, calls the recover API, and saves the wallet locally.
+Recover a wallet from a descriptor, multisig config, or BSMS 1.0 backup file. The command parses the file, derives the wallet's group ID, verifies the wallet exists on the server, calls the recover API, and saves the wallet locally.
 
-| Option | Required | Default | Description |
-|--------|----------|---------|-------------|
-| `--file <path>` | Yes | — | Path to BSMS, descriptor, or multisig config backup file |
-| `--name <name>` | No | `Group wallet` | Wallet name |
+| Option          | Required | Default        | Description                                              |
+| --------------- | -------- | -------------- | -------------------------------------------------------- |
+| `--file <path>` | Yes      | —              | Path to BSMS, descriptor, or multisig config backup file |
+| `--name <name>` | No       | `Group wallet` | Wallet name                                              |
 
 ```bash
 # Recover from a BSMS backup
@@ -547,23 +574,57 @@ nunchuk wallet recover --file descriptor.txt --name "Recovered Vault"
 ```
 
 If the wallet already exists locally, the command returns without overwriting:
+
 ```json
 { "status": "already_exists", "wallet": { ... } }
+```
+
+### `nunchuk wallet miniscript inspect <wallet-id>`
+
+Inspect spending paths for a local miniscript wallet. The command lists each supported path, required signatures, locktime, sequence, signer names, and hash-preimage requirements.
+
+| Argument / Option    | Required | Description                                          |
+| -------------------- | -------- | ---------------------------------------------------- |
+| `<wallet-id>`        | Yes      | Wallet ID                                            |
+| `--locktime <value>` | No       | Evaluate satisfiability at this transaction locktime |
+| `--sequence <value>` | No       | Evaluate satisfiability at this input sequence       |
+
+```bash
+nunchuk wallet miniscript inspect w123
+nunchuk wallet miniscript inspect w123 --locktime 1785542400 --sequence 0xfffffffe
+```
+
+### `nunchuk wallet miniscript validate`
+
+Validate a miniscript wallet, descriptor, or bare miniscript expression. Provide exactly one source: `--wallet`, `--descriptor`, or `--miniscript`.
+
+| Option                      | Required      | Default         | Description                                                           |
+| --------------------------- | ------------- | --------------- | --------------------------------------------------------------------- |
+| `--wallet <wallet-id>`      | Conditionally | —               | Validate a local wallet                                               |
+| `--descriptor <descriptor>` | Conditionally | —               | Validate a miniscript descriptor                                      |
+| `--miniscript <expression>` | Conditionally | —               | Validate a bare miniscript expression                                 |
+| `--address-type <type>`     | No            | `NATIVE_SEGWIT` | Address type for `--miniscript`: `ANY`, `NATIVE_SEGWIT`, or `TAPROOT` |
+
+```bash
+nunchuk wallet miniscript validate --wallet w123
+nunchuk wallet miniscript validate --descriptor "wsh(and_v(v:pk([abcd1234/48h/0h/0h/2h]xpub.../<0;1>/*),after(1785542400)))"
+nunchuk wallet miniscript validate --miniscript "and_v(v:pk(key_0_0),after(1785542400))"
 ```
 
 ### `nunchuk wallet platform-key get <wallet-id>`
 
 Get current platform key policies for a finalized wallet.
 
-| Argument | Description |
-|----------|-------------|
-| `<wallet-id>` | Wallet ID |
+| Argument      | Description |
+| ------------- | ----------- |
+| `<wallet-id>` | Wallet ID   |
 
 ```bash
 nunchuk wallet platform-key get w123
 ```
 
 Output:
+
 ```
 Policy Type:     Global
 Auto Broadcast:  true
@@ -575,19 +636,20 @@ Spending Limit:  500 USD / DAILY
 
 Request a wallet platform key policy update. The request may apply immediately or may create a dummy transaction that needs approval signatures.
 
-| Argument / Option | Required | Description |
-|-------------------|----------|-------------|
-| `<wallet-id>` | Yes | Wallet ID |
-| `--signer <xfp>` | No | Target signer fingerprint (per-key policy) |
-| `--auto-broadcast` | No | Auto-broadcast after signing |
-| `--signing-delay <duration>` | No | Delay before signing (`30s`, `15m`, `24h`, `7d`, or raw seconds) |
-| `--limit-amount <amount>` | No | Spending limit amount |
-| `--limit-currency <currency>` | No | Spending limit currency (`USD`, `BTC`, `sat`) |
-| `--limit-interval <interval>` | No | Spending limit interval (`DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`) |
-| `--policy-json <json>` | No | Full policy as JSON string |
-| `--policy-file <path>` | No | Path to policy JSON file |
+| Argument / Option             | Required | Description                                                      |
+| ----------------------------- | -------- | ---------------------------------------------------------------- |
+| `<wallet-id>`                 | Yes      | Wallet ID                                                        |
+| `--signer <xfp>`              | No       | Target signer fingerprint (per-key policy)                       |
+| `--auto-broadcast`            | No       | Auto-broadcast after signing                                     |
+| `--signing-delay <duration>`  | No       | Delay before signing (`30s`, `15m`, `24h`, `7d`, or raw seconds) |
+| `--limit-amount <amount>`     | No       | Spending limit amount                                            |
+| `--limit-currency <currency>` | No       | Spending limit currency (`USD`, `BTC`, `sat`)                    |
+| `--limit-interval <interval>` | No       | Spending limit interval (`DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`) |
+| `--policy-json <json>`        | No       | Full policy as JSON string                                       |
+| `--policy-file <path>`        | No       | Path to policy JSON file                                         |
 
 Use exactly one input mode:
+
 - flags
 - `--policy-json`
 - `--policy-file`
@@ -612,9 +674,9 @@ nunchuk wallet platform-key update w123 --policy-file policy.json
 
 List pending dummy transactions. Dummy transactions are created by the server when a platform key policy change requires multi-sig approval.
 
-| Argument | Description |
-|----------|-------------|
-| `<wallet-id>` | Wallet ID |
+| Argument      | Description |
+| ------------- | ----------- |
+| `<wallet-id>` | Wallet ID   |
 
 ```bash
 nunchuk wallet dummy-tx list w123
@@ -624,16 +686,17 @@ nunchuk wallet dummy-tx list w123
 
 Get details of a specific dummy transaction, including old/new policies and signature status.
 
-| Argument / Option | Required | Description |
-|-------------------|----------|-------------|
-| `<wallet-id>` | Yes | Wallet ID |
-| `--dummy-tx-id <id>` | Yes | Dummy transaction ID |
+| Argument / Option    | Required | Description          |
+| -------------------- | -------- | -------------------- |
+| `<wallet-id>`        | Yes      | Wallet ID            |
+| `--dummy-tx-id <id>` | Yes      | Dummy transaction ID |
 
 ```bash
 nunchuk wallet dummy-tx get w123 --dummy-tx-id 694364702230188032
 ```
 
 Output:
+
 ```
 ID:              694364702230188032
 Type:            UPDATE_PLATFORM_KEY_POLICIES
@@ -659,12 +722,12 @@ Sign a dummy transaction. Creates a dummy PSBT from the transaction's request bo
 
 If enough signatures are collected, the server applies the policy change and deletes the dummy transaction. The command will then display the updated policy.
 
-| Argument / Option | Required | Description |
-|-------------------|----------|-------------|
-| `<wallet-id>` | Yes | Wallet ID |
-| `--dummy-tx-id <id>` | Yes | Dummy transaction ID |
-| `--fingerprint <xfp>` | No | Fingerprint of a stored key |
-| `--xprv <xprv>` | No | Extended private key for signing |
+| Argument / Option     | Required | Description                      |
+| --------------------- | -------- | -------------------------------- |
+| `<wallet-id>`         | Yes      | Wallet ID                        |
+| `--dummy-tx-id <id>`  | Yes      | Dummy transaction ID             |
+| `--fingerprint <xfp>` | No       | Fingerprint of a stored key      |
+| `--xprv <xprv>`       | No       | Extended private key for signing |
 
 ```bash
 # Auto-sign with all matching stored keys
@@ -684,10 +747,10 @@ nunchuk wallet dummy-tx sign w123 \
 
 Cancel a pending dummy transaction.
 
-| Argument / Option | Required | Description |
-|-------------------|----------|-------------|
-| `<wallet-id>` | Yes | Wallet ID |
-| `--dummy-tx-id <id>` | Yes | Dummy transaction ID |
+| Argument / Option    | Required | Description          |
+| -------------------- | -------- | -------------------- |
+| `<wallet-id>`        | Yes      | Wallet ID            |
+| `--dummy-tx-id <id>` | Yes      | Dummy transaction ID |
 
 ```bash
 nunchuk wallet dummy-tx cancel w123 --dummy-tx-id 694364702230188032
@@ -703,32 +766,39 @@ Create, sign, and broadcast transactions.
 
 Create a new transaction. Builds a PSBT locally and uploads to the group server for signer coordination.
 
-| Option | Required | Description |
-|--------|----------|-------------|
-| `--wallet <wallet-id>` | Yes | Wallet ID |
-| `--to <address>` | Yes | Recipient Bitcoin address |
-| `--amount <value>` | Yes | Amount to send (default unit: sat) |
-| `--currency <code>` | No | Currency for amount. Supports BTC, USD, and fiat codes |
+| Option                      | Required | Description                                                         |
+| --------------------------- | -------- | ------------------------------------------------------------------- |
+| `--wallet <wallet-id>`      | Yes      | Wallet ID                                                           |
+| `--to <address>`            | Yes      | Recipient Bitcoin address                                           |
+| `--amount <value>`          | Yes      | Amount to send (default unit: sat)                                  |
+| `--currency <code>`         | No       | Currency for amount. Supports BTC, USD, and fiat codes              |
+| `--miniscript-path <index>` | No       | Select a miniscript signing path by index                           |
+| `--preimage <hex>`          | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
 
 Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback).
+
+For miniscript wallets, the CLI selects the first satisfiable supported path with the fewest preimage requirements unless `--miniscript-path` is provided. The selected path sets transaction locktime and input sequence when required.
 
 ```bash
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000
 nunchuk tx create --wallet w123 --to bc1q... --amount 0.001 --currency BTC
 nunchuk tx create --wallet w123 --to bc1q... --amount 50 --currency USD
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --miniscript-path 0
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --preimage <32-byte-hex>
 ```
 
 ### `nunchuk tx sign`
 
 Sign a transaction. By default, this fetches the PSBT from the group server, signs matching inputs locally, and re-uploads the merged result. You can also pass `--psbt <base64>` to merge an externally signed PSBT into the current pending transaction. Upload only happens when the merge adds new data.
 
-| Option | Required | Description |
-|--------|----------|-------------|
-| `--wallet <wallet-id>` | Yes | Wallet ID |
-| `--tx-id <tx-id>` | Yes | Transaction ID |
-| `--psbt <psbt>` | No | Signed PSBT to merge into the current pending transaction |
-| `--fingerprint <xfp>` | No | Fingerprint of a stored key |
-| `--xprv <xprv>` | No | Extended private key for signing |
+| Option                 | Required | Description                                                         |
+| ---------------------- | -------- | ------------------------------------------------------------------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID                                                           |
+| `--tx-id <tx-id>`      | Yes      | Transaction ID                                                      |
+| `--psbt <psbt>`        | No       | Signed PSBT to merge into the current pending transaction           |
+| `--fingerprint <xfp>`  | No       | Fingerprint of a stored key                                         |
+| `--xprv <xprv>`        | No       | Extended private key for signing                                    |
+| `--preimage <hex>`     | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
 
 ```bash
 # Auto-sign with all matching stored keys
@@ -740,6 +810,9 @@ nunchuk tx sign --wallet w123 --tx-id tx456 --fingerprint 73c5da0a
 # Or provide xprv directly
 nunchuk tx sign --wallet w123 --tx-id tx456 --xprv "xprv..."
 
+# Attach required miniscript hash preimages
+nunchuk tx sign --wallet w123 --tx-id tx456 --preimage <32-byte-hex>
+
 # Or merge an externally signed PSBT
 nunchuk tx sign --wallet w123 --tx-id tx456 --psbt "cHNidP8B..."
 ```
@@ -748,10 +821,10 @@ nunchuk tx sign --wallet w123 --tx-id tx456 --psbt "cHNidP8B..."
 
 Broadcast a fully signed transaction to the network.
 
-| Option | Required | Description |
-|--------|----------|-------------|
-| `--wallet <wallet-id>` | Yes | Wallet ID |
-| `--tx-id <tx-id>` | Yes | Transaction ID |
+| Option                 | Required | Description    |
+| ---------------------- | -------- | -------------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID      |
+| `--tx-id <tx-id>`      | Yes      | Transaction ID |
 
 ```bash
 nunchuk tx broadcast --wallet w123 --tx-id tx456
@@ -759,11 +832,11 @@ nunchuk tx broadcast --wallet w123 --tx-id tx456
 
 ### `nunchuk tx list`
 
-List transactions for a wallet.
+List transactions for a wallet. For miniscript wallets, pending transaction status is derived from the PSBT when enough metadata is available.
 
-| Option | Required | Description |
-|--------|----------|-------------|
-| `--wallet <wallet-id>` | Yes | Wallet ID |
+| Option                 | Required | Description |
+| ---------------------- | -------- | ----------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID   |
 
 ```bash
 nunchuk tx list --wallet w123
@@ -771,12 +844,12 @@ nunchuk tx list --wallet w123
 
 ### `nunchuk tx get`
 
-Get transaction details.
+Get transaction details. Miniscript transactions include selected path details such as required signatures, locktime, sequence, signer names, and hash-preimage requirements.
 
-| Option | Required | Description |
-|--------|----------|-------------|
-| `--wallet <wallet-id>` | Yes | Wallet ID |
-| `--tx-id <tx-id>` | Yes | Transaction ID |
+| Option                 | Required | Description    |
+| ---------------------- | -------- | -------------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID      |
+| `--tx-id <tx-id>`      | Yes      | Transaction ID |
 
 ```bash
 nunchuk tx get --wallet w123 --tx-id tx456
@@ -792,10 +865,10 @@ Generate and manage software signing keys (BIP39 mnemonics).
 
 Generate a new BIP39 mnemonic and save to local storage. The mnemonic is displayed once — back it up securely.
 
-| Option | Required | Default | Description |
-|--------|----------|---------|-------------|
-| `--name <name>` | No | `My key #N` | Name for the key |
-| `--words <count>` | No | `24` | Number of words (12 or 24) |
+| Option            | Required | Default     | Description                |
+| ----------------- | -------- | ----------- | -------------------------- |
+| `--name <name>`   | No       | `My key #N` | Name for the key           |
+| `--words <count>` | No       | `24`        | Number of words (12 or 24) |
 
 ```bash
 nunchuk key generate
@@ -803,6 +876,7 @@ nunchuk key generate --name "Alice" --words 12
 ```
 
 Output:
+
 ```
 MNEMONIC (back up these words securely!):
   abandon abandon abandon ... about
@@ -817,14 +891,14 @@ Key saved to local storage.
 
 Derive signer info (fingerprint, path, xpub, descriptor) from a stored key, mnemonic, or master xprv. Derivation is done on demand — the stored mnemonic can produce info for any address type.
 
-| Option | Required | Default | Description |
-|--------|----------|---------|-------------|
-| `--fingerprint <xfp>` | Conditionally | — | Fingerprint of a stored key |
-| `--mnemonic <words>` | Conditionally | — | BIP39 mnemonic (wrap in quotes) |
-| `--xprv <xprv>` | Conditionally | — | BIP32 master extended private key |
-| `--passphrase <passphrase>` | No | — | BIP39 passphrase (only with --mnemonic) |
-| `--address-type <type>` | No | `NATIVE_SEGWIT` | Address type for derivation |
-| `--path <path>` | No | — | Custom derivation path (overrides --address-type) |
+| Option                      | Required      | Default         | Description                                       |
+| --------------------------- | ------------- | --------------- | ------------------------------------------------- |
+| `--fingerprint <xfp>`       | Conditionally | —               | Fingerprint of a stored key                       |
+| `--mnemonic <words>`        | Conditionally | —               | BIP39 mnemonic (wrap in quotes)                   |
+| `--xprv <xprv>`             | Conditionally | —               | BIP32 master extended private key                 |
+| `--passphrase <passphrase>` | No            | —               | BIP39 passphrase (only with --mnemonic)           |
+| `--address-type <type>`     | No            | `NATIVE_SEGWIT` | Address type for derivation                       |
+| `--path <path>`             | No            | —               | Custom derivation path (overrides --address-type) |
 
 Provide exactly one of `--fingerprint`, `--mnemonic`, or `--xprv`.
 
@@ -846,6 +920,7 @@ nunchuk key info --fingerprint 73c5da0a --path "m/48'/0'/1'/2'"
 ```
 
 Output:
+
 ```
 Fingerprint:   73c5da0a
 Network:       testnet
@@ -864,6 +939,7 @@ nunchuk key list
 ```
 
 Output:
+
 ```
 name           fingerprint   createdAt
 Alice          73c5da0a      2026-04-03T01:00:00.000Z
@@ -896,8 +972,8 @@ nunchuk config electrum get
 
 Persist a custom Electrum server for the selected network.
 
-| Argument | Description |
-|----------|-------------|
+| Argument   | Description                                                                      |
+| ---------- | -------------------------------------------------------------------------------- |
 | `<server>` | Electrum endpoint in `host:port`, `tcp://host:port`, or `ssl://host:port` format |
 
 If the protocol is omitted, the CLI probes `ssl://` first and then `tcp://`. The server is only saved if the Electrum connection and `server.version` handshake succeed.
@@ -926,13 +1002,14 @@ Currency conversion helpers using Nunchuk market rates.
 
 Convert between `BTC`, `sat`, `USD`, and fiat currencies using Nunchuk market rates.
 
-| Argument | Description |
-|----------|-------------|
+| Argument   | Description                    |
+| ---------- | ------------------------------ |
 | `<amount>` | Non-negative amount to convert |
-| `<from>` | Source currency |
-| `<to>` | Target currency |
+| `<from>`   | Source currency                |
+| `<to>`     | Target currency                |
 
 Notes:
+
 - `BTC`, `USD`, and fiat currencies are case-insensitive.
 - `sat`, `sats`, `satoshi`, and `satoshis` are all accepted.
 - Conversions use `https://api.nunchuk.io/v1.1/prices` and `https://api.nunchuk.io/v1.1/forex/rates`.
@@ -960,11 +1037,18 @@ nunchuk key generate --name "Alice"
 # 4. Create a 2-of-3 multisig sandbox
 nunchuk sandbox create --name "Team Vault" --m 2 --n 3
 
+# Or create a native-segwit miniscript sandbox
+nunchuk sandbox create --name "Mini Vault" \
+  --miniscript-template "or_d(multi(2,key_0_0,key_1_0,key_2_0),and_v(v:pk(key_3_0),after(1785542400)))"
+
 # 5. Share the sandbox ID with participants
 # They run: nunchuk sandbox join <sandbox-id>
 
 # 6. Add stored key to sandbox (auto-derives descriptor)
 nunchuk sandbox add-key <sandbox-id> --slot 0 --fingerprint <xfp>
+
+# For miniscript, use the signer names from the template
+nunchuk sandbox add-key <sandbox-id> --slot key_0_0 --fingerprint <xfp>
 
 # 7. Finalize into an active wallet
 nunchuk sandbox finalize <sandbox-id>
@@ -973,6 +1057,10 @@ nunchuk sandbox finalize <sandbox-id>
 nunchuk tx create --wallet <wallet-id> --to bc1q... --amount 100000
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>
 nunchuk tx broadcast --wallet <wallet-id> --tx-id <tx-id>
+
+# For miniscript, inspect paths and optionally choose one
+nunchuk wallet miniscript inspect <wallet-id>
+nunchuk tx create --wallet <wallet-id> --to bc1q... --amount 100000 --miniscript-path 0
 
 # 9. View transaction history
 nunchuk tx list --wallet <wallet-id>
