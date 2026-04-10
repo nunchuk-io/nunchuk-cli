@@ -582,11 +582,10 @@ export async function createTransaction(
   // Step 2: Fetch full previous transactions for nonWitnessUtxo
   // Reference: FillPsbt adds non_witness_utxo from database (walletdb.cpp:1074-1089)
   const prevTxCache = new Map<string, string>();
-  for (const utxo of utxos) {
-    if (!prevTxCache.has(utxo.txHash)) {
-      const rawHex = await electrum.getTransaction(utxo.txHash);
-      prevTxCache.set(utxo.txHash, rawHex);
-    }
+  const uniquePrevTxIds = [...new Set(utxos.map((utxo) => utxo.txHash))];
+  const prevTxHexes = await electrum.getTransactionBatch(uniquePrevTxIds);
+  for (let i = 0; i < uniquePrevTxIds.length; i++) {
+    prevTxCache.set(uniquePrevTxIds[i], prevTxHexes[i]);
   }
 
   // Step 3: Build PSBT input metadata for each UTXO
@@ -812,18 +811,26 @@ export async function getWalletBalance(
     let startIndex = 0;
     let consecutiveEmpty = 0;
     while (consecutiveEmpty < GAP_LIMIT) {
-      const addresses = deriveWalletAddresses(wallet, network, chain, startIndex, 1);
-      const scripthash = addressToScripthash(addresses[0], network);
-      const history = await electrum.getHistory(scripthash);
+      const batchSize = GAP_LIMIT - consecutiveEmpty;
+      const addresses = deriveWalletAddresses(wallet, network, chain, startIndex, batchSize);
+      const scripthashes = addresses.map((address) => addressToScripthash(address, network));
+      const histories = await electrum.getHistoryBatch(scripthashes);
+      const usedScripthashes = scripthashes.filter((_, index) => histories[index].length > 0);
+      const balances =
+        usedScripthashes.length > 0 ? await electrum.getBalanceBatch(usedScripthashes) : [];
+      let balanceIndex = 0;
 
-      if (history.length > 0) {
-        const bal = await electrum.getBalance(scripthash);
-        total += BigInt(bal.confirmed) + BigInt(bal.unconfirmed);
-        consecutiveEmpty = 0;
-      } else {
-        consecutiveEmpty++;
+      for (const history of histories) {
+        if (history.length > 0) {
+          const bal = balances[balanceIndex++];
+          total += BigInt(bal.confirmed) + BigInt(bal.unconfirmed);
+          consecutiveEmpty = 0;
+        } else {
+          consecutiveEmpty++;
+        }
+        if (consecutiveEmpty >= GAP_LIMIT) break;
       }
-      startIndex++;
+      startIndex += batchSize;
     }
   }
 
@@ -840,18 +847,22 @@ export async function getNextReceiveAddress(
   let highestUsedIndex = -1;
 
   while (consecutiveEmpty < GAP_LIMIT) {
-    const address = deriveWalletAddresses(wallet, network, 0, startIndex, 1)[0];
-    const scripthash = addressToScripthash(address, network);
-    const history = await electrum.getHistory(scripthash);
+    const batchSize = GAP_LIMIT - consecutiveEmpty;
+    const addresses = deriveWalletAddresses(wallet, network, 0, startIndex, batchSize);
+    const scripthashes = addresses.map((address) => addressToScripthash(address, network));
+    const histories = await electrum.getHistoryBatch(scripthashes);
 
-    if (history.length > 0) {
-      highestUsedIndex = startIndex;
-      consecutiveEmpty = 0;
-    } else {
-      consecutiveEmpty++;
+    for (let offset = 0; offset < histories.length; offset++) {
+      if (histories[offset].length > 0) {
+        highestUsedIndex = startIndex + offset;
+        consecutiveEmpty = 0;
+      } else {
+        consecutiveEmpty++;
+      }
+      if (consecutiveEmpty >= GAP_LIMIT) break;
     }
 
-    startIndex++;
+    startIndex += batchSize;
   }
 
   const index = highestUsedIndex + 1;
@@ -874,13 +885,27 @@ export async function scanUtxos(
     let startIndex = 0;
     let consecutiveEmpty = 0;
     while (consecutiveEmpty < GAP_LIMIT) {
-      const addresses = deriveWalletAddresses(wallet, network, chain, startIndex, 1);
-      const addr = addresses[0];
-      const scripthash = addressToScripthash(addr, network);
-      const unspent = await electrum.listUnspent(scripthash);
-      const isUsed = unspent.length > 0 || (await electrum.getHistory(scripthash)).length > 0;
+      const batchSize = GAP_LIMIT - consecutiveEmpty;
+      const addresses = deriveWalletAddresses(wallet, network, chain, startIndex, batchSize);
+      const scripthashes = addresses.map((address) => addressToScripthash(address, network));
+      const unspentBatch = await electrum.listUnspentBatch(scripthashes);
+      const emptyIndexes = unspentBatch
+        .map((unspent, index) => (unspent.length === 0 ? index : -1))
+        .filter((index) => index >= 0);
+      const emptyHistories =
+        emptyIndexes.length > 0
+          ? await electrum.getHistoryBatch(emptyIndexes.map((index) => scripthashes[index]))
+          : [];
+      const emptyHistoryByIndex = new Map<number, HistoryItem[]>();
+      for (let i = 0; i < emptyIndexes.length; i++) {
+        emptyHistoryByIndex.set(emptyIndexes[i], emptyHistories[i]);
+      }
 
-      if (unspent.length > 0) {
+      for (let offset = 0; offset < addresses.length; offset++) {
+        const addr = addresses[offset];
+        const unspent = unspentBatch[offset];
+        const isUsed = unspent.length > 0 || (emptyHistoryByIndex.get(offset)?.length ?? 0) > 0;
+
         for (const u of unspent) {
           utxos.push({
             txHash: u.tx_hash,
@@ -891,15 +916,16 @@ export async function scanUtxos(
             address: addr,
           });
         }
-      }
 
-      if (isUsed) {
-        consecutiveEmpty = 0;
-        if (chain === 1) nextChangeIndex = startIndex + 1;
-      } else {
-        consecutiveEmpty++;
+        if (isUsed) {
+          consecutiveEmpty = 0;
+          if (chain === 1) nextChangeIndex = startIndex + offset + 1;
+        } else {
+          consecutiveEmpty++;
+        }
+        if (consecutiveEmpty >= GAP_LIMIT) break;
       }
-      startIndex++;
+      startIndex += batchSize;
     }
   }
 
@@ -1185,6 +1211,66 @@ export function decodePsbtDetail(
 
 // -- Confirmed transactions from Electrum --
 
+async function fetchTransactionBatchMap(
+  electrum: ElectrumClient,
+  txHashes: string[],
+): Promise<Map<string, string>> {
+  const unique = [...new Set(txHashes)];
+  const result = new Map<string, string>();
+  if (unique.length === 0) {
+    return result;
+  }
+
+  try {
+    const rawHexes = await electrum.getTransactionBatch(unique);
+    for (let i = 0; i < unique.length; i++) {
+      result.set(unique[i], rawHexes[i]);
+    }
+    return result;
+  } catch {
+    await Promise.all(
+      unique.map(async (txHash) => {
+        try {
+          result.set(txHash, await electrum.getTransaction(txHash));
+        } catch {
+          // Keep per-transaction failure behavior for history display.
+        }
+      }),
+    );
+    return result;
+  }
+}
+
+async function fetchBlockHeaderBatchMap(
+  electrum: ElectrumClient,
+  heights: number[],
+): Promise<Map<number, string>> {
+  const unique = [...new Set(heights.filter((height) => height > 0))];
+  const result = new Map<number, string>();
+  if (unique.length === 0) {
+    return result;
+  }
+
+  try {
+    const headers = await electrum.getBlockHeaderBatch(unique);
+    for (let i = 0; i < unique.length; i++) {
+      result.set(unique[i], headers[i]);
+    }
+    return result;
+  } catch {
+    await Promise.all(
+      unique.map(async (height) => {
+        try {
+          result.set(height, await electrum.getBlockHeader(height));
+        } catch {
+          // blocktime stays 0 if a header cannot be resolved
+        }
+      }),
+    );
+    return result;
+  }
+}
+
 export async function fetchConfirmedTransactions(
   wallet: WalletData,
   network: Network,
@@ -1207,10 +1293,12 @@ export async function fetchConfirmedTransactions(
       while (consecutiveEmpty < GAP_LIMIT) {
         const batchSize = GAP_LIMIT - consecutiveEmpty;
         const addresses = deriveWalletAddresses(wallet, network, chain, startIndex, batchSize);
-        for (const addr of addresses) {
+        const scripthashes = addresses.map((addr) => addressToScripthash(addr, network));
+        const histories = await electrum.getHistoryBatch(scripthashes);
+        for (let offset = 0; offset < addresses.length; offset++) {
+          const addr = addresses[offset];
           walletAddresses.add(addr);
-          const scripthash = addressToScripthash(addr, network);
-          const history = await electrum.getHistory(scripthash);
+          const history = histories[offset];
           if (history.length > 0) {
             allHistory.push(...history);
             consecutiveEmpty = 0;
@@ -1231,13 +1319,43 @@ export async function fetchConfirmedTransactions(
       }
     }
 
-    const blockTimeCache = new Map<number, number>();
+    const uniqueTxEntries = [...uniqueTxs.entries()];
+    const rawTxByHash = await fetchTransactionBatchMap(
+      electrum,
+      uniqueTxEntries.map(([txHash]) => txHash),
+    );
 
-    const confirmed: ConfirmedTx[] = [];
-    for (const [txHash, { height, fee: historyFee }] of uniqueTxs) {
+    const txByHash = new Map<string, Transaction>();
+    const prevTxIds = new Set<string>();
+    for (const [txHash] of uniqueTxEntries) {
+      const rawHex = rawTxByHash.get(txHash);
+      if (!rawHex) continue;
       try {
-        const rawHex = await electrum.getTransaction(txHash);
         const tx = Transaction.fromRaw(Buffer.from(rawHex, "hex"), { allowUnknownOutputs: true });
+        txByHash.set(txHash, tx);
+        for (let i = 0; i < tx.inputsLength; i++) {
+          const inp = tx.getInput(i);
+          if (inp.txid) {
+            prevTxIds.add(Buffer.from(inp.txid).toString("hex"));
+          }
+        }
+      } catch {
+        // Keep the fallback row for malformed transaction data.
+      }
+    }
+
+    const prevRawTxByHash = await fetchTransactionBatchMap(electrum, [...prevTxIds]);
+    const blockHeadersByHeight = await fetchBlockHeaderBatchMap(
+      electrum,
+      uniqueTxEntries.map(([, { height }]) => height),
+    );
+    const confirmed: ConfirmedTx[] = [];
+    for (const [txHash, { height, fee: historyFee }] of uniqueTxEntries) {
+      try {
+        const tx = txByHash.get(txHash);
+        if (!tx) {
+          throw new Error("Transaction not found");
+        }
 
         let amount = 0n;
         let totalIn = 0n;
@@ -1265,7 +1383,10 @@ export async function fetchConfirmedTransactions(
           if (inp.txid) {
             try {
               const prevTxId = Buffer.from(inp.txid).toString("hex");
-              const prevHex = await electrum.getTransaction(prevTxId);
+              const prevHex = prevRawTxByHash.get(prevTxId);
+              if (!prevHex) {
+                continue;
+              }
               const prevTx = Transaction.fromRaw(Buffer.from(prevHex, "hex"), {
                 allowUnknownOutputs: true,
               });
@@ -1292,16 +1413,9 @@ export async function fetchConfirmedTransactions(
 
         let blocktime = 0;
         if (height > 0) {
-          if (blockTimeCache.has(height)) {
-            blocktime = blockTimeCache.get(height)!;
-          } else {
-            try {
-              const headerHex = await electrum.getBlockHeader(height);
-              blocktime = parseBlockTime(headerHex);
-              blockTimeCache.set(height, blocktime);
-            } catch {
-              // blocktime stays 0
-            }
+          const headerHex = blockHeadersByHeight.get(height);
+          if (headerHex) {
+            blocktime = parseBlockTime(headerHex);
           }
         }
 

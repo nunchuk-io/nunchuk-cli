@@ -699,9 +699,10 @@ txCommand
           // Check both receive (chain=0) and change (chain=1) addresses
           const receiveAddrs = deriveDescriptorAddresses(wallet.descriptor, network, 0, 0, 20);
           const allAddrs = [...receiveAddrs, ...changeAddrs];
-          for (const addr of allAddrs) {
-            const sh = addressToScripthash(addr, network);
-            const hist = await electrum.getHistory(sh);
+          const histories = await electrum.getHistoryBatch(
+            allAddrs.map((addr) => addressToScripthash(addr, network)),
+          );
+          for (const hist of histories) {
             const match = hist.find((h) => h.tx_hash === options.txId);
             if (match) {
               height = match.height;

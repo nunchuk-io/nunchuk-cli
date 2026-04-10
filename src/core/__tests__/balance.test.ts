@@ -55,20 +55,29 @@ function createMockElectrum(
   balanceMap: Record<string, ScripthashBalance>,
   historyMap: Record<string, HistoryItem[]> = {},
 ): ElectrumClient {
+  const getHistory = vi.fn(async (scripthash: string) => {
+    if (historyMap[scripthash]) {
+      return historyMap[scripthash];
+    }
+    const balance = balanceMap[scripthash];
+    if (balance && (balance.confirmed !== 0 || balance.unconfirmed !== 0)) {
+      return [{ tx_hash: `tx-${scripthash}`, height: 1 }];
+    }
+    return [];
+  });
+  const getBalance = vi.fn(async (scripthash: string) => {
+    return balanceMap[scripthash] ?? { confirmed: 0, unconfirmed: 0 };
+  });
+
   return {
-    getHistory: vi.fn(async (scripthash: string) => {
-      if (historyMap[scripthash]) {
-        return historyMap[scripthash];
-      }
-      const balance = balanceMap[scripthash];
-      if (balance && (balance.confirmed !== 0 || balance.unconfirmed !== 0)) {
-        return [{ tx_hash: `tx-${scripthash}`, height: 1 }];
-      }
-      return [];
-    }),
-    getBalance: vi.fn(async (scripthash: string) => {
-      return balanceMap[scripthash] ?? { confirmed: 0, unconfirmed: 0 };
-    }),
+    getHistory,
+    getHistoryBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getHistory)),
+    ),
+    getBalance,
+    getBalanceBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getBalance)),
+    ),
   } as unknown as ElectrumClient;
 }
 
@@ -76,27 +85,41 @@ function createMockUtxoElectrum(
   unspentMap: Record<string, UnspentItem[]>,
   historyMap: Record<string, HistoryItem[]> = {},
 ): ElectrumClient {
+  const getHistory = vi.fn(async (scripthash: string) => {
+    if (historyMap[scripthash]) {
+      return historyMap[scripthash];
+    }
+    if ((unspentMap[scripthash] ?? []).length > 0) {
+      return [{ tx_hash: `tx-${scripthash}`, height: 1 }];
+    }
+    return [];
+  });
+  const listUnspent = vi.fn(async (scripthash: string) => unspentMap[scripthash] ?? []);
+
   return {
-    getHistory: vi.fn(async (scripthash: string) => {
-      if (historyMap[scripthash]) {
-        return historyMap[scripthash];
-      }
-      if ((unspentMap[scripthash] ?? []).length > 0) {
-        return [{ tx_hash: `tx-${scripthash}`, height: 1 }];
-      }
-      return [];
-    }),
-    listUnspent: vi.fn(async (scripthash: string) => unspentMap[scripthash] ?? []),
+    getHistory,
+    getHistoryBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getHistory)),
+    ),
+    listUnspent,
+    listUnspentBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(listUnspent)),
+    ),
   } as unknown as ElectrumClient;
 }
 
 function createMockHistoryElectrum(
   historyMap: Record<string, Array<{ tx_hash: string; height: number }>>,
 ): ElectrumClient {
+  const getHistory = vi.fn(async (scripthash: string) => {
+    return historyMap[scripthash] ?? [];
+  });
+
   return {
-    getHistory: vi.fn(async (scripthash: string) => {
-      return historyMap[scripthash] ?? [];
-    }),
+    getHistory,
+    getHistoryBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getHistory)),
+    ),
   } as unknown as ElectrumClient;
 }
 
