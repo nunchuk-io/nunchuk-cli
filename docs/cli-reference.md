@@ -579,38 +579,6 @@ If the wallet already exists locally, the command returns without overwriting:
 { "status": "already_exists", "wallet": { ... } }
 ```
 
-### `nunchuk wallet miniscript inspect <wallet-id>`
-
-Inspect spending paths for a local miniscript wallet. The command lists each supported path, required signatures, locktime, sequence, signer names, and hash-preimage requirements.
-
-| Argument / Option    | Required | Description                                          |
-| -------------------- | -------- | ---------------------------------------------------- |
-| `<wallet-id>`        | Yes      | Wallet ID                                            |
-| `--locktime <value>` | No       | Evaluate satisfiability at this transaction locktime |
-| `--sequence <value>` | No       | Evaluate satisfiability at this input sequence       |
-
-```bash
-nunchuk wallet miniscript inspect w123
-nunchuk wallet miniscript inspect w123 --locktime 1785542400 --sequence 0xfffffffe
-```
-
-### `nunchuk wallet miniscript validate`
-
-Validate a miniscript wallet, descriptor, or bare miniscript expression. Provide exactly one source: `--wallet`, `--descriptor`, or `--miniscript`.
-
-| Option                      | Required      | Default         | Description                                                           |
-| --------------------------- | ------------- | --------------- | --------------------------------------------------------------------- |
-| `--wallet <wallet-id>`      | Conditionally | —               | Validate a local wallet                                               |
-| `--descriptor <descriptor>` | Conditionally | —               | Validate a miniscript descriptor                                      |
-| `--miniscript <expression>` | Conditionally | —               | Validate a bare miniscript expression                                 |
-| `--address-type <type>`     | No            | `NATIVE_SEGWIT` | Address type for `--miniscript`: `ANY`, `NATIVE_SEGWIT`, or `TAPROOT` |
-
-```bash
-nunchuk wallet miniscript validate --wallet w123
-nunchuk wallet miniscript validate --descriptor "wsh(and_v(v:pk([abcd1234/48h/0h/0h/2h]xpub.../<0;1>/*),after(1785542400)))"
-nunchuk wallet miniscript validate --miniscript "and_v(v:pk(key_0_0),after(1785542400))"
-```
-
 ### `nunchuk wallet platform-key get <wallet-id>`
 
 Get current platform key policies for a finalized wallet.
@@ -754,6 +722,51 @@ Cancel a pending dummy transaction.
 
 ```bash
 nunchuk wallet dummy-tx cancel w123 --dummy-tx-id 694364702230188032
+```
+
+---
+
+## Miniscript Commands
+
+Inspect and validate miniscript wallets, descriptors, and bare miniscript expressions.
+
+### `nunchuk miniscript inspect`
+
+Inspect spending paths for a miniscript wallet, descriptor, or bare expression. The command lists each supported path, required signatures, locktime, sequence, signer names, and hash-preimage requirements.
+
+Provide exactly one source: `--wallet`, `--descriptor`, or `--miniscript`.
+
+| Option                      | Required      | Default         | Description                                                           |
+| --------------------------- | ------------- | --------------- | --------------------------------------------------------------------- |
+| `--wallet <wallet-id>`      | Conditionally | —               | Inspect a local wallet                                                |
+| `--descriptor <descriptor>` | Conditionally | —               | Inspect a miniscript descriptor                                       |
+| `--miniscript <expression>` | Conditionally | —               | Inspect a bare miniscript expression                                  |
+| `--address-type <type>`     | No            | `NATIVE_SEGWIT` | Address type for `--miniscript`: `ANY`, `NATIVE_SEGWIT`, or `TAPROOT` |
+| `--locktime <value>`        | No            | —               | Evaluate satisfiability at this transaction locktime                  |
+| `--sequence <value>`        | No            | —               | Evaluate satisfiability at this input sequence                        |
+
+```bash
+nunchuk miniscript inspect --wallet w123
+nunchuk miniscript inspect --wallet w123 --locktime 1785542400 --sequence 0xfffffffe
+nunchuk miniscript inspect --descriptor "wsh(and_v(v:pk([abcd1234/48h/0h/0h/2h]xpub.../<0;1>/*),after(1785542400)))"
+nunchuk miniscript inspect --miniscript "and_v(v:pk(key_0_0),after(1785542400))"
+```
+
+### `nunchuk miniscript validate`
+
+Validate a miniscript wallet, descriptor, or bare miniscript expression. Provide exactly one source: `--wallet`, `--descriptor`, or `--miniscript`.
+
+| Option                      | Required      | Default         | Description                                                           |
+| --------------------------- | ------------- | --------------- | --------------------------------------------------------------------- |
+| `--wallet <wallet-id>`      | Conditionally | —               | Validate a local wallet                                               |
+| `--descriptor <descriptor>` | Conditionally | —               | Validate a miniscript descriptor                                      |
+| `--miniscript <expression>` | Conditionally | —               | Validate a bare miniscript expression                                 |
+| `--address-type <type>`     | No            | `NATIVE_SEGWIT` | Address type for `--miniscript`: `ANY`, `NATIVE_SEGWIT`, or `TAPROOT` |
+
+```bash
+nunchuk miniscript validate --wallet w123
+nunchuk miniscript validate --descriptor "wsh(and_v(v:pk([abcd1234/48h/0h/0h/2h]xpub.../<0;1>/*),after(1785542400)))"
+nunchuk miniscript validate --miniscript "and_v(v:pk(key_0_0),after(1785542400))"
 ```
 
 ---
@@ -1059,7 +1072,7 @@ nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>
 nunchuk tx broadcast --wallet <wallet-id> --tx-id <tx-id>
 
 # For miniscript, inspect paths and optionally choose one
-nunchuk wallet miniscript inspect <wallet-id>
+nunchuk miniscript inspect --wallet <wallet-id>
 nunchuk tx create --wallet <wallet-id> --to bc1q... --amount 100000 --miniscript-path 0
 
 # 9. View transaction history

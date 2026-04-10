@@ -96,8 +96,8 @@ nunchuk wallet list --no-balance
 nunchuk wallet address get <wallet-id>
 
 # Inspect or validate miniscript spending paths
-nunchuk wallet miniscript inspect <wallet-id>
-nunchuk wallet miniscript validate --wallet <wallet-id>
+nunchuk miniscript inspect --wallet <wallet-id>
+nunchuk miniscript validate --wallet <wallet-id>
 
 # Export wallet descriptor and BSMS for backup/recovery
 nunchuk wallet export <wallet-id>
@@ -219,23 +219,28 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 
 ### `wallet`
 
-| Command                           | Description                                             |
-| --------------------------------- | ------------------------------------------------------- |
-| `wallet list`                     | List wallets                                            |
-| `wallet get <id>`                 | Get wallet details                                      |
-| `wallet address get <id>`         | Get a new receive address                               |
-| `wallet export <id>`              | Export wallet descriptor and/or BSMS record             |
-| `wallet delete <id>`              | Delete a wallet                                         |
-| `wallet rename <id>`              | Rename a wallet locally                                 |
-| `wallet recover`                  | Recover a wallet from a descriptor or BSMS backup file  |
-| `wallet miniscript inspect <id>`  | Inspect miniscript spending paths                       |
-| `wallet miniscript validate`      | Validate a miniscript wallet, descriptor, or expression |
-| `wallet platform-key get <id>`    | Get platform key policies for a wallet                  |
-| `wallet platform-key update <id>` | Request a platform key policy update                    |
-| `wallet dummy-tx list <id>`       | List pending dummy transactions                         |
-| `wallet dummy-tx get <id>`        | Get dummy transaction details                           |
-| `wallet dummy-tx sign <id>`       | Sign a dummy transaction                                |
-| `wallet dummy-tx cancel <id>`     | Cancel a dummy transaction                              |
+| Command                           | Description                                            |
+| --------------------------------- | ------------------------------------------------------ |
+| `wallet list`                     | List wallets                                           |
+| `wallet get <id>`                 | Get wallet details                                     |
+| `wallet address get <id>`         | Get a new receive address                              |
+| `wallet export <id>`              | Export wallet descriptor and/or BSMS record            |
+| `wallet delete <id>`              | Delete a wallet                                        |
+| `wallet rename <id>`              | Rename a wallet locally                                |
+| `wallet recover`                  | Recover a wallet from a descriptor or BSMS backup file |
+| `wallet platform-key get <id>`    | Get platform key policies for a wallet                 |
+| `wallet platform-key update <id>` | Request a platform key policy update                   |
+| `wallet dummy-tx list <id>`       | List pending dummy transactions                        |
+| `wallet dummy-tx get <id>`        | Get dummy transaction details                          |
+| `wallet dummy-tx sign <id>`       | Sign a dummy transaction                               |
+| `wallet dummy-tx cancel <id>`     | Cancel a dummy transaction                             |
+
+### `miniscript`
+
+| Command               | Description                                             |
+| --------------------- | ------------------------------------------------------- |
+| `miniscript inspect`  | Inspect miniscript spending paths                       |
+| `miniscript validate` | Validate a miniscript wallet, descriptor, or expression |
 
 ### `tx`
 
