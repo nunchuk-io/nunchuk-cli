@@ -166,6 +166,32 @@ function createMiniscriptElectrumMock(
   };
 }
 
+describe("createTransaction multisig", () => {
+  it("uses the default dust threshold for standard multisig coin selection", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(tx.inputsLength).toBe(1);
+      expect(result.fee).toBeGreaterThan(0n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("createTransaction miniscript", () => {
   it("uses absolute timelocks as transaction locktime", async () => {
     const descriptor = buildMiniscriptDescriptor(

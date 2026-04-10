@@ -653,7 +653,6 @@ export async function createTransaction(
         lockTime: txLockTime,
         network: btcNet,
         createTx: true,
-        dust: 546,
       },
     );
 
