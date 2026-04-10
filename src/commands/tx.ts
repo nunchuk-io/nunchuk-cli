@@ -36,7 +36,7 @@ import {
   getOutputAddress,
   statusFromHeight,
 } from "../core/format.js";
-import { convertAmount, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
+import { convertAmountInputToSats, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
 import { print, printError } from "../output.js";
 
 function parseMiniscriptPathOption(value: string): number {
@@ -115,7 +115,7 @@ txCommand
   .description("Create a new transaction")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
   .requiredOption("--to <address>", "Recipient address")
-  .requiredOption("--amount <value>", "Amount to send", parseFloat)
+  .requiredOption("--amount <value>", "Amount to send")
   .option(
     "--currency <code>",
     "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
@@ -143,14 +143,12 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        let sendAmount: bigint;
         const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
-        if (currency !== "sat") {
-          const rates = await fetchMarketRates();
-          const converted = convertAmount(options.amount, currency, "sat", rates);
-          sendAmount = BigInt(Math.round(converted.converted));
-        } else {
-          sendAmount = BigInt(Math.round(options.amount));
+        const rates =
+          currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
+        const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
+        if (sendAmount <= 0n) {
+          throw new Error("Amount must convert to at least 1 sat");
         }
         const result = await createTransaction({
           wallet,

@@ -1,6 +1,9 @@
 const PRICES_URL = "https://api.nunchuk.io/v1.1/prices";
 const FOREX_RATES_URL = "https://api.nunchuk.io/v1.1/forex/rates";
-const SATOSHIS_PER_BTC = 100_000_000;
+const SATOSHIS_PER_BTC_BIGINT = 100_000_000n;
+const SATOSHIS_PER_BTC = Number(SATOSHIS_PER_BTC_BIGINT);
+const MAX_BTC_SUPPLY_SATS = 21_000_000n * SATOSHIS_PER_BTC_BIGINT;
+const MAX_BTC_SUPPLY_SATS_NUMBER = Number(MAX_BTC_SUPPLY_SATS);
 
 export interface MarketRates {
   btcUsd: number;
@@ -75,6 +78,80 @@ export function convertAmount(
   const amountUsd = toUsd(amount, from, rates);
   const converted = fromUsd(amountUsd, to, rates);
   return { from, to, converted };
+}
+
+function parseSatsInput(amountInput: string): bigint {
+  const value = amountInput.trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error("Satoshi amount must be a whole number");
+  }
+
+  return assertWithinMaxBitcoinSupply(BigInt(value));
+}
+
+function parseBtcInputToSats(amountInput: string): bigint {
+  const value = amountInput.trim();
+  const [wholePart = "", fractionPart = "", extraPart] = value.split(".");
+  if (extraPart !== undefined || !/^\d+$/.test(wholePart + fractionPart)) {
+    throw new Error("Amount must be a non-negative decimal number");
+  }
+  if (fractionPart.length > 8) {
+    throw new Error("BTC amount supports at most 8 decimal places");
+  }
+
+  const wholeSats = BigInt(wholePart || "0") * SATOSHIS_PER_BTC_BIGINT;
+  const fractionSats = BigInt(fractionPart.padEnd(8, "0") || "0");
+  return assertWithinMaxBitcoinSupply(wholeSats + fractionSats);
+}
+
+function parseFiatAmount(amountInput: string): number {
+  const amount = Number(amountInput);
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new Error("Amount must be a non-negative number");
+  }
+  return amount;
+}
+
+function roundedSatsToBigInt(sats: number): bigint {
+  const rounded = Math.round(sats);
+  if (!Number.isFinite(rounded)) {
+    throw new Error("Converted satoshi amount is too large to convert safely");
+  }
+  if (rounded > MAX_BTC_SUPPLY_SATS_NUMBER) {
+    throw new Error("Amount exceeds maximum Bitcoin supply");
+  }
+  return BigInt(rounded);
+}
+
+function assertWithinMaxBitcoinSupply(sats: bigint): bigint {
+  if (sats > MAX_BTC_SUPPLY_SATS) {
+    throw new Error("Amount exceeds maximum Bitcoin supply");
+  }
+  return sats;
+}
+
+export function convertAmountInputToSats(
+  amountInput: string,
+  currencyInput: string,
+  rates?: MarketRates,
+): bigint {
+  const currency = normalizeCurrency(currencyInput);
+
+  if (currency === "sat") {
+    return parseSatsInput(amountInput);
+  }
+
+  if (currency === "BTC") {
+    return parseBtcInputToSats(amountInput);
+  }
+
+  if (!rates) {
+    throw new Error(`Market rates are required to convert ${currency} to sat`);
+  }
+
+  return roundedSatsToBigInt(
+    convertAmount(parseFiatAmount(amountInput), currency, "sat", rates).converted,
+  );
 }
 
 export function formatAmount(amount: number, currencyInput: string): string {
