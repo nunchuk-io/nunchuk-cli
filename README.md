@@ -276,6 +276,12 @@ When the protocol is omitted, the CLI tries `ssl://` first, then `tcp://`, and o
 | `--api-key <key>` | Override stored API key |
 | `--network <network>` | Override network for this command |
 
+## Webhooks
+
+Receive real-time HTTP notifications when events happen on your account. Configure webhook endpoints via the [Developer Portal](https://developer.nunchuk.io).
+
+See [docs/portal-webhook-guide.md](docs/portal-webhook-guide.md) for setup instructions, destination types, and event payload reference.
+
 ## Project Structure
 
 ```
