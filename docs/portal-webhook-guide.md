@@ -29,9 +29,8 @@ Choose the destination type that matches where you want events delivered:
 | **Generic** | Your own server or any custom HTTPS endpoint | None |
 | **Slack** | Post events to a Slack channel via incoming webhook | None (use the Slack webhook URL as the endpoint URL) |
 | **Telegram** | Send events to a Telegram chat | **Chat ID** — the Telegram chat/group ID to send messages to |
-| **WhatsApp** | Send events via WhatsApp Cloud API | **Recipient phone number** — use the WhatsApp Cloud API messages URL as the endpoint URL, and pass the bearer token via custom headers |
 
-Use **Generic** for standard server-to-server integrations. Only select Slack, Telegram, or WhatsApp if you want events delivered directly to those apps.
+Use **Generic** for standard server-to-server integrations. Only select Slack or Telegram if you want events delivered directly to those apps.
 
 ### Events
 
@@ -119,18 +118,6 @@ Chat ID: -1001234567890
 
 Provide your Telegram bot's API URL and the target chat ID.
 
-### WhatsApp
-
-```
-Endpoint URL: https://graph.facebook.com/v21.0/<PHONE_NUMBER_ID>/messages
-Destination type: WhatsApp
-Recipient phone: 15551234567
-Custom headers:
-  Authorization: Bearer <WHATSAPP_ACCESS_TOKEN>
-```
-
-Use the WhatsApp Cloud API messages URL. Pass the bearer token via custom headers.
-
 ## Outbound Webhook Request
 
 When an event is delivered, the backend sends a `POST` request to the endpoint URL with JSON body and these base headers:
@@ -151,7 +138,6 @@ Request body depends on `destination_type`:
 - `GENERIC` receives the full Nunchuk webhook JSON envelope.
 - `SLACK` receives a Slack incoming-webhook compatible JSON body with a `text` field.
 - `TELEGRAM` receives a Telegram `sendMessage` compatible JSON body with `chat_id`, `text`, and `disable_web_page_preview`.
-- `WHATSAPP` receives a WhatsApp Cloud API compatible JSON body with `messaging_product`, `to`, `type`, and `text`.
 
 The endpoint should return any 2xx status code for success. Non-2xx responses and network failures are retried. Current max attempts is 8.
 
@@ -180,20 +166,6 @@ Values are in seconds.
   "chat_id": "123456789",
   "text": "Nunchuk webhook event: wallet.transaction.updated\nEvent ID: evt_...\nCreated time: 1770000000000\nData: {\"wallet_id\":\"wallet_id\",\"wallet_display_id\":\"wallet_display_id\",\"transaction_id\":\"transaction_id\",\"bitcoin_transaction_id\":\"bitcoin_transaction_id\"}",
   "disable_web_page_preview": true
-}
-```
-
-`WHATSAPP` webhook recipients receive this shape:
-
-```json
-{
-  "messaging_product": "whatsapp",
-  "to": "15551234567",
-  "type": "text",
-  "text": {
-    "preview_url": false,
-    "body": "Nunchuk webhook event: wallet.transaction.updated\nEvent ID: evt_...\nCreated time: 1770000000000\nData: {\"wallet_id\":\"wallet_id\",\"wallet_display_id\":\"wallet_display_id\",\"transaction_id\":\"transaction_id\",\"bitcoin_transaction_id\":\"bitcoin_transaction_id\"}"
-  }
 }
 ```
 
