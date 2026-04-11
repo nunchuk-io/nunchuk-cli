@@ -28,9 +28,10 @@ Choose the destination type that matches where you want events delivered:
 |------|-------------|---------------------|
 | **Generic** | Your own server or any custom HTTPS endpoint | None |
 | **Slack** | Post events to a Slack channel via incoming webhook | None (use the Slack webhook URL as the endpoint URL) |
+| **Discord** | Post events to a Discord channel via webhook | None (use the Discord webhook URL as the endpoint URL) |
 | **Telegram** | Send events to a Telegram chat | **Chat ID** — the Telegram chat/group ID to send messages to |
 
-Use **Generic** for standard server-to-server integrations. Only select Slack or Telegram if you want events delivered directly to those apps.
+Use **Generic** for standard server-to-server integrations. Only select Slack, Discord, or Telegram if you want events delivered directly to those apps.
 
 ### Events
 
@@ -108,6 +109,15 @@ Destination type: Slack
 
 Use a Slack incoming webhook URL. Events are formatted and posted to the configured channel.
 
+### Discord
+
+```
+Endpoint URL: https://discord.com/api/webhooks/<WEBHOOK_ID>/<WEBHOOK_TOKEN>
+Destination type: Discord
+```
+
+Use a Discord channel webhook URL. Events are formatted and posted to the configured channel.
+
 ### Telegram
 
 ```
@@ -137,6 +147,7 @@ Request body depends on `destination_type`:
 
 - `GENERIC` receives the full Nunchuk webhook JSON envelope.
 - `SLACK` receives a Slack incoming-webhook compatible JSON body with a `text` field.
+- `DISCORD` receives a Discord webhook compatible JSON body with a `content` field.
 - `TELEGRAM` receives a Telegram `sendMessage` compatible JSON body with `chat_id`, `text`, and `disable_web_page_preview`.
 
 The endpoint should return any 2xx status code for success. Non-2xx responses and network failures are retried. Current max attempts is 8.
@@ -156,6 +167,14 @@ Values are in seconds.
 ```json
 {
   "text": "Nunchuk webhook event: wallet.transaction.updated\nEvent ID: evt_...\nCreated time: 1770000000000\nData: {\"wallet_id\":\"wallet_id\",\"wallet_display_id\":\"wallet_display_id\",\"transaction_id\":\"transaction_id\",\"bitcoin_transaction_id\":\"bitcoin_transaction_id\"}"
+}
+```
+
+`DISCORD` webhook recipients receive this shape:
+
+```json
+{
+  "content": "Nunchuk webhook event: wallet.transaction.updated\nEvent ID: evt_...\nCreated time: 1770000000000\nData: {\"wallet_id\":\"wallet_id\",\"wallet_display_id\":\"wallet_display_id\",\"transaction_id\":\"transaction_id\",\"bitcoin_transaction_id\":\"bitcoin_transaction_id\"}"
 }
 ```
 
