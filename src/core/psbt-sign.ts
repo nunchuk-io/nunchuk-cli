@@ -1,4 +1,6 @@
 import { HDKey } from "@scure/bip32";
+import { ripemd160 } from "@noble/hashes/legacy.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { Script } from "@scure/btc-signer/script.js";
 import { SignatureHash, Transaction, getPrevOut } from "@scure/btc-signer/transaction.js";
 import { signECDSA } from "@scure/btc-signer/utils.js";
@@ -33,9 +35,15 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return result;
 }
 
-function scriptContainsPubkey(script: Uint8Array, pubkey: Uint8Array): boolean {
+function hash160(data: Uint8Array): Uint8Array {
+  return ripemd160(sha256(data));
+}
+
+function scriptContainsPubkeyReference(script: Uint8Array, pubkey: Uint8Array): boolean {
+  const pubkeyHash = hash160(pubkey);
   return Script.decode(script).some(
-    (item) => item instanceof Uint8Array && bytesEqual(item, pubkey),
+    (item) =>
+      item instanceof Uint8Array && (bytesEqual(item, pubkey) || bytesEqual(item, pubkeyHash)),
   );
 }
 
@@ -55,7 +63,7 @@ function signMiniscriptInput(
   if (!witnessScript) {
     throw new Error("Miniscript PSBT input is missing witnessScript");
   }
-  if (!scriptContainsPubkey(witnessScript, pubkey)) {
+  if (!scriptContainsPubkeyReference(witnessScript, pubkey)) {
     throw new Error("Input script does not reference the derived signer key");
   }
 

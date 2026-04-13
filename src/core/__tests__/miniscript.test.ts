@@ -115,7 +115,7 @@ describe("miniscript validation and substitution", () => {
   it("rejects mixed time- and height-locks", () => {
     expect(
       isValidMiniscriptTemplate(
-        "and_v(v:after(500000000),older(10))",
+        "and_v(v:after(1),after(500000000))",
         MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
       ),
     ).toBe(false);
@@ -156,7 +156,7 @@ describe("script tree helpers", () => {
   });
 
   it("enumerates threshold signing paths", () => {
-    const paths = getAllSigningPaths("thresh(2,pk(a),pk(b),pk(c))");
+    const paths = getAllSigningPaths("thresh(2,pk(a),s:pk(b),s:pk(c))");
     expect(paths).toEqual([
       [
         [1, 1],

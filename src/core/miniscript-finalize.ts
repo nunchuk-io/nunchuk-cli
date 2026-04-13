@@ -28,6 +28,7 @@ interface InputResult {
 
 interface SatisfactionContext {
   preimages: Map<string, Uint8Array>;
+  pubkeys: Map<string, Uint8Array>;
   signatures: Map<string, Uint8Array>;
   txState: MiniscriptTransactionState;
 }
@@ -96,7 +97,8 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       return { dsat: EMPTY_STACK, sat: null };
     case "JUST_1":
       return { dsat: null, sat: EMPTY_STACK };
-    case "PK": {
+    case "PK":
+    case "PK_K": {
       const signature = ctx.signatures.get(node.key);
       return {
         dsat: ZERO_STACK,
@@ -105,6 +107,29 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
               preimagesUsed: [],
               signaturesUsed: [node.key],
               stack: [signature],
+            }
+          : null,
+      };
+    }
+    case "PKH":
+    case "PK_H": {
+      const pubkey = ctx.pubkeys.get(node.key);
+      if (!pubkey) {
+        throw new Error(`Missing miniscript pubkey for hashed key: ${node.key}`);
+      }
+
+      const signature = ctx.signatures.get(node.key);
+      return {
+        dsat: {
+          preimagesUsed: [],
+          signaturesUsed: [],
+          stack: [new Uint8Array(), pubkey],
+        },
+        sat: signature
+          ? {
+              preimagesUsed: [],
+              signaturesUsed: [node.key],
+              stack: [signature, pubkey],
             }
           : null,
       };
@@ -410,7 +435,9 @@ export function finalizeMiniscriptPsbt(
     }
 
     const signatures = new Map<string, Uint8Array>();
+    const pubkeys = new Map<string, Uint8Array>();
     for (const info of keyInfos) {
+      pubkeys.set(info.keyExpression, info.pubkey);
       const signature = signatureByPubkey.get(hex.encode(info.pubkey));
       if (signature) {
         signatures.set(info.keyExpression, signature);
@@ -418,7 +445,7 @@ export function finalizeMiniscriptPsbt(
     }
 
     const preimages = getInputMiniscriptPreimages(input);
-    const result = produceInput(fragment, { preimages, signatures, txState }).sat;
+    const result = produceInput(fragment, { preimages, pubkeys, signatures, txState }).sat;
     if (!result) {
       throw new Error("Not enough signatures or hash preimages to finalize miniscript PSBT");
     }

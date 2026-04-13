@@ -486,6 +486,43 @@ describe("createTransaction miniscript", () => {
     }
   });
 
+  it("finalizes hashed-key miniscript PSBTs locally", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `pkh(${TEST_WALLET.signers[1]}/<0;1>/*)`,
+      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
+      expect(finalizeMiniscriptPsbt(tx, wallet.descriptor, "testnet").requiredSignatures).toBe(1);
+      expect(tx.isFinal).toBe(true);
+      expect(() => tx.extract()).not.toThrow();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("marks a satisfiable miniscript PSBT as ready to broadcast", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `or_i(pk(${TEST_WALLET.signers[1]}/<0;1>/*),after(144))`,
@@ -666,5 +703,5 @@ describe("createTransaction miniscript", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
-  });
+  }, 10_000);
 });

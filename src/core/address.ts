@@ -8,7 +8,12 @@ import { bech32, createBase58check, hex } from "@scure/base";
 import { p2ms, p2wsh, p2sh, bip32Path, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
 import { Script, type ScriptOP } from "@scure/btc-signer/script.js";
 import { parseDescriptor, parseSignerDescriptor, type ParsedDescriptor } from "./descriptor.js";
-import { parseMiniscript, type MiniscriptFragment } from "./miniscript.js";
+import {
+  miniscriptNeedsExplicitVerify,
+  parseMiniscript,
+  type MiniscriptAddressType,
+  type MiniscriptFragment,
+} from "./miniscript.js";
 import type { Network } from "./config.js";
 
 const base58check = createBase58check(sha256);
@@ -366,6 +371,7 @@ function deriveKeyExpression(
 function compileMiniscriptFragment(
   node: MiniscriptFragment,
   resolveKey: (keyExpression: string) => DerivedKeyInfo,
+  addressType: MiniscriptAddressType,
   verify = false,
 ): Uint8Array {
   switch (node.fragment) {
@@ -376,6 +382,24 @@ function compileMiniscriptFragment(
     case "PK": {
       const { pubkey } = resolveKey(node.key);
       return encodeScript([pubkey, verify ? "CHECKSIGVERIFY" : "CHECKSIG"]);
+    }
+    case "PK_K": {
+      const { pubkey } = resolveKey(node.key);
+      return encodeScript([pubkey]);
+    }
+    case "PK_H": {
+      const { pubkey } = resolveKey(node.key);
+      return encodeScript(["DUP", "HASH160", hash160(pubkey), "EQUALVERIFY"]);
+    }
+    case "PKH": {
+      const { pubkey } = resolveKey(node.key);
+      return encodeScript([
+        "DUP",
+        "HASH160",
+        hash160(pubkey),
+        "EQUALVERIFY",
+        verify ? "CHECKSIGVERIFY" : "CHECKSIG",
+      ]);
     }
     case "OLDER":
       return encodeScript([node.k, "CHECKSEQUENCEVERIFY"]);
@@ -431,96 +455,107 @@ function compileMiniscriptFragment(
     case "WRAP_A":
       return concatBytes([
         encodeScript(["TOALTSTACK"]),
-        compileMiniscriptFragment(node.sub, resolveKey),
+        compileMiniscriptFragment(node.sub, resolveKey, addressType),
         encodeScript(["FROMALTSTACK"]),
       ]);
     case "WRAP_S":
       return concatBytes([
         encodeScript(["SWAP"]),
-        compileMiniscriptFragment(node.sub, resolveKey, verify),
+        compileMiniscriptFragment(node.sub, resolveKey, addressType, verify),
       ]);
     case "WRAP_C":
       if (node.sub.fragment === "PK") {
         const { pubkey } = resolveKey(node.sub.key);
         return encodeScript([pubkey, verify ? "CHECKSIGVERIFY" : "CHECKSIG"]);
       }
+      if (node.sub.fragment === "PK_K" || node.sub.fragment === "PK_H") {
+        return concatBytes([
+          compileMiniscriptFragment(node.sub, resolveKey, addressType),
+          encodeScript([verify ? "CHECKSIGVERIFY" : "CHECKSIG"]),
+        ]);
+      }
       return concatBytes([
-        compileMiniscriptFragment(node.sub, resolveKey),
+        compileMiniscriptFragment(node.sub, resolveKey, addressType),
         encodeScript([verify ? "CHECKSIGVERIFY" : "CHECKSIG"]),
       ]);
     case "WRAP_D":
       return concatBytes([
         encodeScript(["DUP", "IF"]),
-        compileMiniscriptFragment(node.sub, resolveKey),
+        compileMiniscriptFragment(node.sub, resolveKey, addressType),
         encodeScript(["ENDIF"]),
       ]);
     case "WRAP_V":
-      return compileMiniscriptFragment(node.sub, resolveKey, true);
+      return miniscriptNeedsExplicitVerify(node.sub, addressType)
+        ? concatBytes([
+            compileMiniscriptFragment(node.sub, resolveKey, addressType),
+            encodeScript(["VERIFY"]),
+          ])
+        : compileMiniscriptFragment(node.sub, resolveKey, addressType, true);
     case "WRAP_J":
       return concatBytes([
         encodeScript(["SIZE", "0NOTEQUAL", "IF"]),
-        compileMiniscriptFragment(node.sub, resolveKey),
+        compileMiniscriptFragment(node.sub, resolveKey, addressType),
         encodeScript(["ENDIF"]),
       ]);
     case "WRAP_N":
       return concatBytes([
-        compileMiniscriptFragment(node.sub, resolveKey),
+        compileMiniscriptFragment(node.sub, resolveKey, addressType),
         encodeScript(["0NOTEQUAL"]),
       ]);
     case "AND_V":
       return concatBytes([
-        compileMiniscriptFragment(node.subs[0], resolveKey),
-        compileMiniscriptFragment(node.subs[1], resolveKey, verify),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType, verify),
       ]);
     case "AND_B":
       return concatBytes([
-        compileMiniscriptFragment(node.subs[0], resolveKey),
-        compileMiniscriptFragment(node.subs[1], resolveKey),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType),
         encodeScript(["BOOLAND"]),
       ]);
     case "OR_B":
       return concatBytes([
-        compileMiniscriptFragment(node.subs[0], resolveKey),
-        compileMiniscriptFragment(node.subs[1], resolveKey),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType),
         encodeScript(["BOOLOR"]),
       ]);
     case "OR_C":
       return concatBytes([
-        compileMiniscriptFragment(node.subs[0], resolveKey),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
         encodeScript(["NOTIF"]),
-        compileMiniscriptFragment(node.subs[1], resolveKey),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType),
         encodeScript(["ENDIF"]),
       ]);
     case "OR_D":
       return concatBytes([
-        compileMiniscriptFragment(node.subs[0], resolveKey),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
         encodeScript(["IFDUP", "NOTIF"]),
-        compileMiniscriptFragment(node.subs[1], resolveKey),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType),
         encodeScript(["ENDIF"]),
       ]);
     case "OR_I":
       return concatBytes([
         encodeScript(["IF"]),
-        compileMiniscriptFragment(node.subs[0], resolveKey),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
         encodeScript(["ELSE"]),
-        compileMiniscriptFragment(node.subs[1], resolveKey),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType),
         encodeScript(["ENDIF"]),
       ]);
     case "ANDOR":
       return concatBytes([
-        compileMiniscriptFragment(node.subs[0], resolveKey),
+        compileMiniscriptFragment(node.subs[0], resolveKey, addressType),
         encodeScript(["NOTIF"]),
-        compileMiniscriptFragment(node.subs[2], resolveKey),
+        compileMiniscriptFragment(node.subs[2], resolveKey, addressType),
         encodeScript(["ELSE"]),
-        compileMiniscriptFragment(node.subs[1], resolveKey),
+        compileMiniscriptFragment(node.subs[1], resolveKey, addressType),
         encodeScript(["ENDIF"]),
       ]);
     case "THRESH": {
-      let script = compileMiniscriptFragment(node.subs[0], resolveKey);
+      let script = compileMiniscriptFragment(node.subs[0], resolveKey, addressType);
       for (let i = 1; i < node.subs.length; i++) {
         script = concatBytes([
           script,
-          compileMiniscriptFragment(node.subs[i], resolveKey),
+          compileMiniscriptFragment(node.subs[i], resolveKey, addressType),
           encodeScript(["ADD"]),
         ]);
       }
@@ -532,6 +567,9 @@ function compileMiniscriptFragment(
 function collectMiniscriptKeyExpressions(node: MiniscriptFragment): string[] {
   switch (node.fragment) {
     case "PK":
+    case "PKH":
+    case "PK_H":
+    case "PK_K":
       return [node.key];
     case "MULTI":
     case "MULTI_A":
@@ -583,7 +621,11 @@ function deriveMiniscriptPaymentFromParsed(
     return derived;
   };
 
-  const witnessScript = compileMiniscriptFragment(fragment, resolveKey);
+  const witnessScript = compileMiniscriptFragment(
+    fragment,
+    resolveKey,
+    parsed.addressType as MiniscriptAddressType,
+  );
   const witnessScriptHash = sha256(witnessScript);
   const prefix = network === "mainnet" ? "bc" : "tb";
   const bip32Derivation: WalletPayment["bip32Derivation"] = [];

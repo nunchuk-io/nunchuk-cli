@@ -30,7 +30,7 @@ export type HashFragment = "HASH160" | "HASH256" | "RIPEMD160" | "SHA256";
 
 export type MiniscriptFragment =
   | { fragment: "JUST_0" | "JUST_1" }
-  | { fragment: "PK"; key: string }
+  | { fragment: "PK" | "PKH" | "PK_H" | "PK_K"; key: string }
   | { fragment: "OLDER" | "AFTER"; k: number }
   | { fragment: HashFragment; data: string }
   | { fragment: "MULTI" | "MULTI_A"; k: number; keys: string[] }
@@ -136,6 +136,23 @@ export interface CoinsGroup<T extends TimelineCoin> {
 export interface ValidateResult {
   error?: string;
   ok: boolean;
+}
+
+type MiniscriptBaseType = "B" | "K" | "V" | "W";
+
+interface MiniscriptTypeInfo {
+  base?: MiniscriptBaseType;
+  d: boolean;
+  g: boolean;
+  h: boolean;
+  i: boolean;
+  j: boolean;
+  k: boolean;
+  n: boolean;
+  o: boolean;
+  u: boolean;
+  x: boolean;
+  z: boolean;
 }
 
 function invalid(message: string): never {
@@ -291,7 +308,11 @@ function parseMiniscriptFragment(
     case "pkh":
     case "pk_h":
       if (args.length !== 1) invalid(`Invalid ${name}() expression`);
-      node = { fragment: "PK", key: args[0] };
+      node = {
+        fragment:
+          name === "pk_k" ? "PK_K" : name === "pkh" ? "PKH" : name === "pk_h" ? "PK_H" : "PK",
+        key: args[0],
+      };
       break;
     case "older":
       if (args.length !== 1) invalid("Invalid older() expression");
@@ -325,6 +346,9 @@ function parseMiniscriptFragment(
       if (keys.length === 0 || k < 1 || k > keys.length) {
         invalid(`Invalid ${name}() threshold`);
       }
+      if (name === "multi" && keys.length > 20) {
+        invalid("multi() supports at most 20 keys");
+      }
       if (name === "multi_a" && addressType === MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT) {
         invalid("multi_a() is only valid for taproot miniscript");
       }
@@ -336,18 +360,30 @@ function parseMiniscriptFragment(
     }
     case "and_v":
     case "and_b":
+    case "and_n":
     case "or_b":
     case "or_c":
     case "or_d":
     case "or_i":
       if (args.length !== 2) invalid(`Invalid ${name}() expression`);
-      node = {
-        fragment: name.toUpperCase() as BinaryFragment,
-        subs: [
-          parseMiniscriptFragment(args[0], addressType),
-          parseMiniscriptFragment(args[1], addressType),
-        ],
-      };
+      if (name === "and_n") {
+        node = {
+          fragment: "ANDOR",
+          subs: [
+            parseMiniscriptFragment(args[0], addressType),
+            parseMiniscriptFragment(args[1], addressType),
+            { fragment: "JUST_0" },
+          ],
+        };
+      } else {
+        node = {
+          fragment: name.toUpperCase() as BinaryFragment,
+          subs: [
+            parseMiniscriptFragment(args[0], addressType),
+            parseMiniscriptFragment(args[1], addressType),
+          ],
+        };
+      }
       break;
     case "andor":
       if (args.length !== 3) invalid("Invalid andor() expression");
@@ -479,6 +515,9 @@ function makeScriptNode(
 function miniscriptToScriptNode(node: MiniscriptFragment): ScriptNode {
   switch (node.fragment) {
     case "PK":
+    case "PKH":
+    case "PK_H":
+    case "PK_K":
       return makeScriptNode("PK", [], [node.key], undefined, 0);
     case "OLDER":
       return makeScriptNode("OLDER", [], [], undefined, node.k);
@@ -510,7 +549,13 @@ function miniscriptToScriptNode(node: MiniscriptFragment): ScriptNode {
       return makeScriptNode("OR", node.subs.map(miniscriptToScriptNode), [], undefined, 0);
     case "ANDOR":
       if (node.subs[2].fragment === "JUST_0") {
-        return makeScriptNode("AND", node.subs.map(miniscriptToScriptNode), [], undefined, 0);
+        return makeScriptNode(
+          "AND",
+          node.subs.slice(0, 2).map(miniscriptToScriptNode),
+          [],
+          undefined,
+          0,
+        );
       }
       return makeScriptNode("ANDOR", node.subs.map(miniscriptToScriptNode), [], undefined, 0);
     case "THRESH":
@@ -611,26 +656,262 @@ function chooseIndices(length: number, count: number): number[][] {
   return result;
 }
 
-function countTimelockTypes(node: ScriptNode): Set<TimelockBased> {
-  const types = new Set<TimelockBased>();
-  if (node.type === "AFTER") {
-    types.add(timelockFromK(true, node.k).based);
-  } else if (node.type === "OLDER") {
-    types.add(timelockFromK(false, node.k).based);
-  }
-  for (const sub of node.subs) {
-    for (const value of countTimelockTypes(sub)) {
-      types.add(value);
-    }
-  }
-  types.delete("NONE");
-  return types;
+function typeInfo(base: MiniscriptBaseType | undefined, flags = ""): MiniscriptTypeInfo {
+  return {
+    base,
+    d: flags.includes("d"),
+    g: flags.includes("g"),
+    h: flags.includes("h"),
+    i: flags.includes("i"),
+    j: flags.includes("j"),
+    k: flags.includes("k"),
+    n: flags.includes("n"),
+    o: flags.includes("o"),
+    u: flags.includes("u"),
+    x: flags.includes("x"),
+    z: flags.includes("z"),
+  };
 }
 
-function validateTimelockMixing(node: ScriptNode): void {
-  const types = countTimelockTypes(node);
-  if (types.size > 1) {
-    invalid("Timelock mixing");
+function invalidType(): MiniscriptTypeInfo {
+  return typeInfo(undefined);
+}
+
+function sameBase(...types: MiniscriptTypeInfo[]): MiniscriptBaseType | undefined {
+  const base = types[0]?.base;
+  return base && types.every((type) => type.base === base) ? base : undefined;
+}
+
+function hasAnyBase(type: MiniscriptTypeInfo, bases: MiniscriptBaseType[]): boolean {
+  return type.base != null && bases.includes(type.base);
+}
+
+function orFlags(...types: MiniscriptTypeInfo[]): Pick<MiniscriptTypeInfo, "g" | "h" | "i" | "j"> {
+  return {
+    g: types.some((type) => type.g),
+    h: types.some((type) => type.h),
+    i: types.some((type) => type.i),
+    j: types.some((type) => type.j),
+  };
+}
+
+function noTimelockMix(...types: MiniscriptTypeInfo[]): boolean {
+  const flags = orFlags(...types);
+  return !((flags.g && flags.h) || (flags.i && flags.j));
+}
+
+function mergeTimelock(
+  out: MiniscriptTypeInfo,
+  types: MiniscriptTypeInfo[],
+  checkMixing: boolean,
+): MiniscriptTypeInfo {
+  const flags = orFlags(...types);
+  out.g = flags.g;
+  out.h = flags.h;
+  out.i = flags.i;
+  out.j = flags.j;
+  out.k = types.every((type) => type.k) && (!checkMixing || noTimelockMix(...types));
+  return out;
+}
+
+function computeMiniscriptType(
+  node: MiniscriptFragment,
+  addressType: MiniscriptAddressType,
+): MiniscriptTypeInfo {
+  switch (node.fragment) {
+    case "JUST_0":
+      return typeInfo("B", "zudxk");
+    case "JUST_1":
+      return typeInfo("B", "zuxk");
+    case "PK_K":
+      return typeInfo("K", "onduxk");
+    case "PK_H":
+      return typeInfo("K", "nduxk");
+    case "PK":
+      return typeInfo("B", "onduk");
+    case "PKH":
+      return typeInfo("B", "nduk");
+    case "OLDER": {
+      if (node.k < 1 || node.k >= 0x80000000) {
+        invalid("older() value must be between 1 and 2^31 - 1");
+      }
+      const lock = timelockFromK(false, node.k);
+      return typeInfo("B", `${lock.based === "TIME_LOCK" ? "g" : "h"}zxk`);
+    }
+    case "AFTER": {
+      if (node.k < 1 || node.k >= 0x80000000) {
+        invalid("after() value must be between 1 and 2^31 - 1");
+      }
+      const lock = timelockFromK(true, node.k);
+      return typeInfo("B", `${lock.based === "TIME_LOCK" ? "i" : "j"}zxk`);
+    }
+    case "SHA256":
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+      return typeInfo("B", "onduk");
+    case "MULTI":
+      if (addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT) {
+        invalid("multi() is not valid for taproot miniscript");
+      }
+      return typeInfo("B", "nduk");
+    case "MULTI_A":
+      if (
+        addressType !== MINISCRIPT_ADDRESS_TYPE_TAPROOT &&
+        addressType !== MINISCRIPT_ADDRESS_TYPE_ANY
+      ) {
+        invalid("multi_a() is only valid for taproot miniscript");
+      }
+      return typeInfo("B", "duk");
+    case "WRAP_A": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "B") return invalidType();
+      return mergeTimelock({ ...typeInfo("W", "x"), d: x.d, u: x.u }, [x], false);
+    }
+    case "WRAP_S": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "B" || !x.o) return invalidType();
+      return mergeTimelock({ ...typeInfo("W"), d: x.d, u: x.u, x: x.x }, [x], false);
+    }
+    case "WRAP_C": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "K") return invalidType();
+      return mergeTimelock({ ...typeInfo("B", "u"), d: x.d, n: x.n, o: x.o }, [x], false);
+    }
+    case "WRAP_D": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "V" || !x.z) return invalidType();
+      return mergeTimelock(typeInfo("B", "ondx"), [x], false);
+    }
+    case "WRAP_V": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "B") return invalidType();
+      return mergeTimelock({ ...typeInfo("V", "x"), n: x.n, o: x.o, z: x.z }, [x], false);
+    }
+    case "WRAP_J": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "B" || !x.n) return invalidType();
+      return mergeTimelock(typeInfo("B", `${x.o ? "o" : ""}${x.u ? "u" : ""}ndx`), [x], false);
+    }
+    case "WRAP_N": {
+      const x = computeMiniscriptType(node.sub, addressType);
+      if (x.base !== "B") return invalidType();
+      return mergeTimelock({ ...typeInfo("B", "ux"), d: x.d, n: x.n, o: x.o, z: x.z }, [x], false);
+    }
+    case "AND_V": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      if (x.base !== "V" || !hasAnyBase(y, ["B", "K", "V"])) return invalidType();
+      return mergeTimelock(
+        {
+          ...typeInfo(y.base),
+          d: x.d && y.d,
+          n: x.n || (x.z && y.n),
+          o: (x.z && y.o) || (y.z && x.o),
+          u: y.u,
+          x: y.x,
+          z: x.z && y.z,
+        },
+        [x, y],
+        true,
+      );
+    }
+    case "AND_B": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      if (x.base !== "B" || y.base !== "W") return invalidType();
+      return mergeTimelock(
+        {
+          ...typeInfo("B", "ux"),
+          d: x.d && y.d,
+          n: x.n || (x.z && y.n),
+          o: (x.z && y.o) || (y.z && x.o),
+          z: x.z && y.z,
+        },
+        [x, y],
+        true,
+      );
+    }
+    case "OR_B": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      if (x.base !== "B" || !x.d || y.base !== "W" || !y.d) return invalidType();
+      return mergeTimelock(
+        {
+          ...typeInfo("B", "dux"),
+          o: (x.z && y.o) || (y.z && x.o),
+          z: x.z && y.z,
+        },
+        [x, y],
+        false,
+      );
+    }
+    case "OR_D": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      if (x.base !== "B" || !x.d || !x.u || y.base !== "B") return invalidType();
+      return mergeTimelock(
+        { ...typeInfo("B", "x"), d: y.d, o: x.o && y.z, u: y.u, z: x.z && y.z },
+        [x, y],
+        false,
+      );
+    }
+    case "OR_C": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      if (x.base !== "B" || !x.d || !x.u || y.base !== "V") return invalidType();
+      return mergeTimelock({ ...typeInfo("V", "x"), o: x.o && y.z, z: x.z && y.z }, [x, y], false);
+    }
+    case "OR_I": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      const base = sameBase(x, y);
+      if (!base || !hasAnyBase(x, ["B", "K", "V"])) return invalidType();
+      return mergeTimelock(
+        {
+          ...typeInfo(base, "x"),
+          d: x.d || y.d,
+          o: x.z && y.z,
+          u: x.u && y.u,
+        },
+        [x, y],
+        false,
+      );
+    }
+    case "ANDOR": {
+      const x = computeMiniscriptType(node.subs[0], addressType);
+      const y = computeMiniscriptType(node.subs[1], addressType);
+      const z = computeMiniscriptType(node.subs[2], addressType);
+      const base = sameBase(y, z);
+      if (x.base !== "B" || !x.d || !x.u || !base || !hasAnyBase(y, ["B", "K", "V"])) {
+        return invalidType();
+      }
+      const out = mergeTimelock(
+        {
+          ...typeInfo(base, "x"),
+          d: z.d,
+          o: (x.o && y.z && z.z) || (x.z && y.o && z.o),
+          u: y.u && z.u,
+          z: x.z && y.z && z.z,
+        },
+        [x, y, z],
+        false,
+      );
+      out.k = x.k && y.k && z.k && noTimelockMix(x, y);
+      return out;
+    }
+    case "THRESH": {
+      const subTypes = node.subs.map((sub) => computeMiniscriptType(sub, addressType));
+      if (subTypes.length === 0) return invalidType();
+      const [first, ...rest] = subTypes;
+      if (first.base !== "B" || !first.d || !first.u) return invalidType();
+      if (rest.some((type) => type.base !== "W" || !type.d || !type.u)) return invalidType();
+      const z = subTypes.every((type) => type.z);
+      const o =
+        subTypes.filter((type) => type.o).length === 1 &&
+        subTypes.every((type) => type.o || type.z);
+      return mergeTimelock({ ...typeInfo("B", "du"), o, z }, subTypes, node.k >= 2);
+    }
   }
 }
 
@@ -640,10 +921,16 @@ function validateMiniscriptNode(
 ): void {
   switch (node.fragment) {
     case "OLDER": {
+      if (node.k < 1 || node.k >= 0x80000000) {
+        invalid("older() value must be between 1 and 2^31 - 1");
+      }
       timelockFromK(false, node.k);
       break;
     }
     case "AFTER": {
+      if (node.k < 1 || node.k >= 0x80000000) {
+        invalid("after() value must be between 1 and 2^31 - 1");
+      }
       timelockFromK(true, node.k);
       break;
     }
@@ -715,6 +1002,12 @@ function substituteMiniscriptKeys(
       return "1";
     case "PK":
       return `pk(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+    case "PKH":
+      return `pkh(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+    case "PK_H":
+      return `pk_h(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+    case "PK_K":
+      return `pk_k(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
     case "OLDER":
       return `older(${node.k})`;
     case "AFTER":
@@ -1016,7 +1309,13 @@ export function parseMiniscript(
 ): MiniscriptFragment {
   const node = parseMiniscriptFragment(expression, addressType);
   validateMiniscriptNode(node, addressType);
-  validateTimelockMixing(assignNodeIds(miniscriptToScriptNode(node), [1]));
+  const type = computeMiniscriptType(node, addressType);
+  if (type.base !== "B") {
+    invalid("Invalid miniscript type");
+  }
+  if (!type.k) {
+    invalid("Timelock mixing");
+  }
   return node;
 }
 
@@ -1042,6 +1341,13 @@ export function validateMiniscriptTemplate(
   } catch (error) {
     return { error: (error as Error).message, ok: false };
   }
+}
+
+export function miniscriptNeedsExplicitVerify(
+  node: MiniscriptFragment,
+  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
+): boolean {
+  return computeMiniscriptType(node, addressType).x;
 }
 
 export function parsePolicy(expression: string): PolicyNode {
