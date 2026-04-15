@@ -7,20 +7,21 @@ import {
 } from "./descriptor.js";
 import type { Network } from "./config.js";
 import { MAINNET_VERSIONS, TESTNET_VERSIONS } from "./address.js";
+import type { AddressType } from "./address-type.js";
 
-const MULTISIG_CONFIG_FORMATS: Record<number, string> = {
-  1: "P2SH",
-  2: "P2WSH-P2SH",
-  3: "P2WSH",
-  4: "P2TR",
+const MULTISIG_CONFIG_FORMATS: Record<AddressType, string> = {
+  LEGACY: "P2SH",
+  NESTED_SEGWIT: "P2WSH-P2SH",
+  NATIVE_SEGWIT: "P2WSH",
+  TAPROOT: "P2TR",
 };
 
-const FORMAT_TO_ADDRESS_TYPE: Record<string, number> = {
-  p2sh: 1,
-  p2wsh: 3,
-  "p2wsh-p2sh": 2,
-  "p2sh-p2wsh": 2,
-  p2tr: 4,
+const FORMAT_TO_ADDRESS_TYPE: Record<string, AddressType> = {
+  p2sh: "LEGACY",
+  p2wsh: "NATIVE_SEGWIT",
+  "p2wsh-p2sh": "NESTED_SEGWIT",
+  "p2sh-p2wsh": "NESTED_SEGWIT",
+  p2tr: "TAPROOT",
 };
 
 const NAME_REGEX = /^name\s*:(.+)$/i;
@@ -29,7 +30,7 @@ const FORMAT_REGEX = /^format\s*:(.+)$/i;
 const DERIVATION_REGEX = /^derivation\s*:(.+)$/i;
 const XFP_REGEX = /^([0-9a-fA-F]{8})\s*:(.+)$/;
 
-function getMultisigConfigFormat(addressType: number): string {
+function getMultisigConfigFormat(addressType: AddressType): string {
   const format = MULTISIG_CONFIG_FORMATS[addressType];
   if (!format) {
     throw new Error(`Unsupported address type for multisig config export: ${addressType}`);
@@ -47,7 +48,7 @@ export function buildMultisigConfig(
   signers: string[],
   m: number,
   n: number,
-  addressType: number,
+  addressType: AddressType,
 ): string {
   const lines = [
     "# Export from nunchuk-cli",
@@ -82,7 +83,7 @@ function isValidDerivationPath(value: string): boolean {
   return /^m(?:\/\d+'?)*$/.test(withRoot);
 }
 
-function parseMultisigConfigFormat(value: string): number {
+function parseMultisigConfigFormat(value: string): AddressType {
   const addressType = FORMAT_TO_ADDRESS_TYPE[value.trim().toLowerCase()];
   if (addressType == null) {
     throw new Error(`Invalid address type: ${value}`);
@@ -107,7 +108,7 @@ function validateExtendedPublicKeyForNetwork(value: string, network: Network): s
 }
 
 export function parseMultisigConfig(content: string, network: Network): ParsedDescriptor {
-  let addressType = 1;
+  let addressType: AddressType = "LEGACY";
   let m = 0;
   let n = 0;
   let derivationPath: string | undefined;

@@ -8,7 +8,7 @@ import {
   loadConfig,
 } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
-import { ADDRESS_TYPES, ADDRESS_TYPE_LABELS, type AddressType } from "../core/address-type.js";
+import { ADDRESS_TYPES, numberToAddressType, type AddressType } from "../core/address-type.js";
 import {
   buildCreateGroupBody,
   buildJoinGroupEvent,
@@ -413,8 +413,10 @@ sandboxCommand
 
         // Get sandbox address type to derive correct path
         const state = getGroupDisplayState(groupData.group, pub, priv);
-        const addressType = ADDRESS_TYPE_LABELS[state.addressType];
-        if (!addressType) {
+        let addressType: AddressType;
+        try {
+          addressType = numberToAddressType(state.addressType);
+        } catch {
           printError(
             {
               error: "INVALID_STATE",

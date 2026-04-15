@@ -3,7 +3,6 @@ import { Command, InvalidArgumentError } from "commander";
 import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
 import type { Network } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
-import { formatAddressType } from "../core/address-type.js";
 import { listWallets, loadWallet, removeWallet, saveWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { print, printError, printTable, printWalletResult } from "../output.js";
@@ -58,23 +57,6 @@ function looksLikeMultisigConfig(content: string): boolean {
     /(^|\n)\s*[0-9a-fA-F]{8}\s*:/i.test(content)
   );
 }
-function formatWalletOutput<T extends { addressType?: number }>(
-  wallet: T,
-):
-  | T
-  | (Omit<T, "addressType"> & {
-      addressType?: number | string;
-    }) {
-  if (wallet.addressType == null) {
-    return wallet;
-  }
-
-  return {
-    ...wallet,
-    addressType: formatAddressType(wallet.addressType),
-  };
-}
-
 function parseWalletDescriptor(wallet: WalletData) {
   return parseDescriptor(wallet.descriptor);
 }
@@ -447,10 +429,10 @@ walletCommand
       print(
         {
           ...result,
-          wallet: formatWalletOutput({
+          wallet: {
             ...result.wallet,
             typeLabel: getWalletTypeLabel(result.wallet),
-          }),
+          },
         },
         cmd,
       );

@@ -1,16 +1,9 @@
 import { Command, InvalidArgumentError, Option } from "commander";
 import { getNetwork, requireEmail } from "../core/config.js";
-import { formatAddressType } from "../core/address-type.js";
+import type { AddressType } from "../core/address-type.js";
 import { loadWallet } from "../core/storage.js";
 import { buildWalletDescriptorForParsed, parseDescriptor } from "../core/descriptor.js";
-import {
-  MINISCRIPT_ADDRESS_TYPE_ANY,
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-  MINISCRIPT_ADDRESS_TYPE_TAPROOT,
-  buildMiniscriptDescriptor,
-  type MiniscriptAddressType,
-  validateMiniscriptTemplate,
-} from "../core/miniscript.js";
+import { buildMiniscriptDescriptor, validateMiniscriptTemplate } from "../core/miniscript.js";
 import {
   formatMiniscriptPreimageRequirement,
   type MiniscriptPreimageRequirement,
@@ -22,17 +15,17 @@ export const miniscriptCommand = new Command("miniscript").description(
   "Inspect and validate miniscript wallets and descriptors",
 );
 
-function parseMiniscriptAddressTypeOption(value: string): MiniscriptAddressType {
+function parseAddressTypeOption(value: string): AddressType | undefined {
   const upper = value.toUpperCase().replace(/-/g, "_");
 
   if (upper === "ANY") {
-    return MINISCRIPT_ADDRESS_TYPE_ANY;
+    return undefined;
   }
   if (upper === "NATIVE_SEGWIT") {
-    return MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT;
+    return "NATIVE_SEGWIT";
   }
   if (upper === "TAPROOT") {
-    return MINISCRIPT_ADDRESS_TYPE_TAPROOT;
+    return "TAPROOT";
   }
 
   throw new InvalidArgumentError(
@@ -45,8 +38,8 @@ function miniscriptAddressTypeOption(): Option {
     "--address-type <type>",
     "Address type for --miniscript (ANY, NATIVE_SEGWIT, TAPROOT)",
   )
-    .argParser(parseMiniscriptAddressTypeOption)
-    .default(MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT, "NATIVE_SEGWIT");
+    .argParser(parseAddressTypeOption)
+    .default("NATIVE_SEGWIT" satisfies AddressType, "NATIVE_SEGWIT");
 }
 
 function parseNonNegativeIntegerOption(value: string, label: string): number {
@@ -105,17 +98,24 @@ function printMiniscriptPlanTable(
 }
 
 type MiniscriptSourceOptions = {
-  addressType?: MiniscriptAddressType;
+  addressType?: AddressType;
   descriptor?: string;
   miniscript?: string;
   wallet?: string;
 };
 
+function requireMiniscriptAddressType(addressType: AddressType): AddressType {
+  if (addressType !== "NATIVE_SEGWIT" && addressType !== "TAPROOT") {
+    throw new Error("Only native segwit and taproot miniscript descriptors are supported");
+  }
+  return addressType;
+}
+
 function getMiniscriptSource(
   options: MiniscriptSourceOptions,
   cmd: Command,
 ): {
-  addressType: MiniscriptAddressType;
+  addressType?: AddressType;
   descriptor?: string;
   miniscript: string;
   walletId?: string;
@@ -161,7 +161,7 @@ function getMiniscriptSource(
     }
 
     return {
-      addressType: parsed.addressType as MiniscriptAddressType,
+      addressType: requireMiniscriptAddressType(parsed.addressType),
       descriptor: buildWalletDescriptorForParsed(parsed),
       miniscript: parsed.miniscript,
       walletId: wallet.walletId,
@@ -183,14 +183,14 @@ function getMiniscriptSource(
     }
 
     return {
-      addressType: parsed.addressType as MiniscriptAddressType,
+      addressType: requireMiniscriptAddressType(parsed.addressType),
       descriptor: buildWalletDescriptorForParsed(parsed),
       miniscript: parsed.miniscript,
     };
   }
 
   const miniscript = String(options.miniscript).trim();
-  const addressType = options.addressType ?? MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT;
+  const addressType = options.addressType;
   const validation = validateMiniscriptTemplate(miniscript, addressType);
   if (!validation.ok) {
     printError(
@@ -206,17 +206,13 @@ function getMiniscriptSource(
   return {
     addressType,
     descriptor:
-      addressType === MINISCRIPT_ADDRESS_TYPE_ANY
-        ? undefined
-        : buildMiniscriptDescriptor(miniscript, addressType),
+      addressType === undefined ? undefined : buildMiniscriptDescriptor(miniscript, addressType),
     miniscript,
   };
 }
 
-function formatMiniscriptAddressType(addressType: MiniscriptAddressType): string {
-  return addressType === MINISCRIPT_ADDRESS_TYPE_ANY
-    ? "ANY"
-    : String(formatAddressType(addressType));
+function formatAddressTypeLabel(addressType: AddressType | undefined): string {
+  return addressType ?? "ANY";
 }
 
 miniscriptCommand
@@ -252,7 +248,7 @@ miniscriptCommand
       const result = {
         walletId: source.walletId,
         name: source.walletName,
-        addressType: formatMiniscriptAddressType(source.addressType),
+        addressType: formatAddressTypeLabel(source.addressType),
         miniscript: source.miniscript,
         descriptor: source.descriptor,
         txState: txState
@@ -280,7 +276,7 @@ miniscriptCommand
       if (source.walletId) {
         console.log(`Wallet: ${source.walletName} (${source.walletId})`);
       }
-      console.log(`Address Type: ${formatMiniscriptAddressType(source.addressType)}`);
+      console.log(`Address Type: ${formatAddressTypeLabel(source.addressType)}`);
       console.log(`Miniscript: ${source.miniscript}`);
       if (source.descriptor) {
         console.log(`Descriptor: ${source.descriptor}`);
@@ -313,7 +309,7 @@ miniscriptCommand
       const result = {
         ok: true,
         walletId: source.walletId,
-        addressType: formatMiniscriptAddressType(source.addressType),
+        addressType: formatAddressTypeLabel(source.addressType),
         miniscript: source.miniscript,
         descriptor: source.descriptor,
         pathCount: plans.length,
@@ -339,7 +335,7 @@ miniscriptCommand
       if (source.walletId) {
         console.log(`Wallet: ${source.walletId}`);
       }
-      console.log(`Address Type: ${formatMiniscriptAddressType(source.addressType)}`);
+      console.log(`Address Type: ${formatAddressTypeLabel(source.addressType)}`);
       console.log(`Miniscript: ${source.miniscript}`);
       if (source.descriptor) {
         console.log(`Descriptor: ${source.descriptor}`);

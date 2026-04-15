@@ -16,7 +16,11 @@ import {
 } from "./miniscript.js";
 
 interface WitnessStackResult {
+  hasSignature: boolean;
+  malleable: boolean;
+  nonCanonical: boolean;
   preimagesUsed: string[];
+  size: number;
   signaturesUsed: string[];
   stack: Uint8Array[];
 }
@@ -33,22 +37,35 @@ interface SatisfactionContext {
   txState: MiniscriptTransactionState;
 }
 
-const EMPTY_STACK: WitnessStackResult = { preimagesUsed: [], signaturesUsed: [], stack: [] };
-const ONE_STACK: WitnessStackResult = {
-  preimagesUsed: [],
-  signaturesUsed: [],
-  stack: [new Uint8Array([1])],
-};
-const ZERO_STACK: WitnessStackResult = {
-  preimagesUsed: [],
-  signaturesUsed: [],
-  stack: [new Uint8Array()],
-};
-const ZERO32_STACK: WitnessStackResult = {
-  preimagesUsed: [],
-  signaturesUsed: [],
-  stack: [new Uint8Array(32)],
-};
+function witnessItemSize(item: Uint8Array): number {
+  return item.length + 1;
+}
+
+function inputStack(
+  stack: Uint8Array[] = [],
+  options: {
+    hasSignature?: boolean;
+    malleable?: boolean;
+    nonCanonical?: boolean;
+    preimagesUsed?: string[];
+    signaturesUsed?: string[];
+  } = {},
+): WitnessStackResult {
+  return {
+    hasSignature: options.hasSignature ?? false,
+    malleable: options.malleable ?? false,
+    nonCanonical: options.nonCanonical ?? false,
+    preimagesUsed: options.preimagesUsed ?? [],
+    signaturesUsed: options.signaturesUsed ?? [],
+    size: stack.reduce((total, item) => total + witnessItemSize(item), 0),
+    stack,
+  };
+}
+
+const EMPTY_STACK = inputStack();
+const ONE_STACK = inputStack([new Uint8Array([1])]);
+const ZERO_STACK = inputStack([new Uint8Array()]);
+const ZERO32_STACK = inputStack([new Uint8Array(32)], { malleable: true });
 
 function concatWitnessStacks(
   lower: WitnessStackResult | null,
@@ -59,14 +76,55 @@ function concatWitnessStacks(
   }
 
   return {
+    hasSignature: lower.hasSignature || upper.hasSignature,
+    malleable: lower.malleable || upper.malleable,
+    nonCanonical: lower.nonCanonical || upper.nonCanonical,
     preimagesUsed: [...lower.preimagesUsed, ...upper.preimagesUsed],
+    size: lower.size + upper.size,
     signaturesUsed: [...lower.signaturesUsed, ...upper.signaturesUsed],
     stack: [...lower.stack, ...upper.stack],
   };
 }
 
-function firstAvailable(...options: Array<WitnessStackResult | null>): WitnessStackResult | null {
-  return options.find((option) => option != null) ?? null;
+function markWitnessStack(
+  stack: WitnessStackResult | null,
+  flags: { malleable?: boolean; nonCanonical?: boolean },
+): WitnessStackResult | null {
+  if (!stack) return null;
+  return {
+    ...stack,
+    malleable: stack.malleable || (flags.malleable ?? false),
+    nonCanonical: stack.nonCanonical || (flags.nonCanonical ?? false),
+  };
+}
+
+function chooseWitnessStack(
+  left: WitnessStackResult | null,
+  right: WitnessStackResult | null,
+): WitnessStackResult | null {
+  if (!left) return right;
+  if (!right) return left;
+
+  if (!left.hasSignature && right.hasSignature) return left;
+  if (!right.hasSignature && left.hasSignature) return right;
+  if (!left.hasSignature && !right.hasSignature) {
+    left = { ...left, malleable: true };
+    right = { ...right, malleable: true };
+  } else {
+    if (right.malleable && !left.malleable) return left;
+    if (left.malleable && !right.malleable) return right;
+  }
+
+  return left.size <= right.size ? left : right;
+}
+
+function chooseWitnessStacks(
+  ...options: Array<WitnessStackResult | null>
+): WitnessStackResult | null {
+  return options.reduce<WitnessStackResult | null>(
+    (selected, option) => chooseWitnessStack(selected, option),
+    null,
+  );
 }
 
 function sequenceSatisfied(requiredSequence: number, nSequence: number): boolean {
@@ -84,11 +142,20 @@ function sequenceSatisfied(requiredSequence: number, nSequence: number): boolean
 }
 
 function zeroStack(count: number): WitnessStackResult {
-  return {
-    preimagesUsed: [],
-    signaturesUsed: [],
-    stack: Array.from({ length: count }, () => new Uint8Array()),
-  };
+  return inputStack(Array.from({ length: count }, () => new Uint8Array()));
+}
+
+function signatureStack(key: string, signature: Uint8Array): WitnessStackResult {
+  return inputStack([signature], {
+    hasSignature: true,
+    signaturesUsed: [key],
+  });
+}
+
+function preimageStack(requirement: string, preimage: Uint8Array): WitnessStackResult {
+  return inputStack([preimage], {
+    preimagesUsed: [requirement],
+  });
 }
 
 function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): InputResult {
@@ -102,13 +169,7 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const signature = ctx.signatures.get(node.key);
       return {
         dsat: ZERO_STACK,
-        sat: signature
-          ? {
-              preimagesUsed: [],
-              signaturesUsed: [node.key],
-              stack: [signature],
-            }
-          : null,
+        sat: signature ? signatureStack(node.key, signature) : null,
       };
     }
     case "PKH":
@@ -120,17 +181,9 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
 
       const signature = ctx.signatures.get(node.key);
       return {
-        dsat: {
-          preimagesUsed: [],
-          signaturesUsed: [],
-          stack: [new Uint8Array(), pubkey],
-        },
+        dsat: inputStack([new Uint8Array(), pubkey]),
         sat: signature
-          ? {
-              preimagesUsed: [],
-              signaturesUsed: [node.key],
-              stack: [signature, pubkey],
-            }
+          ? concatWitnessStacks(signatureStack(node.key, signature), inputStack([pubkey]))
           : null,
       };
     }
@@ -163,40 +216,25 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       }
       return {
         dsat: ZERO32_STACK,
-        sat: preimage
-          ? {
-              preimagesUsed: [requirement],
-              signaturesUsed: [],
-              stack: [preimage],
-            }
-          : null,
+        sat: preimage ? preimageStack(requirement, preimage) : null,
       };
     }
     case "MULTI": {
-      const signatures: Uint8Array[] = [];
-      const signaturesUsed: string[] = [];
+      let sats: Array<WitnessStackResult | null> = [ZERO_STACK];
       for (const key of node.keys) {
         const signature = ctx.signatures.get(key);
-        if (!signature) {
-          continue;
+        const sat = signature ? signatureStack(key, signature) : null;
+        const nextSats: Array<WitnessStackResult | null> = [sats[0]];
+        for (let j = 1; j < sats.length; j++) {
+          nextSats.push(chooseWitnessStack(sats[j], concatWitnessStacks(sats[j - 1], sat)));
         }
-        signatures.push(signature);
-        signaturesUsed.push(key);
-        if (signatures.length === node.k) {
-          break;
-        }
+        nextSats.push(concatWitnessStacks(sats[sats.length - 1], sat));
+        sats = nextSats;
       }
 
       return {
         dsat: zeroStack(node.k + 1),
-        sat:
-          signatures.length === node.k
-            ? {
-                preimagesUsed: [],
-                signaturesUsed,
-                stack: [new Uint8Array(), ...signatures],
-              }
-            : null,
+        sat: sats[node.k] ?? null,
       };
     }
     case "MULTI_A":
@@ -216,7 +254,9 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
     case "WRAP_J": {
       const sub = produceInput(node.sub, ctx);
       return {
-        dsat: ZERO_STACK,
+        dsat: markWitnessStack(ZERO_STACK, {
+          malleable: sub.dsat != null && !sub.dsat.hasSignature,
+        }),
         sat: sub.sat,
       };
     }
@@ -231,7 +271,9 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const left = produceInput(node.subs[0], ctx);
       const right = produceInput(node.subs[1], ctx);
       return {
-        dsat: concatWitnessStacks(right.dsat, left.sat),
+        dsat: markWitnessStack(concatWitnessStacks(right.dsat, left.sat), {
+          nonCanonical: true,
+        }),
         sat: concatWitnessStacks(right.sat, left.sat),
       };
     }
@@ -239,7 +281,17 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const left = produceInput(node.subs[0], ctx);
       const right = produceInput(node.subs[1], ctx);
       return {
-        dsat: concatWitnessStacks(right.dsat, left.dsat),
+        dsat: chooseWitnessStacks(
+          concatWitnessStacks(right.dsat, left.dsat),
+          markWitnessStack(concatWitnessStacks(right.sat, left.dsat), {
+            malleable: true,
+            nonCanonical: true,
+          }),
+          markWitnessStack(concatWitnessStacks(right.dsat, left.sat), {
+            malleable: true,
+            nonCanonical: true,
+          }),
+        ),
         sat: concatWitnessStacks(right.sat, left.sat),
       };
     }
@@ -248,9 +300,13 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const right = produceInput(node.subs[1], ctx);
       return {
         dsat: concatWitnessStacks(right.dsat, left.dsat),
-        sat: firstAvailable(
+        sat: chooseWitnessStacks(
           concatWitnessStacks(right.dsat, left.sat),
           concatWitnessStacks(right.sat, left.dsat),
+          markWitnessStack(concatWitnessStacks(right.sat, left.sat), {
+            malleable: true,
+            nonCanonical: true,
+          }),
         ),
       };
     }
@@ -259,7 +315,7 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const right = produceInput(node.subs[1], ctx);
       return {
         dsat: null,
-        sat: firstAvailable(left.sat, concatWitnessStacks(right.sat, left.dsat)),
+        sat: chooseWitnessStacks(left.sat, concatWitnessStacks(right.sat, left.dsat)),
       };
     }
     case "OR_D": {
@@ -267,18 +323,18 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const right = produceInput(node.subs[1], ctx);
       return {
         dsat: concatWitnessStacks(right.dsat, left.dsat),
-        sat: firstAvailable(left.sat, concatWitnessStacks(right.sat, left.dsat)),
+        sat: chooseWitnessStacks(left.sat, concatWitnessStacks(right.sat, left.dsat)),
       };
     }
     case "OR_I": {
       const left = produceInput(node.subs[0], ctx);
       const right = produceInput(node.subs[1], ctx);
       return {
-        dsat: firstAvailable(
+        dsat: chooseWitnessStacks(
           concatWitnessStacks(left.dsat, ONE_STACK),
           concatWitnessStacks(right.dsat, ZERO_STACK),
         ),
-        sat: firstAvailable(
+        sat: chooseWitnessStacks(
           concatWitnessStacks(left.sat, ONE_STACK),
           concatWitnessStacks(right.sat, ZERO_STACK),
         ),
@@ -289,8 +345,13 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
       const middle = produceInput(node.subs[1], ctx);
       const right = produceInput(node.subs[2], ctx);
       return {
-        dsat: concatWitnessStacks(right.dsat, left.dsat),
-        sat: firstAvailable(
+        dsat: chooseWitnessStacks(
+          markWitnessStack(concatWitnessStacks(middle.dsat, left.sat), {
+            nonCanonical: true,
+          }),
+          concatWitnessStacks(right.dsat, left.dsat),
+        ),
+        sat: chooseWitnessStacks(
           concatWitnessStacks(middle.sat, left.sat),
           concatWitnessStacks(right.sat, left.dsat),
         ),
@@ -298,55 +359,36 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
     }
     case "THRESH": {
       const subResults = node.subs.map((sub) => produceInput(sub, ctx));
-      const dsat = subResults.every((result) => result.dsat != null)
-        ? subResults
-            .slice()
-            .reverse()
-            .reduce<WitnessStackResult | null>(
-              (stack, result) => concatWitnessStacks(stack, result.dsat),
-              EMPTY_STACK,
-            )
-        : null;
+      let sats: Array<WitnessStackResult | null> = [EMPTY_STACK];
+      for (let i = 0; i < subResults.length; i++) {
+        const result = subResults[subResults.length - i - 1];
+        const nextSats: Array<WitnessStackResult | null> = [
+          concatWitnessStacks(sats[0], result.dsat),
+        ];
+        for (let j = 1; j < sats.length; j++) {
+          nextSats.push(
+            chooseWitnessStack(
+              concatWitnessStacks(sats[j], result.dsat),
+              concatWitnessStacks(sats[j - 1], result.sat),
+            ),
+          );
+        }
+        nextSats.push(concatWitnessStacks(sats[sats.length - 1], result.sat));
+        sats = nextSats;
+      }
 
-      const choose = (
-        index: number,
-        remaining: number,
-        chosen: boolean[],
-      ): WitnessStackResult | null => {
-        if (remaining < 0 || remaining > node.subs.length - index) {
-          return null;
-        }
-        if (index === node.subs.length) {
-          if (remaining !== 0) {
-            return null;
-          }
-
-          let stack: WitnessStackResult | null = EMPTY_STACK;
-          for (let i = node.subs.length - 1; i >= 0; i--) {
-            const result = subResults[i];
-            stack = concatWitnessStacks(stack, chosen[i] ? result.sat : result.dsat);
-            if (!stack) {
-              return null;
-            }
-          }
-          return stack;
-        }
-
-        if (subResults[index].sat) {
-          const withSat = choose(index + 1, remaining - 1, [...chosen, true]);
-          if (withSat) {
-            return withSat;
-          }
-        }
-        if (subResults[index].dsat) {
-          return choose(index + 1, remaining, [...chosen, false]);
-        }
-        return null;
-      };
+      let dsat: WitnessStackResult | null = null;
+      for (let i = 0; i < sats.length; i++) {
+        if (i === node.k) continue;
+        dsat = chooseWitnessStack(
+          dsat,
+          i === 0 ? sats[i] : markWitnessStack(sats[i], { malleable: true, nonCanonical: true }),
+        );
+      }
 
       return {
         dsat,
-        sat: choose(0, node.k, []),
+        sat: sats[node.k] ?? null,
       };
     }
   }
@@ -412,7 +454,11 @@ export function finalizeMiniscriptPsbt(
     throw new Error("Descriptor is not a miniscript descriptor");
   }
 
-  const fragment = parseMiniscript(parsed.miniscript, parsed.addressType as 3);
+  const addressType = parsed.addressType;
+  if (addressType !== "NATIVE_SEGWIT" && addressType !== "TAPROOT") {
+    throw new Error("Only native segwit and taproot miniscript descriptors are supported");
+  }
+  const fragment = parseMiniscript(parsed.miniscript, addressType);
   const txState = getTransactionState(tx);
   let requiredPreimages = 0;
   let requiredSignatures = 0;
@@ -446,7 +492,7 @@ export function finalizeMiniscriptPsbt(
 
     const preimages = getInputMiniscriptPreimages(input);
     const result = produceInput(fragment, { preimages, pubkeys, signatures, txState }).sat;
-    if (!result) {
+    if (!result || result.malleable || !result.hasSignature) {
       throw new Error("Not enough signatures or hash preimages to finalize miniscript PSBT");
     }
 

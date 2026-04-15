@@ -1,20 +1,28 @@
 import { descriptorChecksum } from "./descriptor.js";
-
-export const MINISCRIPT_ADDRESS_TYPE_ANY = 0;
-export const MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT = 3;
-export const MINISCRIPT_ADDRESS_TYPE_TAPROOT = 4;
+import type { AddressType } from "./address-type.js";
 
 const LOCKTIME_THRESHOLD = 500000000;
+const MAX_PUBKEYS_PER_MULTISIG = 20;
+const MAX_PUBKEYS_PER_MULTI_A = 999;
+const MAX_OPS_PER_SCRIPT = 201;
+const MAX_STANDARD_P2WSH_STACK_ITEMS = 100;
+const MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600;
+const MAX_STANDARD_TX_WEIGHT = 400000;
+const MAX_STACK_SIZE = 1000;
+const MAX_TAPMINISCRIPT_STACK_ELEM_SIZE = 65;
+const TAPROOT_CONTROL_BASE_SIZE = 33;
+const TAPROOT_CONTROL_NODE_SIZE = 32;
+const TAPROOT_CONTROL_MAX_NODE_COUNT = 128;
+const TAPROOT_CONTROL_MAX_SIZE =
+  TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT;
 const SEQUENCE_LOCKTIME_MASK = 0x0000ffff;
 const SEQUENCE_LOCKTIME_TYPE_FLAG = 1 << 22;
 const SEQUENCE_LOCKTIME_GRANULARITY = 9;
+const WITNESS_SCALE_FACTOR = 4;
 
 export const UNDETERMINED_TIMELOCK_VALUE = Number.MAX_SAFE_INTEGER;
 
-export type MiniscriptAddressType =
-  | typeof MINISCRIPT_ADDRESS_TYPE_ANY
-  | typeof MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT
-  | typeof MINISCRIPT_ADDRESS_TYPE_TAPROOT;
+type MiniscriptContextAddressType = Extract<AddressType, "NATIVE_SEGWIT" | "TAPROOT">;
 
 export type WrapperFragment =
   | "WRAP_A"
@@ -141,26 +149,103 @@ export interface ValidateResult {
 type MiniscriptBaseType = "B" | "K" | "V" | "W";
 
 interface MiniscriptTypeInfo {
+  flags: number;
   base?: MiniscriptBaseType;
   d: boolean;
+  e: boolean;
+  f: boolean;
   g: boolean;
   h: boolean;
   i: boolean;
   j: boolean;
   k: boolean;
+  m: boolean;
   n: boolean;
   o: boolean;
+  s: boolean;
   u: boolean;
   x: boolean;
   z: boolean;
 }
 
+interface MaxInt {
+  valid: boolean;
+  value: number;
+}
+
+interface MiniscriptOps {
+  count: number;
+  dsat: MaxInt;
+  sat: MaxInt;
+}
+
+interface SatInfo {
+  exec: number;
+  netdiff: number;
+  valid: boolean;
+}
+
+interface StackSize {
+  dsat: SatInfo;
+  sat: SatInfo;
+}
+
+interface WitnessSize {
+  dsat: MaxInt;
+  sat: MaxInt;
+}
+
+interface MiniscriptResourceStats {
+  ops: MiniscriptOps;
+  stackSize: StackSize;
+  witnessSize: WitnessSize;
+}
+
+const TYPE_FLAG_BITS: Record<string, number> = {
+  B: 1 << 0,
+  V: 1 << 1,
+  K: 1 << 2,
+  W: 1 << 3,
+  z: 1 << 4,
+  o: 1 << 5,
+  n: 1 << 6,
+  d: 1 << 7,
+  u: 1 << 8,
+  e: 1 << 9,
+  f: 1 << 10,
+  s: 1 << 11,
+  m: 1 << 12,
+  x: 1 << 13,
+  g: 1 << 14,
+  h: 1 << 15,
+  i: 1 << 16,
+  j: 1 << 17,
+  k: 1 << 18,
+};
+
+const miniscriptTemplateValidationCache = new Map<string, ValidateResult>();
+
 function invalid(message: string): never {
   throw new Error(message);
 }
 
-function isWrapperPrefixChar(ch: string): boolean {
-  return "asctdvjnlut".includes(ch);
+function isMiniscriptContextAddressType(
+  addressType: AddressType,
+): addressType is MiniscriptContextAddressType {
+  return addressType === "NATIVE_SEGWIT" || addressType === "TAPROOT";
+}
+
+function resolveMiniscriptContext(
+  expression: string,
+  addressType?: AddressType,
+): MiniscriptContextAddressType {
+  if (addressType !== undefined) {
+    if (!isMiniscriptContextAddressType(addressType)) {
+      invalid("Only native segwit and taproot miniscript are supported");
+    }
+    return addressType;
+  }
+  return expression.includes("multi_a(") ? "TAPROOT" : "NATIVE_SEGWIT";
 }
 
 function isNumeric(value: string): boolean {
@@ -227,43 +312,6 @@ function unwrapCall(expression: string): { inner: string; name: string } {
   return { name, inner };
 }
 
-function collectWrappers(expression: string): { expression: string; wrappers: string[] } {
-  const wrappers: string[] = [];
-  let working = expression.trim();
-  while (working.length >= 2 && isWrapperPrefixChar(working[0]) && working[1] === ":") {
-    wrappers.push(working[0]);
-    working = working.slice(2);
-  }
-  return { expression: working, wrappers };
-}
-
-function applyWrapper(wrapper: string, node: MiniscriptFragment): MiniscriptFragment {
-  switch (wrapper) {
-    case "a":
-      return { fragment: "WRAP_A", sub: node };
-    case "s":
-      return { fragment: "WRAP_S", sub: node };
-    case "c":
-      return { fragment: "WRAP_C", sub: node };
-    case "d":
-      return { fragment: "WRAP_D", sub: node };
-    case "v":
-      return { fragment: "WRAP_V", sub: node };
-    case "j":
-      return { fragment: "WRAP_J", sub: node };
-    case "n":
-      return { fragment: "WRAP_N", sub: node };
-    case "t":
-      return { fragment: "AND_V", subs: [node, { fragment: "JUST_1" }] };
-    case "l":
-      return { fragment: "OR_I", subs: [{ fragment: "JUST_0" }, node] };
-    case "u":
-      return { fragment: "OR_I", subs: [node, { fragment: "JUST_0" }] };
-    default:
-      invalid(`Unsupported wrapper: ${wrapper}`);
-  }
-}
-
 function parseUInt(value: string, field: string): number {
   if (!isNumeric(value)) {
     invalid(`Invalid ${field}: ${value}`);
@@ -282,138 +330,365 @@ function parseHashArg(value: string, bytes: number, name: string): string {
   return value.toLowerCase();
 }
 
+type TextParseContext =
+  | "WRAPPED_EXPR"
+  | "EXPR"
+  | "SWAP"
+  | "ALT"
+  | "CHECK"
+  | "DUP_IF"
+  | "VERIFY"
+  | "NON_ZERO"
+  | "ZERO_NOTEQUAL"
+  | "WRAP_U"
+  | "WRAP_T"
+  | "AND_N"
+  | "AND_V"
+  | "AND_B"
+  | "ANDOR"
+  | "OR_B"
+  | "OR_C"
+  | "OR_D"
+  | "OR_I"
+  | "THRESH"
+  | "COMMA"
+  | "CLOSE_BRACKET";
+
+interface TextParseFrame {
+  context: TextParseContext;
+  k: number;
+  n: number;
+}
+
 function parseMiniscriptFragment(
   expression: string,
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
+  addressType?: AddressType,
 ): MiniscriptFragment {
-  const trimmed = expression.trim();
-  if (trimmed.length === 0) {
+  const input = expression.trim();
+  if (input.length === 0) {
     invalid("Miniscript expression is empty");
   }
-  if (trimmed === "0") {
-    return { fragment: "JUST_0" };
-  }
-  if (trimmed === "1") {
-    return { fragment: "JUST_1" };
-  }
 
-  const { expression: baseExpression, wrappers } = collectWrappers(trimmed);
-  const { name, inner } = unwrapCall(baseExpression);
-  const args = splitTopLevel(inner, ",");
+  const context = resolveMiniscriptContext(input, addressType);
+  const toParse: TextParseFrame[] = [{ context: "WRAPPED_EXPR", k: -1, n: -1 }];
+  const constructed: MiniscriptFragment[] = [];
+  let pos = 0;
 
-  let node: MiniscriptFragment;
-  switch (name) {
-    case "pk":
-    case "pk_k":
-    case "pkh":
-    case "pk_h":
-      if (args.length !== 1) invalid(`Invalid ${name}() expression`);
-      node = {
-        fragment:
-          name === "pk_k" ? "PK_K" : name === "pkh" ? "PKH" : name === "pk_h" ? "PK_H" : "PK",
-        key: args[0],
-      };
-      break;
-    case "older":
-      if (args.length !== 1) invalid("Invalid older() expression");
-      node = { fragment: "OLDER", k: parseUInt(args[0], "older value") };
-      break;
-    case "after":
-      if (args.length !== 1) invalid("Invalid after() expression");
-      node = { fragment: "AFTER", k: parseUInt(args[0], "after value") };
-      break;
-    case "hash160":
-      if (args.length !== 1) invalid("Invalid hash160() expression");
-      node = { fragment: "HASH160", data: parseHashArg(args[0], 20, "hash160") };
-      break;
-    case "hash256":
-      if (args.length !== 1) invalid("Invalid hash256() expression");
-      node = { fragment: "HASH256", data: parseHashArg(args[0], 32, "hash256") };
-      break;
-    case "ripemd160":
-      if (args.length !== 1) invalid("Invalid ripemd160() expression");
-      node = { fragment: "RIPEMD160", data: parseHashArg(args[0], 20, "ripemd160") };
-      break;
-    case "sha256":
-      if (args.length !== 1) invalid("Invalid sha256() expression");
-      node = { fragment: "SHA256", data: parseHashArg(args[0], 32, "sha256") };
-      break;
-    case "multi":
-    case "multi_a": {
-      if (args.length < 2) invalid(`Invalid ${name}() expression`);
-      const k = parseUInt(args[0], `${name} threshold`);
-      const keys = args.slice(1);
-      if (keys.length === 0 || k < 1 || k > keys.length) {
-        invalid(`Invalid ${name}() threshold`);
-      }
-      if (name === "multi" && keys.length > 20) {
-        invalid("multi() supports at most 20 keys");
-      }
-      if (name === "multi_a" && addressType === MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT) {
-        invalid("multi_a() is only valid for taproot miniscript");
-      }
-      if (name === "multi" && addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT) {
-        invalid("multi() is not valid for taproot miniscript");
-      }
-      node = { fragment: name === "multi_a" ? "MULTI_A" : "MULTI", k, keys };
-      break;
+  const malformed = (): never => invalid(`Invalid miniscript expression: ${expression}`);
+  const consume = (prefix: string): boolean => {
+    if (!input.startsWith(prefix, pos)) {
+      return false;
     }
-    case "and_v":
-    case "and_b":
-    case "and_n":
-    case "or_b":
-    case "or_c":
-    case "or_d":
-    case "or_i":
-      if (args.length !== 2) invalid(`Invalid ${name}() expression`);
-      if (name === "and_n") {
-        node = {
+    pos += prefix.length;
+    return true;
+  };
+  const findNextChar = (ch: string): number => {
+    for (let i = pos; i < input.length; i++) {
+      if (input[i] === ch) return i;
+      if (input[i] === ")") break;
+    }
+    return -1;
+  };
+  const parseIntegralEnd = (field: string): number => {
+    const close = findNextChar(")");
+    if (close - pos < 1) malformed();
+    const raw = input.slice(pos, close);
+    if (!isNumeric(raw)) malformed();
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed >= 0x80000000) {
+      invalid(`Invalid ${field}: ${raw}`);
+    }
+    pos = close + 1;
+    return parsed;
+  };
+  const parseHashEnd = (bytes: number, name: string): string => {
+    const close = findNextChar(")");
+    if (close - pos < 1) malformed();
+    const data = parseHashArg(input.slice(pos, close), bytes, name);
+    pos = close + 1;
+    return data;
+  };
+  const parseKeyEnd = (): string => {
+    const close = findNextChar(")");
+    const keySize = close - pos;
+    if (keySize < 1 || keySize > 200) malformed();
+    const key = input.slice(pos, close);
+    pos = close + 1;
+    return key;
+  };
+  const parseThresholdBeforeComma = (name: string): number => {
+    const comma = findNextChar(",");
+    if (comma - pos < 1) malformed();
+    const raw = input.slice(pos, comma);
+    if (!isNumeric(raw)) malformed();
+    const k = Number.parseInt(raw, 10);
+    if (!Number.isSafeInteger(k) || k < 1) {
+      invalid(`Invalid ${name} threshold`);
+    }
+    pos = comma + 1;
+    return k;
+  };
+  const replaceTop = (fragment: MiniscriptFragment): void => {
+    if (constructed.length < 1) malformed();
+    constructed[constructed.length - 1] = fragment;
+  };
+  const getTop = (): MiniscriptFragment => {
+    const top = constructed[constructed.length - 1];
+    if (!top) malformed();
+    return top;
+  };
+  const wrapTop = (fragment: WrapperFragment): void => {
+    if (constructed.length < 1) malformed();
+    replaceTop({ fragment, sub: getTop() });
+  };
+  const buildBack = (fragment: BinaryFragment): void => {
+    if (constructed.length < 2) malformed();
+    const child = constructed.pop() ?? malformed();
+    replaceTop({ fragment, subs: [getTop(), child] });
+  };
+  const parseBinaryContext = (): TextParseContext => {
+    if (consume("and_n(")) return "AND_N";
+    if (consume("and_b(")) return "AND_B";
+    if (consume("and_v(")) return "AND_V";
+    if (consume("or_b(")) return "OR_B";
+    if (consume("or_c(")) return "OR_C";
+    if (consume("or_d(")) return "OR_D";
+    if (consume("or_i(")) return "OR_I";
+    return malformed();
+  };
+  const parseMultiExpression = (isMultiA: boolean): void => {
+    if ((isMultiA && context !== "TAPROOT") || (!isMultiA && context !== "NATIVE_SEGWIT")) {
+      malformed();
+    }
+
+    const name = isMultiA ? "multi_a" : "multi";
+    const k = parseThresholdBeforeComma(name);
+    const keys: string[] = [];
+    let nextComma = pos - 1;
+    while (nextComma !== -1) {
+      nextComma = findNextChar(",");
+      const close = findNextChar(")");
+      const keyEnd = nextComma === -1 || (close !== -1 && close < nextComma) ? close : nextComma;
+      const keyLength = keyEnd - pos;
+      if (keyEnd < 0 || keyLength < 1 || keyLength > 200) malformed();
+      keys.push(input.slice(pos, keyEnd));
+      pos = keyEnd + 1;
+      if (keyEnd === close) {
+        nextComma = -1;
+      }
+    }
+
+    const maxKeys = isMultiA ? MAX_PUBKEYS_PER_MULTI_A : MAX_PUBKEYS_PER_MULTISIG;
+    if (keys.length < 1 || keys.length > maxKeys || k > keys.length) {
+      invalid(`Invalid ${name}() threshold`);
+    }
+    constructed.push({ fragment: isMultiA ? "MULTI_A" : "MULTI", k, keys });
+  };
+
+  while (toParse.length > 0) {
+    const frame = toParse.pop() ?? malformed();
+
+    switch (frame.context) {
+      case "WRAPPED_EXPR": {
+        let colonIndex: number | undefined;
+        for (let i = pos + 1; i < input.length; i++) {
+          const code = input.charCodeAt(i);
+          if (input[i] === ":") {
+            colonIndex = i;
+            break;
+          }
+          if (code < 97 || code > 122) {
+            break;
+          }
+        }
+
+        let lastWasVerify = false;
+        if (colonIndex != null) {
+          for (let i = pos; i < colonIndex; i++) {
+            switch (input[i]) {
+              case "a":
+                toParse.push({ context: "ALT", k: -1, n: -1 });
+                break;
+              case "s":
+                toParse.push({ context: "SWAP", k: -1, n: -1 });
+                break;
+              case "c":
+                toParse.push({ context: "CHECK", k: -1, n: -1 });
+                break;
+              case "d":
+                toParse.push({ context: "DUP_IF", k: -1, n: -1 });
+                break;
+              case "j":
+                toParse.push({ context: "NON_ZERO", k: -1, n: -1 });
+                break;
+              case "n":
+                toParse.push({ context: "ZERO_NOTEQUAL", k: -1, n: -1 });
+                break;
+              case "v":
+                if (lastWasVerify) malformed();
+                toParse.push({ context: "VERIFY", k: -1, n: -1 });
+                break;
+              case "u":
+                toParse.push({ context: "WRAP_U", k: -1, n: -1 });
+                break;
+              case "t":
+                toParse.push({ context: "WRAP_T", k: -1, n: -1 });
+                break;
+              case "l":
+                constructed.push({ fragment: "JUST_0" });
+                toParse.push({ context: "OR_I", k: -1, n: -1 });
+                break;
+              default:
+                malformed();
+            }
+            lastWasVerify = input[i] === "v";
+          }
+          pos = colonIndex + 1;
+        }
+        toParse.push({ context: "EXPR", k: -1, n: -1 });
+        break;
+      }
+      case "EXPR": {
+        if (consume("0")) {
+          constructed.push({ fragment: "JUST_0" });
+        } else if (consume("1")) {
+          constructed.push({ fragment: "JUST_1" });
+        } else if (consume("pk(")) {
+          constructed.push({ fragment: "WRAP_C", sub: { fragment: "PK_K", key: parseKeyEnd() } });
+        } else if (consume("pkh(")) {
+          constructed.push({ fragment: "WRAP_C", sub: { fragment: "PK_H", key: parseKeyEnd() } });
+        } else if (consume("pk_k(")) {
+          constructed.push({ fragment: "PK_K", key: parseKeyEnd() });
+        } else if (consume("pk_h(")) {
+          constructed.push({ fragment: "PK_H", key: parseKeyEnd() });
+        } else if (consume("sha256(")) {
+          constructed.push({ fragment: "SHA256", data: parseHashEnd(32, "sha256") });
+        } else if (consume("ripemd160(")) {
+          constructed.push({ fragment: "RIPEMD160", data: parseHashEnd(20, "ripemd160") });
+        } else if (consume("hash256(")) {
+          constructed.push({ fragment: "HASH256", data: parseHashEnd(32, "hash256") });
+        } else if (consume("hash160(")) {
+          constructed.push({ fragment: "HASH160", data: parseHashEnd(20, "hash160") });
+        } else if (consume("after(")) {
+          constructed.push({ fragment: "AFTER", k: parseIntegralEnd("after value") });
+        } else if (consume("older(")) {
+          constructed.push({ fragment: "OLDER", k: parseIntegralEnd("older value") });
+        } else if (consume("multi(")) {
+          parseMultiExpression(false);
+        } else if (consume("multi_a(")) {
+          parseMultiExpression(true);
+        } else if (consume("thresh(")) {
+          const k = parseThresholdBeforeComma("thresh");
+          toParse.push({ context: "THRESH", k, n: 1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+        } else if (consume("andor(")) {
+          toParse.push({ context: "ANDOR", k: -1, n: -1 });
+          toParse.push({ context: "CLOSE_BRACKET", k: -1, n: -1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+          toParse.push({ context: "COMMA", k: -1, n: -1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+          toParse.push({ context: "COMMA", k: -1, n: -1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+        } else {
+          toParse.push({ context: parseBinaryContext(), k: -1, n: -1 });
+          toParse.push({ context: "CLOSE_BRACKET", k: -1, n: -1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+          toParse.push({ context: "COMMA", k: -1, n: -1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+        }
+        break;
+      }
+      case "ALT":
+        wrapTop("WRAP_A");
+        break;
+      case "SWAP":
+        wrapTop("WRAP_S");
+        break;
+      case "CHECK":
+        wrapTop("WRAP_C");
+        break;
+      case "DUP_IF":
+        wrapTop("WRAP_D");
+        break;
+      case "VERIFY":
+        wrapTop("WRAP_V");
+        break;
+      case "NON_ZERO":
+        wrapTop("WRAP_J");
+        break;
+      case "ZERO_NOTEQUAL":
+        wrapTop("WRAP_N");
+        break;
+      case "WRAP_U":
+        if (constructed.length < 1) malformed();
+        replaceTop({
+          fragment: "OR_I",
+          subs: [getTop(), { fragment: "JUST_0" }],
+        });
+        break;
+      case "WRAP_T":
+        if (constructed.length < 1) malformed();
+        replaceTop({
+          fragment: "AND_V",
+          subs: [getTop(), { fragment: "JUST_1" }],
+        });
+        break;
+      case "AND_B":
+      case "AND_V":
+      case "OR_B":
+      case "OR_C":
+      case "OR_D":
+      case "OR_I":
+        buildBack(frame.context);
+        break;
+      case "AND_N": {
+        if (constructed.length < 2) malformed();
+        const mid = constructed.pop() ?? malformed();
+        replaceTop({
           fragment: "ANDOR",
-          subs: [
-            parseMiniscriptFragment(args[0], addressType),
-            parseMiniscriptFragment(args[1], addressType),
-            { fragment: "JUST_0" },
-          ],
-        };
-      } else {
-        node = {
-          fragment: name.toUpperCase() as BinaryFragment,
-          subs: [
-            parseMiniscriptFragment(args[0], addressType),
-            parseMiniscriptFragment(args[1], addressType),
-          ],
-        };
+          subs: [getTop(), mid, { fragment: "JUST_0" }],
+        });
+        break;
       }
-      break;
-    case "andor":
-      if (args.length !== 3) invalid("Invalid andor() expression");
-      node = {
-        fragment: "ANDOR",
-        subs: [
-          parseMiniscriptFragment(args[0], addressType),
-          parseMiniscriptFragment(args[1], addressType),
-          parseMiniscriptFragment(args[2], addressType),
-        ],
-      };
-      break;
-    case "thresh": {
-      if (args.length < 2) invalid("Invalid thresh() expression");
-      const k = parseUInt(args[0], "thresh threshold");
-      const subs = args.slice(1).map((arg) => parseMiniscriptFragment(arg, addressType));
-      if (k < 1 || k > subs.length) {
-        invalid("Invalid thresh() threshold");
+      case "ANDOR": {
+        if (constructed.length < 3) malformed();
+        const right = constructed.pop() ?? malformed();
+        const mid = constructed.pop() ?? malformed();
+        replaceTop({ fragment: "ANDOR", subs: [getTop(), mid, right] });
+        break;
       }
-      node = { fragment: "THRESH", k, subs };
-      break;
+      case "THRESH":
+        if (pos >= input.length) malformed();
+        if (input[pos] === ",") {
+          pos++;
+          toParse.push({ context: "THRESH", k: frame.k, n: frame.n + 1 });
+          toParse.push({ context: "WRAPPED_EXPR", k: -1, n: -1 });
+        } else if (input[pos] === ")") {
+          if (frame.k > frame.n || constructed.length < frame.n) {
+            invalid("Invalid thresh() threshold");
+          }
+          pos++;
+          const subs = constructed.splice(constructed.length - frame.n, frame.n);
+          constructed.push({ fragment: "THRESH", k: frame.k, subs });
+        } else {
+          malformed();
+        }
+        break;
+      case "COMMA":
+        if (input[pos] !== ",") malformed();
+        pos++;
+        break;
+      case "CLOSE_BRACKET":
+        if (input[pos] !== ")") malformed();
+        pos++;
+        break;
     }
-    default:
-      invalid(`Unsupported miniscript fragment: ${name}`);
   }
 
-  for (let i = wrappers.length - 1; i >= 0; i--) {
-    node = applyWrapper(wrappers[i], node);
+  if (constructed.length !== 1 || pos !== input.length) {
+    malformed();
   }
-  return node;
+  return constructed[0] ?? malformed();
 }
 
 function unwrapProbability(expression: string): { expression: string; probability: number } {
@@ -656,269 +931,1137 @@ function chooseIndices(length: number, count: number): number[][] {
   return result;
 }
 
-function typeInfo(base: MiniscriptBaseType | undefined, flags = ""): MiniscriptTypeInfo {
+function typeBits(flags: string): number {
+  let result = 0;
+  for (const flag of flags) {
+    const bit = TYPE_FLAG_BITS[flag];
+    if (bit == null) invalid(`Unknown miniscript type flag: ${flag}`);
+    result |= bit;
+  }
+  return result;
+}
+
+function typeFromFlags(flags: number): MiniscriptTypeInfo {
+  const has = (flag: string): boolean => (flags & typeBits(flag)) === typeBits(flag);
+  const bases = (["B", "V", "K", "W"] as const).filter((base) => has(base));
   return {
-    base,
-    d: flags.includes("d"),
-    g: flags.includes("g"),
-    h: flags.includes("h"),
-    i: flags.includes("i"),
-    j: flags.includes("j"),
-    k: flags.includes("k"),
-    n: flags.includes("n"),
-    o: flags.includes("o"),
-    u: flags.includes("u"),
-    x: flags.includes("x"),
-    z: flags.includes("z"),
+    flags,
+    base: bases.length === 1 ? bases[0] : undefined,
+    d: has("d"),
+    e: has("e"),
+    f: has("f"),
+    g: has("g"),
+    h: has("h"),
+    i: has("i"),
+    j: has("j"),
+    k: has("k"),
+    m: has("m"),
+    n: has("n"),
+    o: has("o"),
+    s: has("s"),
+    u: has("u"),
+    x: has("x"),
+    z: has("z"),
   };
+}
+
+function typeFromString(flags: string): MiniscriptTypeInfo {
+  return typeFromFlags(typeBits(flags));
 }
 
 function invalidType(): MiniscriptTypeInfo {
-  return typeInfo(undefined);
+  return typeFromFlags(0);
 }
 
-function sameBase(...types: MiniscriptTypeInfo[]): MiniscriptBaseType | undefined {
-  const base = types[0]?.base;
-  return base && types.every((type) => type.base === base) ? base : undefined;
+function typeOr(...types: MiniscriptTypeInfo[]): MiniscriptTypeInfo {
+  return typeFromFlags(types.reduce((flags, type) => flags | type.flags, 0));
 }
 
-function hasAnyBase(type: MiniscriptTypeInfo, bases: MiniscriptBaseType[]): boolean {
-  return type.base != null && bases.includes(type.base);
+function typeAnd(...types: MiniscriptTypeInfo[]): MiniscriptTypeInfo {
+  return typeFromFlags(types.reduce((flags, type) => flags & type.flags, types[0]?.flags ?? 0));
 }
 
-function orFlags(...types: MiniscriptTypeInfo[]): Pick<MiniscriptTypeInfo, "g" | "h" | "i" | "j"> {
-  return {
-    g: types.some((type) => type.g),
-    h: types.some((type) => type.h),
-    i: types.some((type) => type.i),
-    j: types.some((type) => type.j),
-  };
+function typeIf(type: MiniscriptTypeInfo | string, condition: boolean): MiniscriptTypeInfo {
+  if (!condition) return invalidType();
+  return typeof type === "string" ? typeFromString(type) : type;
 }
 
-function noTimelockMix(...types: MiniscriptTypeInfo[]): boolean {
-  const flags = orFlags(...types);
-  return !((flags.g && flags.h) || (flags.i && flags.j));
+function typeHasAll(type: MiniscriptTypeInfo, flags: string): boolean {
+  const bits = typeBits(flags);
+  return (type.flags & bits) === bits;
 }
 
-function mergeTimelock(
-  out: MiniscriptTypeInfo,
-  types: MiniscriptTypeInfo[],
-  checkMixing: boolean,
-): MiniscriptTypeInfo {
-  const flags = orFlags(...types);
-  out.g = flags.g;
-  out.h = flags.h;
-  out.i = flags.i;
-  out.j = flags.j;
-  out.k = types.every((type) => type.k) && (!checkMixing || noTimelockMix(...types));
-  return out;
+function sanitizeType(type: MiniscriptTypeInfo): MiniscriptTypeInfo {
+  const baseCount = (["B", "V", "K", "W"] as const).filter((base) => typeHasAll(type, base)).length;
+  return baseCount === 1 ? type : invalidType();
+}
+
+function hasTimelockConflict(x: MiniscriptTypeInfo, y: MiniscriptTypeInfo): boolean {
+  return (
+    (typeHasAll(x, "g") && typeHasAll(y, "h")) ||
+    (typeHasAll(x, "h") && typeHasAll(y, "g")) ||
+    (typeHasAll(x, "i") && typeHasAll(y, "j")) ||
+    (typeHasAll(x, "j") && typeHasAll(y, "i"))
+  );
 }
 
 function computeMiniscriptType(
   node: MiniscriptFragment,
-  addressType: MiniscriptAddressType,
+  addressType: AddressType,
 ): MiniscriptTypeInfo {
+  const tapscript = addressType === "TAPROOT";
+  const result = ((): MiniscriptTypeInfo => {
+    switch (node.fragment) {
+      case "JUST_0":
+        return typeFromString("Bzudemsxk");
+      case "JUST_1":
+        return typeFromString("Bzufmxk");
+      case "PK":
+        return computeMiniscriptType(
+          { fragment: "WRAP_C", sub: { fragment: "PK_K", key: node.key } },
+          addressType,
+        );
+      case "PKH":
+        return computeMiniscriptType(
+          { fragment: "WRAP_C", sub: { fragment: "PK_H", key: node.key } },
+          addressType,
+        );
+      case "PK_K":
+        return typeFromString("Konudemsxk");
+      case "PK_H":
+        return typeFromString("Knudemsxk");
+      case "OLDER":
+        if (node.k < 1 || node.k >= 0x80000000) {
+          invalid("older() value must be between 1 and 2^31 - 1");
+        }
+        return typeOr(
+          typeIf("g", (node.k & SEQUENCE_LOCKTIME_TYPE_FLAG) !== 0),
+          typeIf("h", (node.k & SEQUENCE_LOCKTIME_TYPE_FLAG) === 0),
+          typeFromString("Bzfmxk"),
+        );
+      case "AFTER":
+        if (node.k < 1 || node.k >= 0x80000000) {
+          invalid("after() value must be between 1 and 2^31 - 1");
+        }
+        return typeOr(
+          typeIf("i", node.k >= LOCKTIME_THRESHOLD),
+          typeIf("j", node.k < LOCKTIME_THRESHOLD),
+          typeFromString("Bzfmxk"),
+        );
+      case "SHA256":
+      case "RIPEMD160":
+      case "HASH256":
+      case "HASH160":
+        return typeFromString("Bonudmk");
+      case "MULTI":
+        if (tapscript) invalid("multi() is not valid for taproot miniscript");
+        return typeFromString("Bnudemsk");
+      case "MULTI_A":
+        if (!tapscript) invalid("multi_a() is only valid for taproot miniscript");
+        return typeFromString("Budemsk");
+      case "WRAP_A": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeIf("W", typeHasAll(x, "B")),
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("udfems")),
+          typeFromString("x"),
+        );
+      }
+      case "WRAP_S": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeIf("W", typeHasAll(x, "Bo")),
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("udfemsx")),
+        );
+      }
+      case "WRAP_C": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeIf("B", typeHasAll(x, "K")),
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("ondfem")),
+          typeFromString("us"),
+        );
+      }
+      case "WRAP_D": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeIf("B", typeHasAll(x, "Vz")),
+          typeIf("o", typeHasAll(x, "z")),
+          typeIf("e", typeHasAll(x, "f")),
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("ms")),
+          typeIf("u", tapscript),
+          typeFromString("ndx"),
+        );
+      }
+      case "WRAP_V": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeIf("V", typeHasAll(x, "B")),
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("zonms")),
+          typeFromString("fx"),
+        );
+      }
+      case "WRAP_J": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeIf("B", typeHasAll(x, "Bn")),
+          typeIf("e", typeHasAll(x, "f")),
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("oums")),
+          typeFromString("ndx"),
+        );
+      }
+      case "WRAP_N": {
+        const x = computeMiniscriptType(node.sub, addressType);
+        return typeOr(
+          typeAnd(x, typeFromString("ghijk")),
+          typeAnd(x, typeFromString("Bzondfems")),
+          typeFromString("ux"),
+        );
+      }
+      case "AND_V": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        return typeOr(
+          typeIf(typeAnd(y, typeFromString("KVB")), typeHasAll(x, "V")),
+          typeAnd(x, typeFromString("n")),
+          typeIf(typeAnd(y, typeFromString("n")), typeHasAll(x, "z")),
+          typeIf(typeAnd(typeOr(x, y), typeFromString("o")), typeHasAll(typeOr(x, y), "z")),
+          typeAnd(x, y, typeFromString("dmz")),
+          typeAnd(typeOr(x, y), typeFromString("s")),
+          typeIf("f", typeHasAll(y, "f") || typeHasAll(x, "s")),
+          typeAnd(y, typeFromString("ux")),
+          typeAnd(typeOr(x, y), typeFromString("ghij")),
+          typeIf("k", typeHasAll(typeAnd(x, y), "k") && !hasTimelockConflict(x, y)),
+        );
+      }
+      case "AND_B": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        return typeOr(
+          typeIf(typeAnd(x, typeFromString("B")), typeHasAll(y, "W")),
+          typeIf(typeAnd(typeOr(x, y), typeFromString("o")), typeHasAll(typeOr(x, y), "z")),
+          typeAnd(x, typeFromString("n")),
+          typeIf(typeAnd(y, typeFromString("n")), typeHasAll(x, "z")),
+          typeIf(typeAnd(x, y, typeFromString("e")), typeHasAll(typeAnd(x, y), "s")),
+          typeAnd(x, y, typeFromString("dzm")),
+          typeIf("f", typeHasAll(typeAnd(x, y), "f") || typeHasAll(x, "sf") || typeHasAll(y, "sf")),
+          typeAnd(typeOr(x, y), typeFromString("s")),
+          typeFromString("ux"),
+          typeAnd(typeOr(x, y), typeFromString("ghij")),
+          typeIf("k", typeHasAll(typeAnd(x, y), "k") && !hasTimelockConflict(x, y)),
+        );
+      }
+      case "OR_B": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        return typeOr(
+          typeIf("B", typeHasAll(x, "Bd") && typeHasAll(y, "Wd")),
+          typeIf(typeAnd(typeOr(x, y), typeFromString("o")), typeHasAll(typeOr(x, y), "z")),
+          typeIf(
+            typeAnd(x, y, typeFromString("m")),
+            typeHasAll(typeOr(x, y), "s") && typeHasAll(typeAnd(x, y), "e"),
+          ),
+          typeAnd(x, y, typeFromString("zse")),
+          typeFromString("dux"),
+          typeAnd(typeOr(x, y), typeFromString("ghij")),
+          typeAnd(x, y, typeFromString("k")),
+        );
+      }
+      case "OR_D": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        return typeOr(
+          typeIf(typeAnd(y, typeFromString("B")), typeHasAll(x, "Bdu")),
+          typeIf(typeAnd(x, typeFromString("o")), typeHasAll(y, "z")),
+          typeIf(
+            typeAnd(x, y, typeFromString("m")),
+            typeHasAll(x, "e") && typeHasAll(typeOr(x, y), "s"),
+          ),
+          typeAnd(x, y, typeFromString("zs")),
+          typeAnd(y, typeFromString("ufde")),
+          typeFromString("x"),
+          typeAnd(typeOr(x, y), typeFromString("ghij")),
+          typeAnd(x, y, typeFromString("k")),
+        );
+      }
+      case "OR_C": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        return typeOr(
+          typeIf(typeAnd(y, typeFromString("V")), typeHasAll(x, "Bdu")),
+          typeIf(typeAnd(x, typeFromString("o")), typeHasAll(y, "z")),
+          typeIf(
+            typeAnd(x, y, typeFromString("m")),
+            typeHasAll(x, "e") && typeHasAll(typeOr(x, y), "s"),
+          ),
+          typeAnd(x, y, typeFromString("zs")),
+          typeFromString("fx"),
+          typeAnd(typeOr(x, y), typeFromString("ghij")),
+          typeAnd(x, y, typeFromString("k")),
+        );
+      }
+      case "OR_I": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        return typeOr(
+          typeAnd(x, y, typeFromString("VBKufs")),
+          typeIf("o", typeHasAll(typeAnd(x, y), "z")),
+          typeIf(typeAnd(typeOr(x, y), typeFromString("e")), typeHasAll(typeOr(x, y), "f")),
+          typeIf(typeAnd(x, y, typeFromString("m")), typeHasAll(typeOr(x, y), "s")),
+          typeAnd(typeOr(x, y), typeFromString("d")),
+          typeFromString("x"),
+          typeAnd(typeOr(x, y), typeFromString("ghij")),
+          typeAnd(x, y, typeFromString("k")),
+        );
+      }
+      case "ANDOR": {
+        const x = computeMiniscriptType(node.subs[0], addressType);
+        const y = computeMiniscriptType(node.subs[1], addressType);
+        const z = computeMiniscriptType(node.subs[2], addressType);
+        return typeOr(
+          typeIf(typeAnd(y, z, typeFromString("BKV")), typeHasAll(x, "Bdu")),
+          typeAnd(x, y, z, typeFromString("z")),
+          typeIf(
+            typeAnd(typeOr(x, typeAnd(y, z)), typeFromString("o")),
+            typeHasAll(typeOr(x, typeAnd(y, z)), "z"),
+          ),
+          typeAnd(y, z, typeFromString("u")),
+          typeIf(typeAnd(z, typeFromString("f")), typeHasAll(x, "s") || typeHasAll(y, "f")),
+          typeAnd(z, typeFromString("d")),
+          typeIf(typeAnd(z, typeFromString("e")), typeHasAll(x, "s") || typeHasAll(y, "f")),
+          typeIf(
+            typeAnd(x, y, z, typeFromString("m")),
+            typeHasAll(x, "e") && typeHasAll(typeOr(x, y, z), "s"),
+          ),
+          typeAnd(z, typeOr(x, y), typeFromString("s")),
+          typeFromString("x"),
+          typeAnd(typeOr(x, y, z), typeFromString("ghij")),
+          typeIf("k", typeHasAll(typeAnd(x, y, z), "k") && !hasTimelockConflict(x, y)),
+        );
+      }
+      case "THRESH": {
+        const subTypes = node.subs.map((sub) => computeMiniscriptType(sub, addressType));
+        let allE = true;
+        let allM = true;
+        let args = 0;
+        let numS = 0;
+        let accTl = typeFromString("k");
+
+        for (let index = 0; index < subTypes.length; index++) {
+          const type = subTypes[index];
+          if (!typeHasAll(type, index === 0 ? "Bdu" : "Wdu")) return invalidType();
+          if (!type.e) allE = false;
+          if (!type.m) allM = false;
+          if (type.s) numS++;
+          args += type.z ? 0 : type.o ? 1 : 2;
+          accTl = typeOr(
+            typeAnd(typeOr(accTl, type), typeFromString("ghij")),
+            typeIf(
+              "k",
+              typeHasAll(typeAnd(accTl, type), "k") &&
+                (node.k <= 1 || !hasTimelockConflict(accTl, type)),
+            ),
+          );
+        }
+
+        return typeOr(
+          typeFromString("Bdu"),
+          typeIf("z", args === 0),
+          typeIf("o", args === 1),
+          typeIf("e", allE && numS === node.subs.length),
+          typeIf("m", allE && allM && numS >= node.subs.length - node.k),
+          typeIf("s", numS >= node.subs.length - node.k + 1),
+          accTl,
+        );
+      }
+    }
+  })();
+
+  return sanitizeType(result);
+}
+
+function compactSizeSize(value: number): number {
+  if (value < 253) return 1;
+  if (value <= 0xffff) return 3;
+  if (value <= 0xffffffff) return 5;
+  return 9;
+}
+
+function scriptNumberPushSize(value: number): number {
+  if (value >= 0 && value <= 16) return 1;
+  let bytes = 0;
+  let remaining = value;
+  while (remaining > 0) {
+    bytes++;
+    remaining = Math.floor(remaining / 256);
+  }
+  const highByte = Math.floor(value / 256 ** (bytes - 1)) & 0xff;
+  if ((highByte & 0x80) !== 0) bytes++;
+  return 1 + bytes;
+}
+
+function maxScriptSize(addressType: AddressType): number {
+  if (addressType !== "TAPROOT") {
+    return MAX_STANDARD_P2WSH_SCRIPT_SIZE;
+  }
+  const txOverhead = 4 + 4;
+  const txinBytesNoWitness = 36 + 4 + 1;
+  const p2wshTxoutBytes = 8 + 1 + 1 + 33;
+  const txBodyLeewayWeight =
+    (txOverhead + compactSizeSize(1) + txinBytesNoWitness + compactSizeSize(1) + p2wshTxoutBytes) *
+      WITNESS_SCALE_FACTOR +
+    2;
+  const maxTapscriptSatSize =
+    compactSizeSize(MAX_STACK_SIZE) +
+    (compactSizeSize(MAX_TAPMINISCRIPT_STACK_ELEM_SIZE) + MAX_TAPMINISCRIPT_STACK_ELEM_SIZE) *
+      MAX_STACK_SIZE +
+    compactSizeSize(TAPROOT_CONTROL_MAX_SIZE) +
+    TAPROOT_CONTROL_MAX_SIZE;
+  const maxSize = MAX_STANDARD_TX_WEIGHT - txBodyLeewayWeight - maxTapscriptSatSize;
+  return maxSize - compactSizeSize(maxSize);
+}
+
+function computeMiniscriptScriptSize(node: MiniscriptFragment, addressType: AddressType): number {
+  const childSizes = (subs: MiniscriptFragment[]): number =>
+    subs.reduce((size, sub) => size + computeMiniscriptScriptSize(sub, addressType), 0);
   switch (node.fragment) {
     case "JUST_0":
-      return typeInfo("B", "zudxk");
     case "JUST_1":
-      return typeInfo("B", "zuxk");
-    case "PK_K":
-      return typeInfo("K", "onduxk");
-    case "PK_H":
-      return typeInfo("K", "nduxk");
+      return 1;
     case "PK":
-      return typeInfo("B", "onduk");
-    case "PKH":
-      return typeInfo("B", "nduk");
-    case "OLDER": {
-      if (node.k < 1 || node.k >= 0x80000000) {
-        invalid("older() value must be between 1 and 2^31 - 1");
-      }
-      const lock = timelockFromK(false, node.k);
-      return typeInfo("B", `${lock.based === "TIME_LOCK" ? "g" : "h"}zxk`);
-    }
-    case "AFTER": {
-      if (node.k < 1 || node.k >= 0x80000000) {
-        invalid("after() value must be between 1 and 2^31 - 1");
-      }
-      const lock = timelockFromK(true, node.k);
-      return typeInfo("B", `${lock.based === "TIME_LOCK" ? "i" : "j"}zxk`);
-    }
-    case "SHA256":
-    case "HASH160":
-    case "HASH256":
-    case "RIPEMD160":
-      return typeInfo("B", "onduk");
-    case "MULTI":
-      if (addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT) {
-        invalid("multi() is not valid for taproot miniscript");
-      }
-      return typeInfo("B", "nduk");
-    case "MULTI_A":
-      if (
-        addressType !== MINISCRIPT_ADDRESS_TYPE_TAPROOT &&
-        addressType !== MINISCRIPT_ADDRESS_TYPE_ANY
-      ) {
-        invalid("multi_a() is only valid for taproot miniscript");
-      }
-      return typeInfo("B", "duk");
-    case "WRAP_A": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "B") return invalidType();
-      return mergeTimelock({ ...typeInfo("W", "x"), d: x.d, u: x.u }, [x], false);
-    }
-    case "WRAP_S": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "B" || !x.o) return invalidType();
-      return mergeTimelock({ ...typeInfo("W"), d: x.d, u: x.u, x: x.x }, [x], false);
-    }
-    case "WRAP_C": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "K") return invalidType();
-      return mergeTimelock({ ...typeInfo("B", "u"), d: x.d, n: x.n, o: x.o }, [x], false);
-    }
-    case "WRAP_D": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "V" || !x.z) return invalidType();
-      return mergeTimelock(typeInfo("B", "ondx"), [x], false);
-    }
-    case "WRAP_V": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "B") return invalidType();
-      return mergeTimelock({ ...typeInfo("V", "x"), n: x.n, o: x.o, z: x.z }, [x], false);
-    }
-    case "WRAP_J": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "B" || !x.n) return invalidType();
-      return mergeTimelock(typeInfo("B", `${x.o ? "o" : ""}${x.u ? "u" : ""}ndx`), [x], false);
-    }
-    case "WRAP_N": {
-      const x = computeMiniscriptType(node.sub, addressType);
-      if (x.base !== "B") return invalidType();
-      return mergeTimelock({ ...typeInfo("B", "ux"), d: x.d, n: x.n, o: x.o, z: x.z }, [x], false);
-    }
-    case "AND_V": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      if (x.base !== "V" || !hasAnyBase(y, ["B", "K", "V"])) return invalidType();
-      return mergeTimelock(
-        {
-          ...typeInfo(y.base),
-          d: x.d && y.d,
-          n: x.n || (x.z && y.n),
-          o: (x.z && y.o) || (y.z && x.o),
-          u: y.u,
-          x: y.x,
-          z: x.z && y.z,
-        },
-        [x, y],
-        true,
+      return computeMiniscriptScriptSize(
+        { fragment: "WRAP_C", sub: { fragment: "PK_K", key: node.key } },
+        addressType,
       );
+    case "PKH":
+      return computeMiniscriptScriptSize(
+        { fragment: "WRAP_C", sub: { fragment: "PK_H", key: node.key } },
+        addressType,
+      );
+    case "PK_K":
+      return addressType === "TAPROOT" ? 33 : 34;
+    case "PK_H":
+      return 24;
+    case "OLDER":
+    case "AFTER":
+      return 1 + scriptNumberPushSize(node.k);
+    case "SHA256":
+    case "HASH256":
+      return 39;
+    case "HASH160":
+    case "RIPEMD160":
+      return 27;
+    case "MULTI":
+      return (
+        1 +
+        scriptNumberPushSize(node.keys.length) +
+        scriptNumberPushSize(node.k) +
+        34 * node.keys.length
+      );
+    case "MULTI_A":
+      return (1 + 32 + 1) * node.keys.length + scriptNumberPushSize(node.k) + 1;
+    case "AND_V":
+      return childSizes(node.subs);
+    case "WRAP_V": {
+      const subType = computeMiniscriptType(node.sub, addressType);
+      return computeMiniscriptScriptSize(node.sub, addressType) + (subType.x ? 1 : 0);
+    }
+    case "WRAP_S":
+    case "WRAP_C":
+    case "WRAP_N":
+      return computeMiniscriptScriptSize(node.sub, addressType) + 1;
+    case "AND_B":
+    case "OR_B":
+      return childSizes(node.subs) + 1;
+    case "WRAP_A":
+      return computeMiniscriptScriptSize(node.sub, addressType) + 2;
+    case "OR_C":
+      return childSizes(node.subs) + 2;
+    case "WRAP_D":
+      return computeMiniscriptScriptSize(node.sub, addressType) + 3;
+    case "OR_D":
+    case "OR_I":
+      return childSizes(node.subs) + 3;
+    case "ANDOR":
+      return childSizes(node.subs) + 3;
+    case "WRAP_J":
+      return computeMiniscriptScriptSize(node.sub, addressType) + 4;
+    case "THRESH":
+      return childSizes(node.subs) + node.subs.length + scriptNumberPushSize(node.k);
+  }
+}
+
+function maxInt(value?: number): MaxInt {
+  return value == null ? { valid: false, value: 0 } : { valid: true, value };
+}
+
+function maxIntAdd(a: MaxInt, b: MaxInt): MaxInt {
+  if (!a.valid || !b.valid) return maxInt();
+  return maxInt(a.value + b.value);
+}
+
+function maxIntAddValue(a: MaxInt, value: number): MaxInt {
+  return maxIntAdd(a, maxInt(value));
+}
+
+function maxIntOr(a: MaxInt, b: MaxInt): MaxInt {
+  if (!a.valid) return b;
+  if (!b.valid) return a;
+  return maxInt(Math.max(a.value, b.value));
+}
+
+function satInfo(netdiff?: number, exec?: number): SatInfo {
+  return netdiff == null || exec == null
+    ? { exec: 0, netdiff: 0, valid: false }
+    : { exec, netdiff, valid: true };
+}
+
+function satInfoOr(a: SatInfo, b: SatInfo): SatInfo {
+  if (!a.valid) return b;
+  if (!b.valid) return a;
+  return satInfo(Math.max(a.netdiff, b.netdiff), Math.max(a.exec, b.exec));
+}
+
+function satInfoAdd(a: SatInfo, b: SatInfo): SatInfo {
+  if (!a.valid || !b.valid) return satInfo();
+  return satInfo(a.netdiff + b.netdiff, Math.max(b.exec, b.netdiff + a.exec));
+}
+
+const Sat = {
+  BinaryOp: (): SatInfo => satInfo(1, 1),
+  Empty: (): SatInfo => satInfo(0, 0),
+  Hash: (): SatInfo => satInfo(0, 0),
+  If: (): SatInfo => satInfo(1, 1),
+  Nop: (): SatInfo => satInfo(0, 0),
+  OP_0NOTEQUAL: (): SatInfo => satInfo(0, 0),
+  OP_CHECKSIG: (): SatInfo => satInfo(1, 1),
+  OP_DUP: (): SatInfo => satInfo(-1, 0),
+  OP_EQUAL: (): SatInfo => satInfo(1, 1),
+  OP_EQUALVERIFY: (): SatInfo => satInfo(2, 2),
+  OP_IFDUP: (nonzero: boolean): SatInfo => satInfo(nonzero ? -1 : 0, 0),
+  OP_SIZE: (): SatInfo => satInfo(-1, 0),
+  OP_VERIFY: (): SatInfo => satInfo(1, 1),
+  Push: (): SatInfo => satInfo(-1, 0),
+};
+
+function pkSugarNode(node: {
+  fragment: "PK" | "PKH" | "PK_H" | "PK_K";
+  key: string;
+}): MiniscriptFragment {
+  return {
+    fragment: "WRAP_C",
+    sub: { fragment: node.fragment === "PK" ? "PK_K" : "PK_H", key: node.key },
+  };
+}
+
+function computeMiniscriptOps(node: MiniscriptFragment, addressType: AddressType): MiniscriptOps {
+  const childOps = (sub: MiniscriptFragment): MiniscriptOps =>
+    computeMiniscriptOps(sub, addressType);
+
+  switch (node.fragment) {
+    case "PK":
+    case "PKH":
+      return computeMiniscriptOps(pkSugarNode(node), addressType);
+    case "JUST_1":
+      return { count: 0, dsat: maxInt(), sat: maxInt(0) };
+    case "JUST_0":
+      return { count: 0, dsat: maxInt(0), sat: maxInt() };
+    case "PK_K":
+      return { count: 0, dsat: maxInt(0), sat: maxInt(0) };
+    case "PK_H":
+      return { count: 3, dsat: maxInt(0), sat: maxInt(0) };
+    case "OLDER":
+    case "AFTER":
+      return { count: 1, dsat: maxInt(), sat: maxInt(0) };
+    case "SHA256":
+    case "RIPEMD160":
+    case "HASH256":
+    case "HASH160":
+      return { count: 4, dsat: maxInt(), sat: maxInt(0) };
+    case "AND_V": {
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      return {
+        count: x.count + y.count,
+        dsat: maxInt(),
+        sat: maxIntAdd(x.sat, y.sat),
+      };
     }
     case "AND_B": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      if (x.base !== "B" || y.base !== "W") return invalidType();
-      return mergeTimelock(
-        {
-          ...typeInfo("B", "ux"),
-          d: x.d && y.d,
-          n: x.n || (x.z && y.n),
-          o: (x.z && y.o) || (y.z && x.o),
-          z: x.z && y.z,
-        },
-        [x, y],
-        true,
-      );
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      return {
+        count: 1 + x.count + y.count,
+        dsat: maxIntAdd(x.dsat, y.dsat),
+        sat: maxIntAdd(x.sat, y.sat),
+      };
     }
     case "OR_B": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      if (x.base !== "B" || !x.d || y.base !== "W" || !y.d) return invalidType();
-      return mergeTimelock(
-        {
-          ...typeInfo("B", "dux"),
-          o: (x.z && y.o) || (y.z && x.o),
-          z: x.z && y.z,
-        },
-        [x, y],
-        false,
-      );
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      return {
+        count: 1 + x.count + y.count,
+        dsat: maxIntAdd(x.dsat, y.dsat),
+        sat: maxIntOr(maxIntAdd(x.sat, y.dsat), maxIntAdd(y.sat, x.dsat)),
+      };
     }
     case "OR_D": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      if (x.base !== "B" || !x.d || !x.u || y.base !== "B") return invalidType();
-      return mergeTimelock(
-        { ...typeInfo("B", "x"), d: y.d, o: x.o && y.z, u: y.u, z: x.z && y.z },
-        [x, y],
-        false,
-      );
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      return {
+        count: 3 + x.count + y.count,
+        dsat: maxIntAdd(x.dsat, y.dsat),
+        sat: maxIntOr(x.sat, maxIntAdd(y.sat, x.dsat)),
+      };
     }
     case "OR_C": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      if (x.base !== "B" || !x.d || !x.u || y.base !== "V") return invalidType();
-      return mergeTimelock({ ...typeInfo("V", "x"), o: x.o && y.z, z: x.z && y.z }, [x, y], false);
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      return {
+        count: 2 + x.count + y.count,
+        dsat: maxInt(),
+        sat: maxIntOr(x.sat, maxIntAdd(y.sat, x.dsat)),
+      };
     }
     case "OR_I": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      const base = sameBase(x, y);
-      if (!base || !hasAnyBase(x, ["B", "K", "V"])) return invalidType();
-      return mergeTimelock(
-        {
-          ...typeInfo(base, "x"),
-          d: x.d || y.d,
-          o: x.z && y.z,
-          u: x.u && y.u,
-        },
-        [x, y],
-        false,
-      );
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      return {
+        count: 3 + x.count + y.count,
+        dsat: maxIntOr(x.dsat, y.dsat),
+        sat: maxIntOr(x.sat, y.sat),
+      };
     }
     case "ANDOR": {
-      const x = computeMiniscriptType(node.subs[0], addressType);
-      const y = computeMiniscriptType(node.subs[1], addressType);
-      const z = computeMiniscriptType(node.subs[2], addressType);
-      const base = sameBase(y, z);
-      if (x.base !== "B" || !x.d || !x.u || !base || !hasAnyBase(y, ["B", "K", "V"])) {
-        return invalidType();
-      }
-      const out = mergeTimelock(
-        {
-          ...typeInfo(base, "x"),
-          d: z.d,
-          o: (x.o && y.z && z.z) || (x.z && y.o && z.o),
-          u: y.u && z.u,
-          z: x.z && y.z && z.z,
-        },
-        [x, y, z],
-        false,
-      );
-      out.k = x.k && y.k && z.k && noTimelockMix(x, y);
-      return out;
+      const x = childOps(node.subs[0]);
+      const y = childOps(node.subs[1]);
+      const z = childOps(node.subs[2]);
+      return {
+        count: 3 + x.count + y.count + z.count,
+        dsat: maxIntAdd(x.dsat, z.dsat),
+        sat: maxIntOr(maxIntAdd(y.sat, x.sat), maxIntAdd(x.dsat, z.sat)),
+      };
+    }
+    case "MULTI":
+      return { count: 1, dsat: maxInt(node.keys.length), sat: maxInt(node.keys.length) };
+    case "MULTI_A":
+      return { count: node.keys.length + 1, dsat: maxInt(0), sat: maxInt(0) };
+    case "WRAP_S":
+    case "WRAP_C":
+    case "WRAP_N": {
+      const x = childOps(node.sub);
+      return { count: 1 + x.count, dsat: x.dsat, sat: x.sat };
+    }
+    case "WRAP_A": {
+      const x = childOps(node.sub);
+      return { count: 2 + x.count, dsat: x.dsat, sat: x.sat };
+    }
+    case "WRAP_D": {
+      const x = childOps(node.sub);
+      return { count: 3 + x.count, dsat: maxInt(0), sat: x.sat };
+    }
+    case "WRAP_J": {
+      const x = childOps(node.sub);
+      return { count: 4 + x.count, dsat: maxInt(0), sat: x.sat };
+    }
+    case "WRAP_V": {
+      const x = childOps(node.sub);
+      const type = computeMiniscriptType(node.sub, addressType);
+      return { count: x.count + (type.x ? 1 : 0), dsat: maxInt(), sat: x.sat };
     }
     case "THRESH": {
-      const subTypes = node.subs.map((sub) => computeMiniscriptType(sub, addressType));
-      if (subTypes.length === 0) return invalidType();
-      const [first, ...rest] = subTypes;
-      if (first.base !== "B" || !first.d || !first.u) return invalidType();
-      if (rest.some((type) => type.base !== "W" || !type.d || !type.u)) return invalidType();
-      const z = subTypes.every((type) => type.z);
-      const o =
-        subTypes.filter((type) => type.o).length === 1 &&
-        subTypes.every((type) => type.o || type.z);
-      return mergeTimelock({ ...typeInfo("B", "du"), o, z }, subTypes, node.k >= 2);
+      let count = 0;
+      let sats = [maxInt(0)];
+      for (const sub of node.subs) {
+        const subOps = childOps(sub);
+        count += subOps.count + 1;
+        const nextSats = [maxIntAdd(sats[0], subOps.dsat)];
+        for (let index = 1; index < sats.length; index++) {
+          nextSats.push(
+            maxIntOr(maxIntAdd(sats[index], subOps.dsat), maxIntAdd(sats[index - 1], subOps.sat)),
+          );
+        }
+        nextSats.push(maxIntAdd(sats[sats.length - 1], subOps.sat));
+        sats = nextSats;
+      }
+      return { count, dsat: sats[0], sat: sats[node.k] };
     }
   }
 }
 
-function validateMiniscriptNode(
+function computeMiniscriptStackSize(node: MiniscriptFragment, addressType: AddressType): StackSize {
+  const childStack = (sub: MiniscriptFragment): StackSize =>
+    computeMiniscriptStackSize(sub, addressType);
+
+  switch (node.fragment) {
+    case "PK":
+    case "PKH":
+      return computeMiniscriptStackSize(pkSugarNode(node), addressType);
+    case "JUST_0":
+      return { dsat: Sat.Push(), sat: satInfo() };
+    case "JUST_1":
+      return { dsat: satInfo(), sat: Sat.Push() };
+    case "OLDER":
+    case "AFTER":
+      return { dsat: satInfo(), sat: satInfoAdd(Sat.Push(), Sat.Nop()) };
+    case "PK_K":
+      return { dsat: Sat.Push(), sat: Sat.Push() };
+    case "PK_H": {
+      const both = satInfoAdd(
+        satInfoAdd(satInfoAdd(Sat.OP_DUP(), Sat.Hash()), Sat.Push()),
+        Sat.OP_EQUALVERIFY(),
+      );
+      return { dsat: both, sat: both };
+    }
+    case "SHA256":
+    case "RIPEMD160":
+    case "HASH256":
+    case "HASH160":
+      return {
+        dsat: satInfo(),
+        sat: satInfoAdd(
+          satInfoAdd(
+            satInfoAdd(satInfoAdd(Sat.OP_SIZE(), Sat.Push()), Sat.OP_EQUALVERIFY()),
+            Sat.Hash(),
+          ),
+          satInfoAdd(Sat.Push(), Sat.OP_EQUAL()),
+        ),
+      };
+    case "ANDOR": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      const z = childStack(node.subs[2]);
+      return {
+        dsat: satInfoAdd(satInfoAdd(x.dsat, Sat.If()), z.dsat),
+        sat: satInfoOr(
+          satInfoAdd(satInfoAdd(x.sat, Sat.If()), y.sat),
+          satInfoAdd(satInfoAdd(x.dsat, Sat.If()), z.sat),
+        ),
+      };
+    }
+    case "AND_V": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      return { dsat: satInfo(), sat: satInfoAdd(x.sat, y.sat) };
+    }
+    case "AND_B": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      return {
+        dsat: satInfoAdd(satInfoAdd(x.dsat, y.dsat), Sat.BinaryOp()),
+        sat: satInfoAdd(satInfoAdd(x.sat, y.sat), Sat.BinaryOp()),
+      };
+    }
+    case "OR_B": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      return {
+        dsat: satInfoAdd(satInfoAdd(x.dsat, y.dsat), Sat.BinaryOp()),
+        sat: satInfoAdd(
+          satInfoOr(satInfoAdd(x.sat, y.dsat), satInfoAdd(x.dsat, y.sat)),
+          Sat.BinaryOp(),
+        ),
+      };
+    }
+    case "OR_C": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      return {
+        dsat: satInfo(),
+        sat: satInfoOr(
+          satInfoAdd(x.sat, Sat.If()),
+          satInfoAdd(satInfoAdd(x.dsat, Sat.If()), y.sat),
+        ),
+      };
+    }
+    case "OR_D": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      return {
+        dsat: satInfoAdd(satInfoAdd(satInfoAdd(x.dsat, Sat.OP_IFDUP(false)), Sat.If()), y.dsat),
+        sat: satInfoOr(
+          satInfoAdd(satInfoAdd(x.sat, Sat.OP_IFDUP(true)), Sat.If()),
+          satInfoAdd(satInfoAdd(satInfoAdd(x.dsat, Sat.OP_IFDUP(false)), Sat.If()), y.sat),
+        ),
+      };
+    }
+    case "OR_I": {
+      const x = childStack(node.subs[0]);
+      const y = childStack(node.subs[1]);
+      return {
+        dsat: satInfoAdd(Sat.If(), satInfoOr(x.dsat, y.dsat)),
+        sat: satInfoAdd(Sat.If(), satInfoOr(x.sat, y.sat)),
+      };
+    }
+    case "MULTI": {
+      const both = satInfo(node.k, node.k + node.keys.length + 2);
+      return { dsat: both, sat: both };
+    }
+    case "MULTI_A": {
+      const both = satInfo(node.keys.length - 1, node.keys.length);
+      return { dsat: both, sat: both };
+    }
+    case "WRAP_A":
+    case "WRAP_N":
+    case "WRAP_S":
+      return childStack(node.sub);
+    case "WRAP_C": {
+      const x = childStack(node.sub);
+      return {
+        dsat: satInfoAdd(x.dsat, Sat.OP_CHECKSIG()),
+        sat: satInfoAdd(x.sat, Sat.OP_CHECKSIG()),
+      };
+    }
+    case "WRAP_D": {
+      const prefix = satInfoAdd(Sat.OP_DUP(), Sat.If());
+      const x = childStack(node.sub);
+      return { dsat: prefix, sat: satInfoAdd(prefix, x.sat) };
+    }
+    case "WRAP_V": {
+      const x = childStack(node.sub);
+      return { dsat: satInfo(), sat: satInfoAdd(x.sat, Sat.OP_VERIFY()) };
+    }
+    case "WRAP_J": {
+      const prefix = satInfoAdd(satInfoAdd(Sat.OP_SIZE(), Sat.OP_0NOTEQUAL()), Sat.If());
+      const x = childStack(node.sub);
+      return { dsat: prefix, sat: satInfoAdd(prefix, x.sat) };
+    }
+    case "THRESH": {
+      let sats = [Sat.Empty()];
+      for (let i = 0; i < node.subs.length; i++) {
+        const sub = childStack(node.subs[i]);
+        const add = i > 0 ? Sat.BinaryOp() : Sat.Empty();
+        const nextSats = [satInfoAdd(satInfoAdd(sats[0], sub.dsat), add)];
+        for (let index = 1; index < sats.length; index++) {
+          nextSats.push(
+            satInfoAdd(
+              satInfoOr(satInfoAdd(sats[index], sub.dsat), satInfoAdd(sats[index - 1], sub.sat)),
+              add,
+            ),
+          );
+        }
+        nextSats.push(satInfoAdd(satInfoAdd(sats[sats.length - 1], sub.sat), add));
+        sats = nextSats;
+      }
+      return {
+        dsat: satInfoAdd(satInfoAdd(sats[0], Sat.Push()), Sat.OP_EQUAL()),
+        sat: satInfoAdd(satInfoAdd(sats[node.k], Sat.Push()), Sat.OP_EQUAL()),
+      };
+    }
+  }
+}
+
+function computeMiniscriptWitnessSize(
   node: MiniscriptFragment,
-  addressType: MiniscriptAddressType,
-): void {
+  addressType: AddressType,
+): WitnessSize {
+  const sigSize = addressType === "TAPROOT" ? 1 + 65 : 1 + 72;
+  const pubkeySize = addressType === "TAPROOT" ? 1 + 32 : 1 + 33;
+  const childWitness = (sub: MiniscriptFragment): WitnessSize =>
+    computeMiniscriptWitnessSize(sub, addressType);
+
+  switch (node.fragment) {
+    case "PK":
+    case "PKH":
+      return computeMiniscriptWitnessSize(pkSugarNode(node), addressType);
+    case "JUST_0":
+      return { dsat: maxInt(0), sat: maxInt() };
+    case "JUST_1":
+    case "OLDER":
+    case "AFTER":
+      return { dsat: maxInt(), sat: maxInt(0) };
+    case "PK_K":
+      return { dsat: maxInt(1), sat: maxInt(sigSize) };
+    case "PK_H":
+      return { dsat: maxInt(1 + pubkeySize), sat: maxInt(sigSize + pubkeySize) };
+    case "SHA256":
+    case "RIPEMD160":
+    case "HASH256":
+    case "HASH160":
+      return { dsat: maxInt(), sat: maxInt(1 + 32) };
+    case "ANDOR": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      const z = childWitness(node.subs[2]);
+      return {
+        dsat: maxIntAdd(x.dsat, z.dsat),
+        sat: maxIntOr(maxIntAdd(x.sat, y.sat), maxIntAdd(x.dsat, z.sat)),
+      };
+    }
+    case "AND_V": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      return { dsat: maxInt(), sat: maxIntAdd(x.sat, y.sat) };
+    }
+    case "AND_B": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      return { dsat: maxIntAdd(x.dsat, y.dsat), sat: maxIntAdd(x.sat, y.sat) };
+    }
+    case "OR_B": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      return {
+        dsat: maxIntAdd(x.dsat, y.dsat),
+        sat: maxIntOr(maxIntAdd(x.dsat, y.sat), maxIntAdd(x.sat, y.dsat)),
+      };
+    }
+    case "OR_C": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      return { dsat: maxInt(), sat: maxIntOr(x.sat, maxIntAdd(x.dsat, y.sat)) };
+    }
+    case "OR_D": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      return {
+        dsat: maxIntAdd(x.dsat, y.dsat),
+        sat: maxIntOr(x.sat, maxIntAdd(x.dsat, y.sat)),
+      };
+    }
+    case "OR_I": {
+      const x = childWitness(node.subs[0]);
+      const y = childWitness(node.subs[1]);
+      return {
+        dsat: maxIntOr(maxIntAddValue(x.dsat, 2), maxIntAddValue(y.dsat, 1)),
+        sat: maxIntOr(maxIntAddValue(x.sat, 2), maxIntAddValue(y.sat, 1)),
+      };
+    }
+    case "MULTI":
+      return { dsat: maxInt(node.k + 1), sat: maxInt(node.k * sigSize + 1) };
+    case "MULTI_A":
+      return {
+        dsat: maxInt(node.keys.length),
+        sat: maxInt(node.k * sigSize + node.keys.length - node.k),
+      };
+    case "WRAP_A":
+    case "WRAP_N":
+    case "WRAP_S":
+    case "WRAP_C":
+      return childWitness(node.sub);
+    case "WRAP_D": {
+      const x = childWitness(node.sub);
+      return { dsat: maxInt(1), sat: maxIntAddValue(x.sat, 2) };
+    }
+    case "WRAP_V": {
+      const x = childWitness(node.sub);
+      return { dsat: maxInt(), sat: x.sat };
+    }
+    case "WRAP_J": {
+      const x = childWitness(node.sub);
+      return { dsat: maxInt(1), sat: x.sat };
+    }
+    case "THRESH": {
+      let sats = [maxInt(0)];
+      for (const sub of node.subs) {
+        const subWitness = childWitness(sub);
+        const nextSats = [maxIntAdd(sats[0], subWitness.dsat)];
+        for (let index = 1; index < sats.length; index++) {
+          nextSats.push(
+            maxIntOr(
+              maxIntAdd(sats[index], subWitness.dsat),
+              maxIntAdd(sats[index - 1], subWitness.sat),
+            ),
+          );
+        }
+        nextSats.push(maxIntAdd(sats[sats.length - 1], subWitness.sat));
+        sats = nextSats;
+      }
+      return { dsat: sats[0], sat: sats[node.k] };
+    }
+  }
+}
+
+function computeMiniscriptResourceStats(
+  node: MiniscriptFragment,
+  addressType: AddressType,
+  includeWitnessSize = false,
+): MiniscriptResourceStats {
+  return {
+    ops: computeMiniscriptOps(node, addressType),
+    stackSize: computeMiniscriptStackSize(node, addressType),
+    witnessSize: includeWitnessSize
+      ? computeMiniscriptWitnessSize(node, addressType)
+      : { dsat: maxInt(), sat: maxInt() },
+  };
+}
+
+function isBkwType(type: MiniscriptTypeInfo): boolean {
+  return typeHasAll(type, "B") || typeHasAll(type, "K") || typeHasAll(type, "W");
+}
+
+function getMiniscriptOps(stats: MiniscriptResourceStats): number | undefined {
+  return stats.ops.sat.valid ? stats.ops.count + stats.ops.sat.value : undefined;
+}
+
+function getMiniscriptStackSize(
+  type: MiniscriptTypeInfo,
+  stats: MiniscriptResourceStats,
+): number | undefined {
+  return stats.stackSize.sat.valid
+    ? stats.stackSize.sat.netdiff + (isBkwType(type) ? 1 : 0)
+    : undefined;
+}
+
+function getMiniscriptExecStackSize(
+  type: MiniscriptTypeInfo,
+  stats: MiniscriptResourceStats,
+): number | undefined {
+  return stats.stackSize.sat.valid
+    ? stats.stackSize.sat.exec + (isBkwType(type) ? 1 : 0)
+    : undefined;
+}
+
+function checkMiniscriptOpsLimit(
+  stats: MiniscriptResourceStats,
+  addressType: AddressType,
+): boolean {
+  if (addressType === "TAPROOT") return true;
+  const ops = getMiniscriptOps(stats);
+  return ops == null || ops <= MAX_OPS_PER_SCRIPT;
+}
+
+function checkMiniscriptStackSize(
+  type: MiniscriptTypeInfo,
+  stats: MiniscriptResourceStats,
+  addressType: AddressType,
+): boolean {
+  if (addressType === "TAPROOT") {
+    const execStackSize = getMiniscriptExecStackSize(type, stats);
+    return execStackSize == null || execStackSize <= MAX_STACK_SIZE;
+  }
+  const stackSize = getMiniscriptStackSize(type, stats);
+  return stackSize == null || stackSize <= MAX_STANDARD_P2WSH_STACK_ITEMS;
+}
+
+function collectDuplicateCheckedKeys(node: MiniscriptFragment, keys = new Set<string>()): boolean {
+  const addKey = (key: string): boolean => {
+    if (keys.has(key)) return false;
+    keys.add(key);
+    return true;
+  };
+
+  switch (node.fragment) {
+    case "PK":
+    case "PKH":
+    case "PK_H":
+    case "PK_K":
+      return addKey(node.key);
+    case "MULTI":
+    case "MULTI_A":
+      return node.keys.every(addKey);
+    case "WRAP_A":
+    case "WRAP_S":
+    case "WRAP_C":
+    case "WRAP_D":
+    case "WRAP_V":
+    case "WRAP_J":
+    case "WRAP_N":
+      return collectDuplicateCheckedKeys(node.sub, keys);
+    case "AND_V":
+    case "AND_B":
+    case "OR_B":
+    case "OR_C":
+    case "OR_D":
+    case "OR_I":
+      return (
+        collectDuplicateCheckedKeys(node.subs[0], keys) &&
+        collectDuplicateCheckedKeys(node.subs[1], keys)
+      );
+    case "ANDOR":
+      return (
+        collectDuplicateCheckedKeys(node.subs[0], keys) &&
+        collectDuplicateCheckedKeys(node.subs[1], keys) &&
+        collectDuplicateCheckedKeys(node.subs[2], keys)
+      );
+    case "THRESH":
+      return node.subs.every((sub) => collectDuplicateCheckedKeys(sub, keys));
+    case "JUST_0":
+    case "JUST_1":
+    case "OLDER":
+    case "AFTER":
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      return true;
+  }
+}
+
+function validateMiniscriptTimelineNode(node: MiniscriptFragment): void {
+  let lockType: TimelockBased = "NONE";
+  const detectTimelock = (timelock: Timelock, k: number): void => {
+    if (timelockK(timelock) !== k) {
+      invalid(timelock.based === "TIME_LOCK" ? "Invalid time value" : "Invalid height value");
+    }
+    if (timelock.based === "NONE") {
+      return;
+    }
+    if (lockType === "NONE") {
+      lockType = timelock.based;
+    } else if (lockType !== timelock.based) {
+      invalid("Timelock mixing");
+    }
+  };
+  const visit = (current: MiniscriptFragment): void => {
+    switch (current.fragment) {
+      case "AFTER":
+        detectTimelock(timelockFromK(true, current.k), current.k);
+        return;
+      case "OLDER":
+        detectTimelock(timelockFromK(false, current.k), current.k);
+        return;
+      case "WRAP_A":
+      case "WRAP_S":
+      case "WRAP_C":
+      case "WRAP_D":
+      case "WRAP_V":
+      case "WRAP_J":
+      case "WRAP_N":
+        visit(current.sub);
+        return;
+      case "AND_V":
+      case "AND_B":
+      case "OR_B":
+      case "OR_C":
+      case "OR_D":
+      case "OR_I":
+        visit(current.subs[0]);
+        visit(current.subs[1]);
+        return;
+      case "ANDOR":
+        visit(current.subs[0]);
+        visit(current.subs[1]);
+        visit(current.subs[2]);
+        return;
+      case "THRESH":
+        current.subs.forEach(visit);
+        return;
+      case "JUST_0":
+      case "JUST_1":
+      case "PK":
+      case "PKH":
+      case "PK_H":
+      case "PK_K":
+      case "MULTI":
+      case "MULTI_A":
+      case "HASH160":
+      case "HASH256":
+      case "RIPEMD160":
+      case "SHA256":
+        return;
+    }
+  };
+  visit(node);
+}
+
+function validateMiniscriptNode(node: MiniscriptFragment, addressType: AddressType): void {
   switch (node.fragment) {
     case "OLDER": {
       if (node.k < 1 || node.k >= 0x80000000) {
@@ -935,15 +2078,12 @@ function validateMiniscriptNode(
       break;
     }
     case "MULTI":
-      if (addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT) {
+      if (addressType === "TAPROOT") {
         invalid("multi() is not valid for taproot miniscript");
       }
       break;
     case "MULTI_A":
-      if (
-        addressType !== MINISCRIPT_ADDRESS_TYPE_TAPROOT &&
-        addressType !== MINISCRIPT_ADDRESS_TYPE_ANY
-      ) {
+      if (addressType !== "TAPROOT") {
         invalid("multi_a() is only valid for taproot miniscript");
       }
       break;
@@ -994,72 +2134,94 @@ function substituteMiniscriptKeys(
   node: MiniscriptFragment,
   signers: Record<string, string>,
   childPath: string,
+  wrapped = false,
 ): string {
+  const prefix = wrapped ? ":" : "";
+  const keyExpression = (key: string): string =>
+    maybeAppendChildPath(signers[key] ?? key, childPath);
+  const wrappedSub = (sub: MiniscriptFragment): string =>
+    substituteMiniscriptKeys(sub, signers, childPath, true);
+  const normalSub = (sub: MiniscriptFragment): string =>
+    substituteMiniscriptKeys(sub, signers, childPath);
+
   switch (node.fragment) {
     case "JUST_0":
-      return "0";
+      return `${prefix}0`;
     case "JUST_1":
-      return "1";
+      return `${prefix}1`;
     case "PK":
-      return `pk(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+      return `${prefix}pk(${keyExpression(node.key)})`;
     case "PKH":
-      return `pkh(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+      return `${prefix}pkh(${keyExpression(node.key)})`;
     case "PK_H":
-      return `pk_h(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+      return `${prefix}pk_h(${keyExpression(node.key)})`;
     case "PK_K":
-      return `pk_k(${maybeAppendChildPath(signers[node.key] ?? node.key, childPath)})`;
+      return `${prefix}pk_k(${keyExpression(node.key)})`;
     case "OLDER":
-      return `older(${node.k})`;
+      return `${prefix}older(${node.k})`;
     case "AFTER":
-      return `after(${node.k})`;
+      return `${prefix}after(${node.k})`;
     case "HASH160":
-      return `hash160(${node.data})`;
+      return `${prefix}hash160(${node.data})`;
     case "HASH256":
-      return `hash256(${node.data})`;
+      return `${prefix}hash256(${node.data})`;
     case "RIPEMD160":
-      return `ripemd160(${node.data})`;
+      return `${prefix}ripemd160(${node.data})`;
     case "SHA256":
-      return `sha256(${node.data})`;
+      return `${prefix}sha256(${node.data})`;
     case "MULTI":
-      return `multi(${node.k},${node.keys
-        .map((key) => maybeAppendChildPath(signers[key] ?? key, childPath))
-        .join(",")})`;
+      return `${prefix}multi(${node.k},${node.keys.map(keyExpression).join(",")})`;
     case "MULTI_A":
-      return `multi_a(${node.k},${node.keys
-        .map((key) => maybeAppendChildPath(signers[key] ?? key, childPath))
-        .join(",")})`;
+      return `${prefix}multi_a(${node.k},${node.keys.map(keyExpression).join(",")})`;
     case "WRAP_A":
-      return `a:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
+      return `a${wrappedSub(node.sub)}`;
     case "WRAP_S":
-      return `s:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
-    case "WRAP_C":
-      return `c:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
+      return `s${wrappedSub(node.sub)}`;
+    case "WRAP_C": {
+      if (node.sub.fragment === "PK_K") {
+        return `${prefix}pk(${keyExpression(node.sub.key)})`;
+      }
+      if (node.sub.fragment === "PK_H") {
+        return `${prefix}pkh(${keyExpression(node.sub.key)})`;
+      }
+      return `c${wrappedSub(node.sub)}`;
+    }
     case "WRAP_D":
-      return `d:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
+      return `d${wrappedSub(node.sub)}`;
     case "WRAP_V":
-      return `v:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
+      return `v${wrappedSub(node.sub)}`;
     case "WRAP_J":
-      return `j:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
+      return `j${wrappedSub(node.sub)}`;
     case "WRAP_N":
-      return `n:${substituteMiniscriptKeys(node.sub, signers, childPath)}`;
+      return `n${wrappedSub(node.sub)}`;
     case "AND_V":
-      return `and_v(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)})`;
+      if (node.subs[1].fragment === "JUST_1") {
+        return `t${wrappedSub(node.subs[0])}`;
+      }
+      return `${prefix}and_v(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
     case "AND_B":
-      return `and_b(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)})`;
+      return `${prefix}and_b(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
     case "OR_B":
-      return `or_b(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)})`;
+      return `${prefix}or_b(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
     case "OR_C":
-      return `or_c(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)})`;
+      return `${prefix}or_c(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
     case "OR_D":
-      return `or_d(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)})`;
+      return `${prefix}or_d(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
     case "OR_I":
-      return `or_i(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)})`;
+      if (node.subs[0].fragment === "JUST_0") {
+        return `l${wrappedSub(node.subs[1])}`;
+      }
+      if (node.subs[1].fragment === "JUST_0") {
+        return `u${wrappedSub(node.subs[0])}`;
+      }
+      return `${prefix}or_i(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
     case "ANDOR":
-      return `andor(${substituteMiniscriptKeys(node.subs[0], signers, childPath)},${substituteMiniscriptKeys(node.subs[1], signers, childPath)},${substituteMiniscriptKeys(node.subs[2], signers, childPath)})`;
+      if (node.subs[2].fragment === "JUST_0") {
+        return `${prefix}and_n(${normalSub(node.subs[0])},${normalSub(node.subs[1])})`;
+      }
+      return `${prefix}andor(${normalSub(node.subs[0])},${normalSub(node.subs[1])},${normalSub(node.subs[2])})`;
     case "THRESH":
-      return `thresh(${node.k},${node.subs
-        .map((sub) => substituteMiniscriptKeys(sub, signers, childPath))
-        .join(",")})`;
+      return `${prefix}thresh(${node.k},${node.subs.map(normalSub).join(",")})`;
   }
 }
 
@@ -1123,7 +2285,7 @@ function validateTapLeaf(leaf: string): void {
   if (isValidMusigTemplate(leaf)) {
     return;
   }
-  if (!isValidMiniscriptTemplate(leaf, MINISCRIPT_ADDRESS_TYPE_TAPROOT)) {
+  if (!isValidMiniscriptTemplate(leaf, "TAPROOT")) {
     invalid(`invalid miniscript template: '${leaf}'`);
   }
 }
@@ -1154,80 +2316,985 @@ function validateDuplicateKeys(keypath: string[], subscripts: string[]): void {
   }
 }
 
-function foldWithAnd(expressions: string[]): string {
-  if (expressions.length === 0) {
-    invalid("Cannot AND an empty set of policies");
-  }
-  let result = expressions[0];
-  for (let i = 1; i < expressions.length; i++) {
-    result = `and_v(v:${result},${expressions[i]})`;
-  }
-  return result;
-}
-
-function foldWithOr(expressions: string[]): string {
-  if (expressions.length === 0) {
-    invalid("Cannot OR an empty set of policies");
-  }
-  let result = expressions[0];
-  for (let i = 1; i < expressions.length; i++) {
-    result = `or_i(${result},${expressions[i]})`;
-  }
-  return result;
-}
-
 function resolveConfiguredValue(value: string, config: Record<string, string>): string {
   return config[value] ?? value;
 }
 
-function policyNodeToMiniscript(
-  node: PolicyNode,
-  config: Record<string, string>,
-  addressType: MiniscriptAddressType,
-): string {
+type CompiledPolicyNode =
+  | { type: "PK"; key: string }
+  | { type: "OLDER" | "AFTER"; k: number }
+  | { type: HashFragment; data: string }
+  | { type: "AND"; subs: CompiledPolicyNode[] }
+  | { type: "OR"; probs: number[]; subs: CompiledPolicyNode[] }
+  | { type: "THRESH"; k: number; subs: CompiledPolicyNode[] };
+
+type PolicyCompilerStratType =
+  | "JUST_0"
+  | "JUST_1"
+  | "PK_K"
+  | "MULTI"
+  | "OLDER"
+  | "AFTER"
+  | HashFragment
+  | "AND"
+  | "OR"
+  | "ANDOR"
+  | "THRESH"
+  | "WRAP_AS"
+  | "WRAP_C"
+  | "WRAP_D"
+  | "WRAP_V"
+  | "WRAP_J"
+  | "WRAP_N"
+  | "ALTERNATIVES"
+  | "CACHE";
+
+interface PolicyCompilerStrat {
+  data?: string;
+  id: number;
+  k: number;
+  keys: string[];
+  prob: number;
+  subs: PolicyCompilerStrat[];
+  type: PolicyCompilerStratType;
+}
+
+interface PolicyCompilerState {
+  nextId: number;
+  stratFalse: PolicyCompilerStrat;
+  stratTrue: PolicyCompilerStrat;
+}
+
+interface CostPair {
+  nsat: number;
+  sat: number;
+}
+
+interface CompileResult {
+  cost: number;
+  node: MiniscriptFragment;
+  pair: CostPair;
+  scriptSize: number;
+  type: MiniscriptTypeInfo;
+}
+
+interface Compilation {
+  p: number;
+  q: number;
+  results: CompileResult[];
+  seq: number;
+}
+
+interface CompilerFilter {
+  care: string;
+  required: string;
+}
+
+function parsePolicyPositiveInt(value: string, field: string): number {
+  const parsed = parseUInt(value, field);
+  if (parsed < 1 || parsed >= 0x80000000) {
+    invalid(`Invalid ${field}: ${value}`);
+  }
+  return parsed;
+}
+
+function configurePolicyNode(node: PolicyNode, config: Record<string, string>): CompiledPolicyNode {
   switch (node.type) {
     case "PK":
-      return `pk(${resolveConfiguredValue(node.key, config)})`;
+      return { type: "PK", key: resolveConfiguredValue(node.key, config) };
     case "OLDER": {
       const resolved = resolveConfiguredValue(node.value, config);
-      return `older(${parseUInt(resolved, "older value")})`;
+      return { type: "OLDER", k: parsePolicyPositiveInt(resolved, "older value") };
     }
     case "AFTER": {
       const resolved = resolveConfiguredValue(node.value, config);
-      return `after(${parseUInt(resolved, "after value")})`;
+      return { type: "AFTER", k: parsePolicyPositiveInt(resolved, "after value") };
     }
     case "HASH160":
-      return `hash160(${parseHashArg(resolveConfiguredValue(node.data, config), 20, "hash160")})`;
+      return {
+        type: "HASH160",
+        data: parseHashArg(resolveConfiguredValue(node.data, config), 20, "hash160"),
+      };
     case "HASH256":
-      return `hash256(${parseHashArg(resolveConfiguredValue(node.data, config), 32, "hash256")})`;
+      return {
+        type: "HASH256",
+        data: parseHashArg(resolveConfiguredValue(node.data, config), 32, "hash256"),
+      };
     case "RIPEMD160":
-      return `ripemd160(${parseHashArg(resolveConfiguredValue(node.data, config), 20, "ripemd160")})`;
+      return {
+        type: "RIPEMD160",
+        data: parseHashArg(resolveConfiguredValue(node.data, config), 20, "ripemd160"),
+      };
     case "SHA256":
-      return `sha256(${parseHashArg(resolveConfiguredValue(node.data, config), 32, "sha256")})`;
+      return {
+        type: "SHA256",
+        data: parseHashArg(resolveConfiguredValue(node.data, config), 32, "sha256"),
+      };
     case "AND":
-      return foldWithAnd(node.subs.map((sub) => policyNodeToMiniscript(sub, config, addressType)));
+      return { type: "AND", subs: node.subs.map((sub) => configurePolicyNode(sub, config)) };
     case "OR":
-      return foldWithOr(node.subs.map((sub) => policyNodeToMiniscript(sub, config, addressType)));
+      return {
+        type: "OR",
+        probs: node.probs ?? node.subs.map(() => 1),
+        subs: node.subs.map((sub) => configurePolicyNode(sub, config)),
+      };
     case "THRESH": {
       if (node.k < 1 || node.k > node.subs.length) {
         invalid("Invalid thresh() threshold");
       }
-      if (node.subs.every((sub) => sub.type === "PK")) {
-        const keys = node.subs.map((sub) =>
-          resolveConfiguredValue((sub as Extract<PolicyNode, { type: "PK" }>).key, config),
-        );
-        const name = addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT ? "multi_a" : "multi";
-        return `${name}(${node.k},${keys.join(",")})`;
-      }
-
-      const chosen = chooseIndices(node.subs.length, node.k).map((indices) =>
-        foldWithAnd(
-          indices.map((index) => policyNodeToMiniscript(node.subs[index], config, addressType)),
-        ),
-      );
-      return foldWithOr(chosen);
+      return {
+        type: "THRESH",
+        k: node.k,
+        subs: node.subs.map((sub) => configurePolicyNode(sub, config)),
+      };
     }
   }
+}
+
+function makePolicyCompilerStrat(
+  state: PolicyCompilerState,
+  type: PolicyCompilerStratType,
+  subs: PolicyCompilerStrat[] = [],
+  options: { data?: string; k?: number; keys?: string[]; prob?: number } = {},
+): PolicyCompilerStrat {
+  return {
+    data: options.data,
+    id: state.nextId++,
+    k: options.k ?? 0,
+    keys: options.keys ?? [],
+    prob: options.prob ?? 0,
+    subs,
+    type,
+  };
+}
+
+function createPolicyCompilerState(): PolicyCompilerState {
+  const state = { nextId: 0 } as PolicyCompilerState;
+  state.stratFalse = makePolicyCompilerStrat(state, "CACHE", [
+    makePolicyCompilerStrat(state, "JUST_0"),
+  ]);
+  state.stratTrue = makePolicyCompilerStrat(state, "CACHE", [
+    makePolicyCompilerStrat(state, "JUST_1"),
+  ]);
+  return state;
+}
+
+function computePolicyStrategy(
+  node: CompiledPolicyNode,
+  cache: Map<CompiledPolicyNode, PolicyCompilerStrat>,
+  state: PolicyCompilerState,
+): PolicyCompilerStrat | null {
+  const cached = cache.get(node);
+  if (cached) {
+    return cached;
+  }
+
+  const strats: PolicyCompilerStrat[] = [];
+  switch (node.type) {
+    case "PK":
+      strats.push(makePolicyCompilerStrat(state, "PK_K", [], { keys: [node.key] }));
+      break;
+    case "OLDER":
+      strats.push(makePolicyCompilerStrat(state, "OLDER", [], { k: node.k }));
+      break;
+    case "AFTER":
+      strats.push(makePolicyCompilerStrat(state, "AFTER", [], { k: node.k }));
+      break;
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      strats.push(makePolicyCompilerStrat(state, node.type, [], { data: node.data }));
+      break;
+    case "AND": {
+      if (node.subs.length !== 2) {
+        return null;
+      }
+      const left = computePolicyStrategy(node.subs[0], cache, state);
+      const right = computePolicyStrategy(node.subs[1], cache, state);
+      if (!left || !right) {
+        return null;
+      }
+      strats.push(makePolicyCompilerStrat(state, "AND", [left, right]));
+      strats.push(
+        makePolicyCompilerStrat(state, "ANDOR", [left, right, state.stratFalse], { prob: 1 }),
+      );
+      break;
+    }
+    case "OR": {
+      if (node.subs.length !== 2 || node.probs.length !== 2) {
+        return null;
+      }
+      const [leftProb, rightProb] = node.probs;
+      const totalProb = leftProb + rightProb;
+      if (
+        !Number.isSafeInteger(leftProb) ||
+        !Number.isSafeInteger(rightProb) ||
+        leftProb < 1 ||
+        rightProb < 1 ||
+        !Number.isSafeInteger(totalProb)
+      ) {
+        return null;
+      }
+      const prob = leftProb / totalProb;
+      const left = computePolicyStrategy(node.subs[0], cache, state);
+      const right = computePolicyStrategy(node.subs[1], cache, state);
+      if (!left || !right) {
+        return null;
+      }
+      if (node.subs[0].type === "AND" && node.subs[0].subs.length === 2) {
+        const leftLeft = computePolicyStrategy(node.subs[0].subs[0], cache, state);
+        const leftRight = computePolicyStrategy(node.subs[0].subs[1], cache, state);
+        if (!leftLeft || !leftRight) {
+          return null;
+        }
+        strats.push(
+          makePolicyCompilerStrat(state, "ANDOR", [leftLeft, leftRight, right], { prob }),
+        );
+      }
+      if (node.subs[1].type === "AND" && node.subs[1].subs.length === 2) {
+        const rightLeft = computePolicyStrategy(node.subs[1].subs[0], cache, state);
+        const rightRight = computePolicyStrategy(node.subs[1].subs[1], cache, state);
+        if (!rightLeft || !rightRight) {
+          return null;
+        }
+        strats.push(
+          makePolicyCompilerStrat(state, "ANDOR", [rightLeft, rightRight, left], {
+            prob: 1 - prob,
+          }),
+        );
+      }
+      strats.push(
+        makePolicyCompilerStrat(state, "ANDOR", [left, state.stratTrue, right], { prob }),
+      );
+      strats.push(makePolicyCompilerStrat(state, "OR", [left, right], { prob }));
+      break;
+    }
+    case "THRESH": {
+      if (node.k < 1 || node.k > node.subs.length || node.subs.length > 100) {
+        return null;
+      }
+      const subs = node.subs.map((sub) => computePolicyStrategy(sub, cache, state));
+      if (subs.some((sub) => sub == null)) {
+        return null;
+      }
+      const strategies = subs as PolicyCompilerStrat[];
+      if (
+        node.subs.length <= MAX_PUBKEYS_PER_MULTISIG &&
+        node.subs.every((sub) => sub.type === "PK")
+      ) {
+        strats.push(
+          makePolicyCompilerStrat(state, "MULTI", [], {
+            k: node.k,
+            keys: node.subs.map((sub) => (sub as Extract<CompiledPolicyNode, { type: "PK" }>).key),
+          }),
+        );
+      }
+      if (node.k === 1 || node.k === node.subs.length) {
+        const grouped = [...strategies];
+        while (grouped.length > 1) {
+          const prob = 1 / grouped.length;
+          const right = grouped.pop()!;
+          const left = grouped.pop()!;
+          const rep = makePolicyCompilerStrat(state, node.k === 1 ? "OR" : "AND", [left, right], {
+            prob,
+          });
+          grouped.push(makePolicyCompilerStrat(state, "CACHE", [rep]));
+        }
+        strats.push(grouped[0]);
+      }
+      strats.push(
+        makePolicyCompilerStrat(state, "THRESH", strategies, {
+          k: node.k,
+          prob: node.k / strategies.length,
+        }),
+      );
+      break;
+    }
+  }
+
+  const initial =
+    strats.length === 1 ? strats : [makePolicyCompilerStrat(state, "ALTERNATIVES", strats)];
+  const result = makePolicyCompilerStrat(state, "CACHE", initial);
+  cache.set(node, result);
+  result.subs.push(makePolicyCompilerStrat(state, "WRAP_C", [result]));
+  result.subs.push(makePolicyCompilerStrat(state, "WRAP_V", [result]));
+  result.subs.push(makePolicyCompilerStrat(state, "AND", [result, state.stratTrue]));
+  result.subs.push(makePolicyCompilerStrat(state, "WRAP_N", [result]));
+  result.subs.push(makePolicyCompilerStrat(state, "WRAP_D", [result]));
+  result.subs.push(makePolicyCompilerStrat(state, "WRAP_J", [result]));
+  result.subs.push(makePolicyCompilerStrat(state, "OR", [result, state.stratFalse], { prob: 1 }));
+  result.subs.push(makePolicyCompilerStrat(state, "WRAP_AS", [result]));
+  return result;
+}
+
+function multiplyCompilerCost(coef: number, value: number): number {
+  return coef === 0 ? 0 : coef * value;
+}
+
+function calcCompilerCostPair(
+  fragment: MiniscriptFragment["fragment"],
+  results: CompileResult[],
+  prob: number,
+): CostPair {
+  const rightProb = 1 - prob;
+  switch (fragment) {
+    case "PK_K":
+      return { sat: 73, nsat: 1 };
+    case "PK_H":
+      return { sat: 107, nsat: 35 };
+    case "OLDER":
+    case "AFTER":
+      return { sat: 0, nsat: Number.POSITIVE_INFINITY };
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      return { sat: 33, nsat: 33 };
+    case "WRAP_A":
+    case "WRAP_S":
+    case "WRAP_C":
+    case "WRAP_N":
+      return results[0].pair;
+    case "WRAP_D":
+      return { sat: 2 + results[0].pair.sat, nsat: 1 };
+    case "WRAP_V":
+      return { sat: results[0].pair.sat, nsat: Number.POSITIVE_INFINITY };
+    case "WRAP_J":
+      return { sat: results[0].pair.sat, nsat: 1 };
+    case "JUST_1":
+      return { sat: 0, nsat: Number.POSITIVE_INFINITY };
+    case "JUST_0":
+      return { sat: Number.POSITIVE_INFINITY, nsat: 0 };
+    case "AND_V":
+      return { sat: results[0].pair.sat + results[1].pair.sat, nsat: Number.POSITIVE_INFINITY };
+    case "AND_B":
+      return {
+        sat: results[0].pair.sat + results[1].pair.sat,
+        nsat: results[0].pair.nsat + results[1].pair.nsat,
+      };
+    case "OR_B":
+      return {
+        sat:
+          multiplyCompilerCost(prob, results[0].pair.sat + results[1].pair.nsat) +
+          multiplyCompilerCost(rightProb, results[0].pair.nsat + results[1].pair.sat),
+        nsat: results[0].pair.nsat + results[1].pair.nsat,
+      };
+    case "OR_C":
+    case "OR_D":
+      return {
+        sat:
+          multiplyCompilerCost(prob, results[0].pair.sat) +
+          multiplyCompilerCost(rightProb, results[0].pair.nsat + results[1].pair.sat),
+        nsat: results[0].pair.nsat + results[1].pair.nsat,
+      };
+    case "OR_I":
+      return {
+        sat:
+          multiplyCompilerCost(prob, results[0].pair.sat + 2) +
+          multiplyCompilerCost(rightProb, results[1].pair.sat + 1),
+        nsat: Math.min(2 + results[0].pair.nsat, 1 + results[1].pair.nsat),
+      };
+    case "ANDOR":
+      return {
+        sat:
+          multiplyCompilerCost(prob, results[0].pair.sat + results[1].pair.sat) +
+          multiplyCompilerCost(rightProb, results[0].pair.nsat + results[2].pair.sat),
+        nsat: results[0].pair.nsat + results[2].pair.nsat,
+      };
+    case "MULTI":
+      return { sat: 1 + prob * 73, nsat: 1 + prob };
+    case "THRESH": {
+      let sat = 0;
+      let nsat = 0;
+      for (const result of results) {
+        sat += result.pair.sat;
+        nsat += result.pair.nsat;
+      }
+      return {
+        sat: multiplyCompilerCost(prob, sat) + multiplyCompilerCost(rightProb, nsat),
+        nsat,
+      };
+    }
+    case "PK":
+    case "PKH":
+    case "MULTI_A":
+      invalid(`Unsupported policy compiler fragment: ${fragment}`);
+  }
+}
+
+function getCompilerPqs(
+  fragment: MiniscriptFragment["fragment"],
+  p: number,
+  q: number,
+  prob: number,
+  subCount: number,
+): { ps: number[]; qs: number[] } {
+  const rightProb = 1 - prob;
+  switch (fragment) {
+    case "JUST_1":
+    case "JUST_0":
+    case "PK_K":
+    case "PK_H":
+    case "MULTI":
+    case "OLDER":
+    case "AFTER":
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      return { ps: [], qs: [] };
+    case "WRAP_A":
+    case "WRAP_S":
+    case "WRAP_C":
+    case "WRAP_N":
+      return { ps: [p], qs: [q] };
+    case "WRAP_D":
+    case "WRAP_V":
+    case "WRAP_J":
+      return { ps: [p], qs: [0] };
+    case "AND_V":
+    case "AND_B":
+      return { ps: [p, p], qs: [q, q] };
+    case "OR_B":
+      return { ps: [prob * p, rightProb * p], qs: [rightProb * p + q, prob * p + q] };
+    case "OR_D":
+      return { ps: [prob * p, rightProb * p], qs: [rightProb * p + q, q] };
+    case "OR_C":
+      return { ps: [prob * p, rightProb * p], qs: [rightProb * p, 0] };
+    case "OR_I":
+      return {
+        ps: [prob * p, rightProb * p],
+        qs: [subCount === 0 ? q : 0, subCount === 1 ? q : 0],
+      };
+    case "ANDOR":
+      return { ps: [prob * p, prob * p, rightProb * p], qs: [q + rightProb * p, 0, q] };
+    case "THRESH":
+      return {
+        ps: Array.from({ length: subCount }, () => p * prob),
+        qs: Array.from({ length: subCount }, () => q + p * rightProb),
+      };
+    case "PK":
+    case "PKH":
+    case "MULTI_A":
+      invalid(`Unsupported policy compiler fragment: ${fragment}`);
+  }
+}
+
+function parseCompilerFilter(filter: string): CompilerFilter {
+  const [required, care = ""] = filter.split("/", 2);
+  return { required, care };
+}
+
+function getCompilerTypeFilters(fragment: MiniscriptFragment["fragment"]): CompilerFilter[][] {
+  const filters = (values: string[][]): CompilerFilter[][] =>
+    values.map((row) => row.map(parseCompilerFilter));
+  switch (fragment) {
+    case "JUST_1":
+    case "JUST_0":
+    case "PK_K":
+    case "PK_H":
+    case "MULTI":
+    case "OLDER":
+    case "AFTER":
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      return [[]];
+    case "WRAP_A":
+      return filters([["B/udfems"]]);
+    case "WRAP_S":
+      return filters([["Bo/udfemsx"]]);
+    case "WRAP_C":
+      return filters([["K/onde"]]);
+    case "WRAP_D":
+      return filters([["V/zfms"]]);
+    case "WRAP_V":
+      return filters([["B/zonmsx"]]);
+    case "WRAP_J":
+      return filters([["Bn/oufms"]]);
+    case "WRAP_N":
+      return filters([["B/zondfems"]]);
+    case "AND_V":
+      return filters([
+        ["V/nzoms", "B/unzofmsx"],
+        ["V/nsoms", "K/unzofmsx"],
+        ["V/nzoms", "V/unzofmsx"],
+      ]);
+    case "AND_B":
+      return filters([["B/zondfems", "W/zondfems"]]);
+    case "OR_B":
+      return filters([["Bde/zoms", "Wde/zoms"]]);
+    case "OR_D":
+      return filters([["Bdue/zoms", "B/zoudfems"]]);
+    case "OR_C":
+      return filters([["Bdue/zoms", "V/zoms"]]);
+    case "OR_I":
+      return filters([
+        ["V/zudfems", "V/zudfems"],
+        ["B/zudfems", "B/zudfems"],
+        ["K/zudfems", "K/zudfems"],
+      ]);
+    case "ANDOR":
+      return filters([
+        ["Bdue/zoms", "B/zoufms", "B/zoudfems"],
+        ["Bdue/zoms", "K/zoufms", "K/zoudfems"],
+        ["Bdue/zoms", "V/zoufms", "V/zoudfems"],
+      ]);
+    case "THRESH":
+    case "PK":
+    case "PKH":
+    case "MULTI_A":
+      invalid(`Unsupported policy compiler type filter: ${fragment}`);
+  }
+}
+
+function makeCompilerMiniscriptNode(
+  fragment: MiniscriptFragment["fragment"],
+  subs: MiniscriptFragment[],
+  options: { data?: string; k?: number; keys?: string[] } = {},
+): MiniscriptFragment {
+  switch (fragment) {
+    case "JUST_0":
+    case "JUST_1":
+      return { fragment };
+    case "PK_K":
+    case "PK_H":
+      return { fragment, key: options.keys?.[0] ?? invalid(`Missing key for ${fragment}`) };
+    case "OLDER":
+    case "AFTER":
+      return { fragment, k: options.k ?? invalid(`Missing k for ${fragment}`) };
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      return { fragment, data: options.data ?? invalid(`Missing hash data for ${fragment}`) };
+    case "MULTI":
+      return {
+        fragment,
+        k: options.k ?? invalid("Missing multi threshold"),
+        keys: options.keys ?? invalid("Missing multi keys"),
+      };
+    case "WRAP_A":
+    case "WRAP_S":
+    case "WRAP_C":
+    case "WRAP_D":
+    case "WRAP_V":
+    case "WRAP_J":
+    case "WRAP_N":
+      return { fragment, sub: subs[0] ?? invalid(`Missing subexpression for ${fragment}`) };
+    case "AND_V":
+    case "AND_B":
+    case "OR_B":
+    case "OR_C":
+    case "OR_D":
+    case "OR_I":
+      if (subs.length !== 2) invalid(`Invalid ${fragment} subexpression count`);
+      return { fragment, subs: [subs[0], subs[1]] };
+    case "ANDOR":
+      if (subs.length !== 3) invalid("Invalid andor subexpression count");
+      return { fragment, subs: [subs[0], subs[1], subs[2]] };
+    case "THRESH":
+      return {
+        fragment,
+        k: options.k ?? invalid("Missing thresh threshold"),
+        subs,
+      };
+    case "PK":
+    case "PKH":
+    case "MULTI_A":
+      invalid(`Unsupported policy compiler node: ${fragment}`);
+  }
+}
+
+function analyzeCompiledNode(node: MiniscriptFragment): {
+  scriptSize: number;
+  stats: MiniscriptResourceStats;
+  type: MiniscriptTypeInfo;
+} | null {
+  try {
+    const addressType = "NATIVE_SEGWIT";
+    const type = computeMiniscriptType(node, addressType);
+    const scriptSize = computeMiniscriptScriptSize(node, addressType);
+    const stats = computeMiniscriptResourceStats(node, addressType);
+    return { scriptSize, stats, type };
+  } catch {
+    return null;
+  }
+}
+
+function isValidCompiledSatisfaction(
+  type: MiniscriptTypeInfo,
+  scriptSize: number,
+  stats: MiniscriptResourceStats,
+): boolean {
+  return (
+    type.flags !== 0 &&
+    scriptSize <= maxScriptSize("NATIVE_SEGWIT") &&
+    checkMiniscriptOpsLimit(stats, "NATIVE_SEGWIT") &&
+    checkMiniscriptStackSize(type, stats, "NATIVE_SEGWIT")
+  );
+}
+
+function typeIsSubtype(left: MiniscriptTypeInfo, right: MiniscriptTypeInfo): boolean {
+  return (right.flags & ~left.flags) === 0;
+}
+
+function compareCompileResultTo(
+  result: CompileResult,
+  otherCost: number,
+  otherScriptSize: number,
+): number {
+  if (result.cost < otherCost) return -1;
+  if (result.cost > otherCost) return 1;
+  if (result.scriptSize > otherScriptSize) return -1;
+  if (result.scriptSize < otherScriptSize) return 1;
+  return 0;
+}
+
+function addCompilationResult(
+  compilation: Compilation,
+  pair: CostPair,
+  node: MiniscriptFragment,
+): void {
+  const analysis = analyzeCompiledNode(node);
+  if (!analysis) return;
+  if (
+    !(
+      isValidCompiledSatisfaction(analysis.type, analysis.scriptSize, analysis.stats) &&
+      analysis.type.m &&
+      analysis.type.k
+    )
+  ) {
+    return;
+  }
+
+  const cost =
+    analysis.scriptSize +
+    multiplyCompilerCost(compilation.p, pair.sat) +
+    multiplyCompilerCost(compilation.q, pair.nsat);
+  if (cost > 10000) {
+    return;
+  }
+
+  for (const result of compilation.results) {
+    if (
+      typeIsSubtype(result.type, analysis.type) &&
+      compareCompileResultTo(result, cost, analysis.scriptSize) <= 0
+    ) {
+      return;
+    }
+  }
+
+  compilation.results = compilation.results.filter(
+    (result) =>
+      !(
+        typeIsSubtype(analysis.type, result.type) &&
+        compareCompileResultTo(result, cost, analysis.scriptSize) >= 0
+      ),
+  );
+  compilation.results.push({
+    cost,
+    node,
+    pair,
+    scriptSize: analysis.scriptSize,
+    type: analysis.type,
+  });
+  compilation.seq++;
+}
+
+function addCompilerInner(
+  compilation: Compilation,
+  fragment: MiniscriptFragment["fragment"],
+  results: CompileResult[],
+  prob: number,
+  options: { data?: string; k?: number; keys?: string[] } = {},
+): void {
+  const node = makeCompilerMiniscriptNode(
+    fragment,
+    results.map((result) => result.node),
+    options,
+  );
+  addCompilationResult(compilation, calcCompilerCostPair(fragment, results, prob), node);
+}
+
+function queryCompilation(compilation: Compilation, filter: CompilerFilter): CompileResult[] {
+  const requiredBits = typeBits(filter.required);
+  const careBits = typeBits(filter.care);
+  const byMask = new Map<number, CompileResult>();
+  for (const result of compilation.results) {
+    if ((result.type.flags & requiredBits) !== requiredBits) {
+      continue;
+    }
+    const masked = result.type.flags & careBits;
+    const existing = byMask.get(masked);
+    if (!existing || compareCompileResultTo(result, existing.cost, existing.scriptSize) < 0) {
+      byMask.set(masked, result);
+    }
+  }
+  return [...byMask.values()];
+}
+
+function addCompilerStrategyResults(
+  compilation: Compilation,
+  fragment: MiniscriptFragment["fragment"],
+  subStrategies: PolicyCompilerStrat[],
+  prob: number,
+  mode: number,
+  cache: Map<string, Compilation>,
+  options: { data?: string; k?: number; keys?: string[] } = {},
+): void {
+  const pqs = getCompilerPqs(fragment, compilation.p, compilation.q, prob, mode);
+  const filters = getCompilerTypeFilters(fragment);
+
+  for (const row of filters) {
+    const resultLists: CompileResult[][] = [];
+    let missing = false;
+    for (let i = 0; i < row.length; i++) {
+      const subCompilation = getPolicyCompilation(subStrategies[i], pqs.ps[i], pqs.qs[i], cache);
+      const results = queryCompilation(subCompilation, row[i]);
+      if (results.length === 0) {
+        missing = true;
+        break;
+      }
+      resultLists.push(results);
+    }
+    if (missing) {
+      continue;
+    }
+
+    const visit = (index: number, selected: CompileResult[]): void => {
+      if (index === resultLists.length) {
+        addCompilerInner(compilation, fragment, selected, prob, options);
+        return;
+      }
+      for (const result of resultLists[index]) {
+        visit(index + 1, [...selected, result]);
+      }
+    };
+    visit(0, []);
+  }
+}
+
+function getPolicyCompilation(
+  strat: PolicyCompilerStrat,
+  p: number,
+  q: number,
+  cache: Map<string, Compilation>,
+): Compilation {
+  if (strat.type !== "CACHE") {
+    invalid("Policy compiler cache root expected");
+  }
+  const cacheKey = `${strat.id}:${p}:${q}`;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const compilation: Compilation = { p, q, results: [], seq: 0 };
+  compilePolicyStrategy(strat.subs[0], compilation, cache);
+  cache.set(cacheKey, compilation);
+
+  if (strat.subs.length > 1) {
+    let last = 1;
+    let pos = 1;
+    do {
+      const previousSeq = compilation.seq;
+      compilePolicyStrategy(strat.subs[pos], compilation, cache);
+      if (compilation.seq !== previousSeq) {
+        last = pos;
+      }
+      pos++;
+      if (pos === strat.subs.length) {
+        pos = 1;
+      }
+    } while (pos !== last);
+  }
+
+  return compilation;
+}
+
+function compilePolicyStrategy(
+  strat: PolicyCompilerStrat,
+  compilation: Compilation,
+  cache: Map<string, Compilation>,
+): void {
+  switch (strat.type) {
+    case "ALTERNATIVES":
+      for (const sub of strat.subs) compilePolicyStrategy(sub, compilation, cache);
+      return;
+    case "CACHE": {
+      const subCompilation = getPolicyCompilation(strat, compilation.p, compilation.q, cache);
+      for (const result of subCompilation.results) {
+        addCompilationResult(compilation, result.pair, result.node);
+      }
+      return;
+    }
+    case "JUST_0":
+      addCompilerStrategyResults(compilation, "JUST_0", strat.subs, 0, 0, cache);
+      return;
+    case "JUST_1":
+      addCompilerStrategyResults(compilation, "JUST_1", strat.subs, 0, 0, cache);
+      return;
+    case "AFTER":
+    case "OLDER":
+      addCompilerStrategyResults(compilation, strat.type, strat.subs, 0, 0, cache, { k: strat.k });
+      return;
+    case "HASH160":
+    case "HASH256":
+    case "RIPEMD160":
+    case "SHA256":
+      addCompilerStrategyResults(compilation, strat.type, strat.subs, 0, 0, cache, {
+        data: strat.data,
+      });
+      return;
+    case "PK_K":
+      addCompilerStrategyResults(compilation, "PK_K", strat.subs, 0, 0, cache, {
+        keys: strat.keys,
+      });
+      addCompilerStrategyResults(compilation, "PK_H", strat.subs, 0, 0, cache, {
+        keys: strat.keys,
+      });
+      return;
+    case "MULTI":
+      addCompilerStrategyResults(compilation, "MULTI", strat.subs, strat.k, 0, cache, {
+        k: strat.k,
+        keys: strat.keys,
+      });
+      return;
+    case "WRAP_AS":
+      addCompilerStrategyResults(compilation, "WRAP_A", strat.subs, 0, 0, cache);
+      addCompilerStrategyResults(compilation, "WRAP_S", strat.subs, 0, 0, cache);
+      return;
+    case "WRAP_C":
+      addCompilerStrategyResults(compilation, "WRAP_C", strat.subs, 0, 0, cache);
+      return;
+    case "WRAP_D":
+      addCompilerStrategyResults(compilation, "WRAP_D", strat.subs, 0, 0, cache);
+      return;
+    case "WRAP_N":
+      addCompilerStrategyResults(compilation, "WRAP_N", strat.subs, 0, 0, cache);
+      return;
+    case "WRAP_J":
+      addCompilerStrategyResults(compilation, "WRAP_J", strat.subs, 0, 0, cache);
+      return;
+    case "WRAP_V":
+      addCompilerStrategyResults(compilation, "WRAP_V", strat.subs, 0, 0, cache);
+      return;
+    case "AND": {
+      const rev = [strat.subs[1], strat.subs[0]];
+      if (compilation.q === 0) {
+        addCompilerStrategyResults(compilation, "AND_V", strat.subs, 0, 0, cache);
+        addCompilerStrategyResults(compilation, "AND_V", rev, 0, 0, cache);
+      }
+      addCompilerStrategyResults(compilation, "AND_B", strat.subs, 0, 0, cache);
+      addCompilerStrategyResults(compilation, "AND_B", rev, 0, 0, cache);
+      return;
+    }
+    case "OR": {
+      const rev = [strat.subs[1], strat.subs[0]];
+      const prob = strat.prob;
+      const revProb = 1 - prob;
+      if (compilation.q === 0) {
+        addCompilerStrategyResults(compilation, "OR_C", strat.subs, prob, 0, cache);
+        addCompilerStrategyResults(compilation, "OR_C", rev, revProb, 0, cache);
+      }
+      addCompilerStrategyResults(compilation, "OR_B", strat.subs, prob, 0, cache);
+      addCompilerStrategyResults(compilation, "OR_B", rev, revProb, 0, cache);
+      addCompilerStrategyResults(compilation, "OR_D", strat.subs, prob, 0, cache);
+      addCompilerStrategyResults(compilation, "OR_D", rev, revProb, 0, cache);
+      addCompilerStrategyResults(compilation, "OR_I", strat.subs, prob, 0, cache);
+      addCompilerStrategyResults(compilation, "OR_I", rev, revProb, 0, cache);
+      addCompilerStrategyResults(compilation, "OR_I", strat.subs, prob, 1, cache);
+      addCompilerStrategyResults(compilation, "OR_I", rev, revProb, 1, cache);
+      return;
+    }
+    case "ANDOR": {
+      addCompilerStrategyResults(compilation, "ANDOR", strat.subs, strat.prob, 0, cache);
+      addCompilerStrategyResults(
+        compilation,
+        "ANDOR",
+        [strat.subs[1], strat.subs[0], strat.subs[2]],
+        strat.prob,
+        0,
+        cache,
+      );
+      return;
+    }
+    case "THRESH": {
+      const pqs = getCompilerPqs(
+        "THRESH",
+        compilation.p,
+        compilation.q,
+        strat.prob,
+        strat.subs.length,
+      );
+      const bs: CompileResult[] = [];
+      const ws: CompileResult[] = [];
+      let bPosition = -1;
+      let costDiff = -1;
+
+      for (let i = 0; i < strat.subs.length; i++) {
+        const subCompilation = getPolicyCompilation(strat.subs[i], pqs.ps[i], pqs.qs[i], cache);
+        const bResults = queryCompilation(subCompilation, parseCompilerFilter("Bemdu"));
+        if (bResults.length === 0) return;
+        bs.push(bResults[0]);
+        const wResults = queryCompilation(subCompilation, parseCompilerFilter("Wemdu"));
+        if (wResults.length === 0) return;
+        ws.push(wResults[0]);
+        const diff = ws[ws.length - 1].cost - bs[bs.length - 1].cost;
+        if (diff > costDiff) {
+          costDiff = diff;
+          bPosition = i;
+        }
+      }
+
+      const selected: CompileResult[] = [bs[bPosition]];
+      for (let i = 0; i < strat.subs.length; i++) {
+        if (i !== bPosition) {
+          selected.push(ws[i]);
+        }
+      }
+      addCompilerInner(compilation, "THRESH", selected, strat.prob, { k: strat.k });
+      return;
+    }
+  }
+}
+
+function isSaneCompiledNode(node: MiniscriptFragment): boolean {
+  const analysis = analyzeCompiledNode(node);
+  if (!analysis) return false;
+  return (
+    analysis.type.base === "B" &&
+    isValidCompiledSatisfaction(analysis.type, analysis.scriptSize, analysis.stats) &&
+    analysis.type.m &&
+    analysis.type.k &&
+    analysis.type.s &&
+    collectDuplicateCheckedKeys(node)
+  );
+}
+
+function compilePolicyToMiniscript(
+  node: PolicyNode,
+  config: Record<string, string>,
+  addressType: AddressType,
+): string {
+  const configured = configurePolicyNode(node, config);
+  const state = createPolicyCompilerState();
+  const strategy = computePolicyStrategy(configured, new Map(), state);
+  if (!strategy) {
+    invalid("Invalid policy");
+  }
+
+  const compilation = getPolicyCompilation(strategy, 1, 0, new Map());
+  const results = queryCompilation(compilation, parseCompilerFilter("Bms"));
+  if (results.length !== 1 || !isSaneCompiledNode(results[0].node)) {
+    invalid("Invalid policy");
+  }
+
+  const miniscript = substituteMiniscriptKeys(results[0].node, {}, "");
+  return addressType === "TAPROOT" ? miniscript.replaceAll("multi(", "multi_a(") : miniscript;
 }
 
 export function timelockFromK(isAbsolute: boolean, k: number): Timelock {
@@ -1303,51 +3370,80 @@ export function timelockToMiniscript(lock: Timelock): string {
     : `older(${timelockK(lock)})`;
 }
 
-export function parseMiniscript(
-  expression: string,
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
-): MiniscriptFragment {
+export function parseMiniscript(expression: string, addressType?: AddressType): MiniscriptFragment {
   const node = parseMiniscriptFragment(expression, addressType);
-  validateMiniscriptNode(node, addressType);
-  const type = computeMiniscriptType(node, addressType);
+  const effectiveAddressType = resolveMiniscriptContext(expression, addressType);
+  validateMiniscriptNode(node, effectiveAddressType);
+  return node;
+}
+
+function validateMiniscriptTemplateStrict(expression: string, addressType?: AddressType): void {
+  const node = parseMiniscript(expression, addressType);
+  const effectiveAddressType = resolveMiniscriptContext(expression, addressType);
+  const type = computeMiniscriptType(node, effectiveAddressType);
   if (type.base !== "B") {
     invalid("Invalid miniscript type");
+  }
+  if (
+    computeMiniscriptScriptSize(node, effectiveAddressType) > maxScriptSize(effectiveAddressType)
+  ) {
+    invalid("Miniscript script exceeds maximum script size");
+  }
+  const stats = computeMiniscriptResourceStats(node, effectiveAddressType);
+  if (!checkMiniscriptOpsLimit(stats, effectiveAddressType)) {
+    invalid("Miniscript ops exceed consensus limit");
+  }
+  if (!checkMiniscriptStackSize(type, stats, effectiveAddressType)) {
+    invalid("Miniscript stack size exceeds standard limit");
+  }
+  if (!type.m) {
+    invalid("Miniscript is not non-malleable");
   }
   if (!type.k) {
     invalid("Timelock mixing");
   }
-  return node;
+  if (!type.s) {
+    invalid("Miniscript does not require a signature");
+  }
+  if (!collectDuplicateCheckedKeys(node)) {
+    invalid("Duplicate miniscript key");
+  }
+  if (getMiniscriptStackSize(type, stats) == null) {
+    invalid("Miniscript is not satisfiable");
+  }
+  validateMiniscriptTimelineNode(node);
 }
 
-export function isValidMiniscriptTemplate(
-  expression: string,
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
-): boolean {
-  try {
-    parseMiniscript(expression, addressType);
-    return true;
-  } catch {
-    return false;
-  }
+export function isValidMiniscriptTemplate(expression: string, addressType?: AddressType): boolean {
+  return validateMiniscriptTemplate(expression, addressType).ok;
 }
 
 export function validateMiniscriptTemplate(
   expression: string,
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
+  addressType?: AddressType,
 ): ValidateResult {
-  try {
-    parseMiniscript(expression, addressType);
-    return { ok: true };
-  } catch (error) {
-    return { error: (error as Error).message, ok: false };
+  const cacheKey = `${addressType}\u0000${expression}`;
+  const cached = miniscriptTemplateValidationCache.get(cacheKey);
+  if (cached) {
+    return { ...cached };
   }
+
+  let result: ValidateResult;
+  try {
+    validateMiniscriptTemplateStrict(expression, addressType);
+    result = { ok: true };
+  } catch (error) {
+    result = { error: (error as Error).message, ok: false };
+  }
+  miniscriptTemplateValidationCache.set(cacheKey, result);
+  return { ...result };
 }
 
 export function miniscriptNeedsExplicitVerify(
   node: MiniscriptFragment,
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
+  addressType?: AddressType,
 ): boolean {
-  return computeMiniscriptType(node, addressType).x;
+  return computeMiniscriptType(node, resolveMiniscriptContext("", addressType)).x;
 }
 
 export function parsePolicy(expression: string): PolicyNode {
@@ -1356,7 +3452,7 @@ export function parsePolicy(expression: string): PolicyNode {
 
 export function isValidPolicy(expression: string): boolean {
   try {
-    parsePolicy(expression);
+    compilePolicyToMiniscript(parsePolicy(expression), {}, "NATIVE_SEGWIT");
     return true;
   } catch {
     return false;
@@ -1366,10 +3462,10 @@ export function isValidPolicy(expression: string): boolean {
 export function policyToMiniscript(
   expression: string,
   config: Record<string, string> = {},
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  addressType: AddressType = "NATIVE_SEGWIT",
 ): string {
   const policy = parsePolicy(expression);
-  const miniscript = policyNodeToMiniscript(policy, config, addressType);
+  const miniscript = compilePolicyToMiniscript(policy, config, addressType);
   parseMiniscript(miniscript, addressType);
   return miniscript;
 }
@@ -1381,16 +3477,13 @@ export function flexibleMultisigMiniscriptTemplate(
   newN: number,
   reuseSigners: boolean,
   timelock: Timelock,
-  addressType: MiniscriptAddressType,
+  addressType: AddressType,
 ): string {
   if (m <= 0 || newM <= 0) invalid("m, new_m must be greater than 0");
   if (n <= 0 || newN <= 0) invalid("n, new_n must be greater than 0");
   if (m > n) invalid("m must be less than or equal to n");
   if (newM > newN) invalid("new m must be less than or equal to new n");
-  if (
-    addressType !== MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT &&
-    addressType !== MINISCRIPT_ADDRESS_TYPE_TAPROOT
-  ) {
+  if (addressType !== "NATIVE_SEGWIT" && addressType !== "TAPROOT") {
     invalid("Invalid address type");
   }
 
@@ -1403,7 +3496,7 @@ export function flexibleMultisigMiniscriptTemplate(
     if (total === 1) {
       return `pk(key_${startIndex}${0 < newIndex ? "_1" : "_0"})`;
     }
-    const name = addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT ? "multi_a" : "multi";
+    const name = addressType === "TAPROOT" ? "multi_a" : "multi";
     const keys: string[] = [];
     for (let i = startIndex; i < startIndex + total; i++) {
       keys.push(`key_${i}${i < newIndex ? "_1" : "_0"}`);
@@ -1414,7 +3507,7 @@ export function flexibleMultisigMiniscriptTemplate(
   const nextScript = buildInner(newM, newN, reuseSigners ? 0 : n, reuseSigners ? n : 0);
   const lockScript = timelockToMiniscript(timelock);
 
-  if (addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT) {
+  if (addressType === "TAPROOT") {
     return `{${buildInner(m, n, 0, 0)},and_v(v:${nextScript},${lockScript})}`;
   }
   return `or_d(${buildInner(m, n, 0, 0)},and_v(v:${nextScript},${lockScript}))`;
@@ -1426,7 +3519,7 @@ export function expandingMultisigMiniscriptTemplate(
   newN: number,
   reuseSigners: boolean,
   timelock: Timelock,
-  addressType: MiniscriptAddressType,
+  addressType: AddressType,
 ): string {
   if (n >= newN) invalid("n must be less than new n");
   return flexibleMultisigMiniscriptTemplate(m, n, m, newN, reuseSigners, timelock, addressType);
@@ -1438,7 +3531,7 @@ export function decayingMultisigMiniscriptTemplate(
   newM: number,
   reuseSigners: boolean,
   timelock: Timelock,
-  addressType: MiniscriptAddressType,
+  addressType: AddressType,
 ): string {
   if (m <= newM) invalid("new m must be less than m");
   return flexibleMultisigMiniscriptTemplate(m, n, newM, n, reuseSigners, timelock, addressType);
@@ -1448,7 +3541,7 @@ export function miniscriptTemplateToMiniscript(
   miniscriptTemplate: string,
   signers: Record<string, string>,
   childPath = "/<0;1>/*",
-  addressType: MiniscriptAddressType = MINISCRIPT_ADDRESS_TYPE_ANY,
+  addressType?: AddressType,
 ): string {
   const node = parseMiniscript(miniscriptTemplate, addressType);
   return substituteMiniscriptKeys(node, signers, childPath);
@@ -1564,7 +3657,7 @@ export function subScriptsToScriptNode(subscripts: string[], depths: number[]): 
         const keys = parseMusigInner(node.value).keys;
         return makeScriptNode("MUSIG", [], keys, undefined, keys.length);
       }
-      return miniscriptToScriptNode(parseMiniscript(node.value, MINISCRIPT_ADDRESS_TYPE_ANY));
+      return miniscriptToScriptNode(parseMiniscript(node.value));
     }
     return makeScriptNode(
       "OR_TAPROOT",
@@ -1587,12 +3680,7 @@ export function tapscriptTemplateToTapscript(
   const subscripts = parsed.subscripts.map((subscript) =>
     isValidMusigTemplate(subscript)
       ? getMusigScript(subscript, signers, childPath)
-      : miniscriptTemplateToMiniscript(
-          subscript,
-          signers,
-          childPath,
-          MINISCRIPT_ADDRESS_TYPE_TAPROOT,
-        ),
+      : miniscriptTemplateToMiniscript(subscript, signers, childPath, "TAPROOT"),
   );
 
   return { keypath: parsed.keypath, tapscript: subScriptsToString(subscripts, parsed.depths) };
@@ -1600,8 +3688,7 @@ export function tapscriptTemplateToTapscript(
 
 export function getScriptNode(expression: string): GetScriptNodeResult {
   const trimmed = expression.trim();
-  const tapValidation = validateTapscriptTemplate(trimmed);
-  if (tapValidation.ok || trimmed.startsWith("tr(") || trimmed.startsWith("{")) {
+  if (trimmed.startsWith("tr(") || trimmed.startsWith("{")) {
     const parsed = parseTapscriptTemplate(trimmed);
     if (parsed.subscripts.length > 0) {
       return {
@@ -1614,7 +3701,7 @@ export function getScriptNode(expression: string): GetScriptNodeResult {
     }
   }
 
-  const miniscriptNode = parseMiniscript(trimmed, MINISCRIPT_ADDRESS_TYPE_ANY);
+  const miniscriptNode = parseMiniscript(trimmed);
   return {
     keypath: [],
     node: assignNodeIds(miniscriptToScriptNode(miniscriptNode), [1]),
@@ -1819,10 +3906,16 @@ export class MiniscriptTimeline {
   private addNode(node: ScriptNode): void {
     if (node.type === "AFTER") {
       const timelock = timelockFromK(true, node.k);
+      if (timelockK(timelock) !== node.k) {
+        invalid(timelock.based === "TIME_LOCK" ? "Invalid time value" : "Invalid height value");
+      }
       this.detectTimelockMixing(timelock.based);
       this.absoluteLocks.push(timelock.value);
     } else if (node.type === "OLDER") {
       const timelock = timelockFromK(false, node.k);
+      if (timelockK(timelock) !== node.k) {
+        invalid(timelock.based === "TIME_LOCK" ? "Invalid time value" : "Invalid height value");
+      }
       this.detectTimelockMixing(timelock.based);
       this.relativeLocks.push(timelock.value);
     }
@@ -1947,13 +4040,13 @@ export function parseSignerNames(scriptTemplate: string): { keypathM: number; na
 
 export function buildMiniscriptDescriptor(
   miniscript: string,
-  addressType: MiniscriptAddressType,
+  addressType: AddressType,
   keypath = "",
 ): string {
-  if (addressType === MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT) {
+  if (addressType === "NATIVE_SEGWIT") {
     return withDescriptorChecksum(`wsh(${miniscript})`);
   }
-  if (addressType === MINISCRIPT_ADDRESS_TYPE_TAPROOT) {
+  if (addressType === "TAPROOT") {
     return withDescriptorChecksum(`tr(${keypath},${miniscript})`);
   }
   invalid("Invalid address type");

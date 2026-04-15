@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { formatPoliciesText, type PlatformKeyPolicies } from "./core/platform-key.js";
 import { getGroupDisplayState, getGroupPlatformKeyState } from "./core/sandbox.js";
 import { formatAddressType } from "./core/address-type.js";
+import type { AddressType } from "./core/address-type.js";
 import { loadConfig, getEphemeralKeypair, getNetwork } from "./core/config.js";
 import { isRecord } from "./core/utils.js";
 
@@ -239,7 +240,7 @@ export interface WalletView {
   name: string;
   m: number;
   n: number;
-  addressType: number;
+  addressType: AddressType;
   signers: string[];
   createdAt: string;
   balance?: string;
@@ -249,7 +250,7 @@ export interface WalletView {
 
 export function printWalletResult(wallet: WalletView, cmd: Command): void {
   if (cmd.optsWithGlobals().json) {
-    print({ ...wallet, addressType: formatAddressType(wallet.addressType) }, cmd);
+    print(wallet, cmd);
   } else {
     printWalletHuman(wallet);
   }

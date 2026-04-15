@@ -3,6 +3,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import type { Network } from "./config.js";
+import type { AddressType } from "./address-type.js";
+import { parseDescriptor } from "./descriptor.js";
 import {
   getAccountStorageDir,
   getCliHome,
@@ -12,7 +14,7 @@ import {
 } from "./paths.js";
 
 const ENCRYPTION_VERSION = 0x01;
-const STORAGE_SCHEMA_VERSION = 1;
+const STORAGE_SCHEMA_VERSION = 2;
 const STORAGE_SCHEMA_VERSION_KEY = "schema_version";
 const PROFILE_META_KEY = "profile";
 const HKDF_INFO = "nunchuk-cli/storage/v1";
@@ -226,6 +228,31 @@ function createSchemaTables(db: Database.Database): void {
   `);
 }
 
+function migrateWalletRowsToDescriptorOnly(db: Database.Database): void {
+  const rows = db
+    .prepare("SELECT wallet_id, encrypted FROM wallets ORDER BY rowid")
+    .all() as Record<string, unknown>[];
+  const update = db.prepare("UPDATE wallets SET encrypted = ? WHERE wallet_id = ?");
+
+  for (const row of rows) {
+    if (typeof row.wallet_id !== "string" || !(row.encrypted instanceof Uint8Array)) {
+      throw new Error("Invalid wallet storage row");
+    }
+
+    const stored = deserializeEncrypted<StoredWalletData>(row.encrypted);
+    const wallet = normalizeWalletData(stored);
+    update.run(serializeEncrypted(serializeWalletData(wallet)), row.wallet_id);
+  }
+}
+
+function parseSchemaVersion(version: string): number {
+  const parsed = Number.parseInt(version, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || String(parsed) !== version) {
+    throw new Error(`Unsupported storage schema version: ${version}`);
+  }
+  return parsed;
+}
+
 function initializeSchema(db: Database.Database): void {
   const version = readMeta(db, STORAGE_SCHEMA_VERSION_KEY);
 
@@ -237,11 +264,22 @@ function initializeSchema(db: Database.Database): void {
     return;
   }
 
-  if (version !== String(STORAGE_SCHEMA_VERSION)) {
+  const currentVersion = parseSchemaVersion(version);
+  if (currentVersion > STORAGE_SCHEMA_VERSION) {
     throw new Error(`Unsupported storage schema version: ${version}`);
   }
 
-  createSchemaTables(db);
+  if (currentVersion === STORAGE_SCHEMA_VERSION) {
+    return;
+  }
+
+  runInTransaction(db, () => {
+    createSchemaTables(db);
+    if (currentVersion < 2) {
+      migrateWalletRowsToDescriptorOnly(db);
+    }
+    writeMeta(db, STORAGE_SCHEMA_VERSION_KEY, String(STORAGE_SCHEMA_VERSION));
+  });
 }
 
 function runInTransaction<T>(db: Database.Database, fn: () => T): T {
@@ -365,10 +403,6 @@ export function loadProfile(email: string, network: Network): Profile | null {
 
 // ── Sandbox storage ──────────────────────────────────────────────────
 
-interface SandboxStore {
-  sandboxIds: string[];
-}
-
 export function addSandboxId(email: string, network: Network, sandboxId: string): void {
   const db = getDatabase(email, network, { create: true });
   db?.prepare(
@@ -416,11 +450,45 @@ export interface WalletData {
   name: string;
   m: number;
   n: number;
-  addressType: number;
+  addressType: AddressType;
   descriptor: string;
   signers: string[];
   secretboxKey: string; // base64-encoded 32-byte key
   createdAt: string;
+}
+
+type StoredWalletData = Pick<
+  WalletData,
+  "createdAt" | "descriptor" | "gid" | "groupId" | "name" | "secretboxKey" | "walletId"
+> & {
+  // Legacy fields kept optional for old encrypted rows. New saves derive these from descriptor.
+  addressType?: AddressType | number;
+  m?: number;
+  n?: number;
+  signers?: string[];
+};
+
+function normalizeWalletData(wallet: StoredWalletData): WalletData {
+  const parsed = parseDescriptor(wallet.descriptor);
+  return {
+    ...wallet,
+    addressType: parsed.addressType,
+    m: parsed.m,
+    n: parsed.n,
+    signers: parsed.signers,
+  };
+}
+
+function serializeWalletData(wallet: WalletData): StoredWalletData {
+  return {
+    createdAt: wallet.createdAt,
+    descriptor: wallet.descriptor,
+    gid: wallet.gid,
+    groupId: wallet.groupId,
+    name: wallet.name,
+    secretboxKey: wallet.secretboxKey,
+    walletId: wallet.walletId,
+  };
 }
 
 export function saveWallet(email: string, network: Network, wallet: WalletData): void {
@@ -431,15 +499,16 @@ export function saveWallet(email: string, network: Network, wallet: WalletData):
       VALUES (?, ?)
       ON CONFLICT(wallet_id) DO UPDATE SET encrypted = excluded.encrypted
     `,
-  ).run(wallet.walletId, serializeEncrypted(wallet));
+  ).run(wallet.walletId, serializeEncrypted(serializeWalletData(wallet)));
 }
 
 export function loadWallet(email: string, network: Network, walletId: string): WalletData | null {
-  return encryptedRead<WalletData>(email, network, "wallets", walletId);
+  const wallet = encryptedRead<StoredWalletData>(email, network, "wallets", walletId);
+  return wallet ? normalizeWalletData(wallet) : null;
 }
 
 export function listWallets(email: string, network: Network): WalletData[] {
-  return encryptedList<WalletData>("wallets", email, network);
+  return encryptedList<StoredWalletData>("wallets", email, network).map(normalizeWalletData);
 }
 
 export function removeWallet(email: string, network: Network, walletId: string): void {

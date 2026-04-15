@@ -11,10 +11,10 @@ import { parseDescriptor, parseSignerDescriptor, type ParsedDescriptor } from ".
 import {
   miniscriptNeedsExplicitVerify,
   parseMiniscript,
-  type MiniscriptAddressType,
   type MiniscriptFragment,
 } from "./miniscript.js";
 import type { Network } from "./config.js";
+import type { AddressType } from "./address-type.js";
 
 const base58check = createBase58check(sha256);
 
@@ -75,7 +75,7 @@ export function comparePubkeys(a: Uint8Array, b: Uint8Array): number {
 export function deriveFirstAddress(
   signers: string[],
   m: number,
-  addressType: number,
+  addressType: AddressType,
   network: Network,
 ): string {
   // Derive child pubkeys at receive path /0/0
@@ -94,13 +94,13 @@ export function deriveFirstAddress(
   const redeemScript = buildMultisigScript(pubkeys, m);
   const isMainnet = network === "mainnet";
 
-  if (addressType === 3) {
+  if (addressType === "NATIVE_SEGWIT") {
     // NATIVE_SEGWIT: P2WSH — bech32(witness_v0, SHA256(script))
     const scriptHash = sha256(redeemScript);
     const prefix = isMainnet ? "bc" : "tb";
     const words = bech32.toWords(scriptHash);
     return bech32.encode(prefix, [0, ...words]);
-  } else if (addressType === 2) {
+  } else if (addressType === "NESTED_SEGWIT") {
     // NESTED_SEGWIT: P2SH-P2WSH — base58check(0x05, HASH160(0x0020 || SHA256(script)))
     const scriptHash = sha256(redeemScript);
     const witnessProgram = new Uint8Array(34);
@@ -113,7 +113,7 @@ export function deriveFirstAddress(
     payload[0] = version;
     payload.set(h160, 1);
     return base58check.encode(payload);
-  } else if (addressType === 1) {
+  } else if (addressType === "LEGACY") {
     // LEGACY: P2SH — base58check(0x05, HASH160(script))
     const h160 = hash160(redeemScript);
     const version = isMainnet ? 0x05 : 0xc4;
@@ -131,7 +131,7 @@ export function deriveFirstAddress(
 export function deriveAddresses(
   signers: string[],
   m: number,
-  addressType: number,
+  addressType: AddressType,
   network: Network,
   chain: 0 | 1, // 0 = receive, 1 = change
   startIndex: number,
@@ -158,12 +158,12 @@ export function deriveAddresses(
 
     const redeemScript = buildMultisigScript(pubkeys, m);
 
-    if (addressType === 3) {
+    if (addressType === "NATIVE_SEGWIT") {
       const scriptHash = sha256(redeemScript);
       const prefix = isMainnet ? "bc" : "tb";
       const words = bech32.toWords(scriptHash);
       addresses.push(bech32.encode(prefix, [0, ...words]));
-    } else if (addressType === 2) {
+    } else if (addressType === "NESTED_SEGWIT") {
       const scriptHash = sha256(redeemScript);
       const witnessProgram = new Uint8Array(34);
       witnessProgram[0] = 0x00;
@@ -175,7 +175,7 @@ export function deriveAddresses(
       payload[0] = version;
       payload.set(h160, 1);
       addresses.push(base58check.encode(payload));
-    } else if (addressType === 1) {
+    } else if (addressType === "LEGACY") {
       const h160 = hash160(redeemScript);
       const version = isMainnet ? 0x05 : 0xc4;
       const payload = new Uint8Array(21);
@@ -206,7 +206,7 @@ export type MultisigPayment = WalletPayment;
 export function deriveMultisigPayment(
   signers: string[],
   m: number,
-  addressType: number,
+  addressType: AddressType,
   network: Network,
   chain: 0 | 1,
   index: number,
@@ -239,7 +239,7 @@ export function deriveMultisigPayment(
   // Use @scure/btc-signer payment helpers
   const ms = p2ms(m, sortedPubkeys);
 
-  if (addressType === 3) {
+  if (addressType === "NATIVE_SEGWIT") {
     // P2WSH
     const payment = p2wsh(ms, btcNet);
     return {
@@ -248,7 +248,7 @@ export function deriveMultisigPayment(
       witnessScript: payment.witnessScript,
       bip32Derivation,
     };
-  } else if (addressType === 2) {
+  } else if (addressType === "NESTED_SEGWIT") {
     // P2SH-P2WSH
     const inner = p2wsh(ms, btcNet);
     const payment = p2sh(inner, btcNet);
@@ -259,7 +259,7 @@ export function deriveMultisigPayment(
       redeemScript: payment.redeemScript,
       bip32Derivation,
     };
-  } else if (addressType === 1) {
+  } else if (addressType === "LEGACY") {
     // P2SH
     const payment = p2sh(ms, btcNet);
     return {
@@ -371,7 +371,7 @@ function deriveKeyExpression(
 function compileMiniscriptFragment(
   node: MiniscriptFragment,
   resolveKey: (keyExpression: string) => DerivedKeyInfo,
-  addressType: MiniscriptAddressType,
+  addressType: AddressType,
   verify = false,
 ): Uint8Array {
   switch (node.fragment) {
@@ -603,9 +603,9 @@ function deriveMiniscriptPaymentFromParsed(
   network: Network,
   chain: 0 | 1,
   index: number,
-  fragment = parseMiniscript(requireMiniscriptBody(parsed), parsed.addressType as 3),
+  fragment = parseMiniscript(requireMiniscriptBody(parsed), parsed.addressType),
 ): WalletPayment {
-  if (parsed.addressType !== 3) {
+  if (parsed.addressType !== "NATIVE_SEGWIT") {
     throw new Error("Only native segwit miniscript wallets are currently supported");
   }
 
@@ -621,11 +621,7 @@ function deriveMiniscriptPaymentFromParsed(
     return derived;
   };
 
-  const witnessScript = compileMiniscriptFragment(
-    fragment,
-    resolveKey,
-    parsed.addressType as MiniscriptAddressType,
-  );
+  const witnessScript = compileMiniscriptFragment(fragment, resolveKey, parsed.addressType);
   const witnessScriptHash = sha256(witnessScript);
   const prefix = network === "mainnet" ? "bc" : "tb";
   const bip32Derivation: WalletPayment["bip32Derivation"] = [];
@@ -657,7 +653,7 @@ function deriveDescriptorMiniscriptKeysFromParsed(
   network: Network,
   chain: 0 | 1,
   index: number,
-  fragment = parseMiniscript(requireMiniscriptBody(parsed), parsed.addressType as 3),
+  fragment = parseMiniscript(requireMiniscriptBody(parsed), parsed.addressType),
 ): DescriptorMiniscriptKeyInfo[] {
   const versions = network === "mainnet" ? MAINNET_VERSIONS : TESTNET_VERSIONS;
   const cache = new Map<string, DerivedKeyInfo>();
@@ -731,7 +727,7 @@ export function deriveDescriptorAddresses(
     );
   }
 
-  const fragment = parseMiniscript(requireMiniscriptBody(parsed), parsed.addressType as 3);
+  const fragment = parseMiniscript(requireMiniscriptBody(parsed), parsed.addressType);
   const addresses: string[] = [];
   for (let index = startIndex; index < startIndex + count; index++) {
     addresses.push(

@@ -8,9 +8,8 @@ import type { ParsedDescriptor } from "./descriptor.js";
 import { deriveRootKeyFromDescriptor, deriveSecretboxKey, deriveGID } from "./wallet-keys.js";
 import type { Network } from "./config.js";
 import type { PlatformKeyPolicies, PlatformKeyConfig } from "./platform-key.js";
-import { ADDRESS_TYPE_TO_NUMBER, type AddressType } from "./address-type.js";
+import { ADDRESS_TYPE_TO_NUMBER, numberToAddressType, type AddressType } from "./address-type.js";
 import {
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
   miniscriptTemplateToMiniscript,
   parseSignerNames,
   validateMiniscriptTemplate,
@@ -208,14 +207,11 @@ function getMiniscriptTemplateMetadata(
   miniscriptTemplate: string,
   addressType: number,
 ): { keypathM: number; slotNames: string[] } {
-  if (addressType !== MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT) {
+  if (addressType !== ADDRESS_TYPE_TO_NUMBER.NATIVE_SEGWIT) {
     throw new Error("Only native segwit miniscript sandboxes are supported yet");
   }
 
-  const validation = validateMiniscriptTemplate(
-    miniscriptTemplate,
-    MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-  );
+  const validation = validateMiniscriptTemplate(miniscriptTemplate, "NATIVE_SEGWIT");
   if (!validation.ok) {
     throw new Error(validation.error ?? "Invalid miniscript template");
   }
@@ -283,7 +279,8 @@ function buildParsedDescriptorFromGroup(
   signers: string[],
   pubstate: Record<string, unknown>,
 ): ParsedDescriptor {
-  const addressType = Number(pubstate.addressType ?? 0);
+  const addressTypeNumber = Number(pubstate.addressType ?? 0);
+  const addressType = numberToAddressType(addressTypeNumber);
   const metadata = getGroupDescriptorMetadata(pubstate);
 
   if (metadata.kind === "multisig") {
@@ -308,7 +305,7 @@ function buildParsedDescriptorFromGroup(
     metadata.miniscriptTemplate,
     namedSigners,
     "/<0;1>/*",
-    MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+    "NATIVE_SEGWIT",
   );
 
   return {
@@ -630,7 +627,7 @@ export interface FinalizeResult {
   secretboxKey: Uint8Array;
   m: number;
   n: number;
-  addressType: number;
+  addressType: AddressType;
   name: string;
 }
 
@@ -687,7 +684,7 @@ export async function buildFinalizeBody(
     pubstate: {
       m,
       n,
-      addressType,
+      addressType: ADDRESS_TYPE_TO_NUMBER[addressType],
       walletTemplate: 0,
       miniscriptTemplate:
         typeof pubstate.miniscriptTemplate === "string" ? pubstate.miniscriptTemplate : "",

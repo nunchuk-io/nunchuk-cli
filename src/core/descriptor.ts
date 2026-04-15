@@ -1,6 +1,8 @@
 // Bitcoin output descriptor builder and checksum
 // Reference: libnunchuk src/descriptor.cpp
 
+import type { AddressType } from "./address-type.js";
+
 const INPUT_CHARSET =
   "0123456789()[],'/*abcdefgh@:$%{}" +
   "IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~" +
@@ -90,14 +92,18 @@ function formatSignerKey(desc: string, childPath: string): string {
 // Build wallet descriptor for DescriptorPath::EXTERNAL_INTERNAL (appends /<0;1>/*)
 // This is the standard format used by mobile apps (BIP-389 multipath descriptors)
 // Reference: GetDescriptorForSigners in descriptor.cpp:240-328
-export function buildWalletDescriptor(signers: string[], m: number, addressType: number): string {
+export function buildWalletDescriptor(
+  signers: string[],
+  m: number,
+  addressType: AddressType,
+): string {
   return addChecksum(buildDescriptorBody(signers, m, addressType, "/<0;1>/*"));
 }
 
 // Build wallet descriptor for DescriptorPath::ANY (appends /*)
 // Used as PBKDF2 input for key derivation — must match SoftwareSigner behavior
 // Reference: SoftwareSigner(Wallet) in softwaresigner.cpp:97-98
-export function buildAnyDescriptor(signers: string[], m: number, addressType: number): string {
+export function buildAnyDescriptor(signers: string[], m: number, addressType: AddressType): string {
   return addChecksum(buildDescriptorBody(signers, m, addressType, "/*"));
 }
 
@@ -105,16 +111,16 @@ export function buildAnyDescriptor(signers: string[], m: number, addressType: nu
 function buildDescriptorBody(
   signers: string[],
   m: number,
-  addressType: number,
+  addressType: AddressType,
   childPath: string,
 ): string {
   const keys = signers.map((s) => formatSignerKey(s, childPath));
 
-  if (addressType === 3) {
+  if (addressType === "NATIVE_SEGWIT") {
     return `wsh(sortedmulti(${m},${keys.join(",")}))`;
-  } else if (addressType === 2) {
+  } else if (addressType === "NESTED_SEGWIT") {
     return `sh(wsh(sortedmulti(${m},${keys.join(",")})))`;
-  } else if (addressType === 1) {
+  } else if (addressType === "LEGACY") {
     return `sh(sortedmulti(${m},${keys.join(",")}))`;
   } else {
     throw new Error("Taproot descriptor not yet supported");
@@ -123,13 +129,17 @@ function buildDescriptorBody(
 
 // Build wallet descriptor for DescriptorPath::EXTERNAL_ALL (appends /0/*)
 // Reference: GetDescriptorForSigners in descriptor.cpp
-export function buildExternalDescriptor(signers: string[], m: number, addressType: number): string {
+export function buildExternalDescriptor(
+  signers: string[],
+  m: number,
+  addressType: AddressType,
+): string {
   return addChecksum(buildDescriptorBody(signers, m, addressType, "/0/*"));
 }
 
 // Derive local walletId — checksum of external descriptor (raw, no checksum suffix)
 // Reference: GetWalletId in descriptor.cpp:345-349
-export function getWalletId(signers: string[], m: number, addressType: number): string {
+export function getWalletId(signers: string[], m: number, addressType: AddressType): string {
   return descriptorChecksum(buildDescriptorBody(signers, m, addressType, "/0/*"));
 }
 
@@ -144,16 +154,16 @@ export interface ParsedDescriptor {
   kind: DescriptorKind;
   m: number;
   n: number;
-  addressType: number; // 3=NATIVE_SEGWIT, 2=NESTED_SEGWIT, 1=LEGACY
+  addressType: AddressType;
   signers: string[]; // ["[xfp/path]xpub", ...] — paths use ' notation
   miniscript?: string;
 }
 
 // Wrapper prefixes → addressType, ordered longest-first to avoid false matches
-const WRAPPER_PREFIXES: Array<{ prefix: string; suffix: string; addressType: number }> = [
-  { prefix: "sh(wsh(sortedmulti(", suffix: ")))", addressType: 2 },
-  { prefix: "wsh(sortedmulti(", suffix: "))", addressType: 3 },
-  { prefix: "sh(sortedmulti(", suffix: "))", addressType: 1 },
+const WRAPPER_PREFIXES: Array<{ prefix: string; suffix: string; addressType: AddressType }> = [
+  { prefix: "sh(wsh(sortedmulti(", suffix: ")))", addressType: "NESTED_SEGWIT" },
+  { prefix: "wsh(sortedmulti(", suffix: "))", addressType: "NATIVE_SEGWIT" },
+  { prefix: "sh(sortedmulti(", suffix: "))", addressType: "LEGACY" },
 ];
 
 // Regex to strip child path suffixes from xpub: /0/*, /*, /<0;1>/*
@@ -199,10 +209,10 @@ function requireMiniscriptBody(parsed: ParsedDescriptor): string {
 
 function buildMiniscriptDescriptorBody(
   miniscript: string,
-  addressType: number,
+  addressType: AddressType,
   childPath: string,
 ): string {
-  if (addressType !== 3) {
+  if (addressType !== "NATIVE_SEGWIT") {
     throw new Error("Only native segwit miniscript descriptors are currently supported");
   }
   return `wsh(${normalizeMiniscriptBody(miniscript, childPath)})`;
@@ -264,7 +274,7 @@ export function parseDescriptor(descriptor: string): ParsedDescriptor {
 
   // 2. Detect wrapper → addressType
   let innerContent: string | null = null;
-  let addressType = 0;
+  let addressType: AddressType | undefined;
   for (const w of WRAPPER_PREFIXES) {
     if (body.startsWith(w.prefix) && body.endsWith(w.suffix)) {
       innerContent = body.slice(w.prefix.length, body.length - w.suffix.length);
@@ -281,12 +291,16 @@ export function parseDescriptor(descriptor: string): ParsedDescriptor {
         kind: "miniscript",
         m: 0,
         n: signers.length,
-        addressType: 3,
+        addressType: "NATIVE_SEGWIT",
         signers,
         miniscript,
       };
     }
 
+    throw new Error("Could not parse descriptor: unsupported wrapper");
+  }
+  const resolvedAddressType = addressType;
+  if (!resolvedAddressType) {
     throw new Error("Could not parse descriptor: unsupported wrapper");
   }
 
@@ -317,7 +331,7 @@ export function parseDescriptor(descriptor: string): ParsedDescriptor {
     kind: "multisig",
     m,
     n: signers.length,
-    addressType,
+    addressType: resolvedAddressType,
     signers,
   };
 }
