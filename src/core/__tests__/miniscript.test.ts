@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-  MINISCRIPT_ADDRESS_TYPE_TAPROOT,
   UNDETERMINED_TIMELOCK_VALUE,
   buildMiniscriptDescriptor,
   createTimelock,
@@ -47,41 +45,19 @@ const TEST_SIGNERS: Record<string, string> = {
 describe("miniscript templates", () => {
   it("builds expanding multisig for native segwit", () => {
     expect(
-      expandingMultisigMiniscriptTemplate(
-        2,
-        2,
-        3,
-        true,
-        HEIGHT_RELATIVE_LOCK,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
+      expandingMultisigMiniscriptTemplate(2, 2, 3, true, HEIGHT_RELATIVE_LOCK, "NATIVE_SEGWIT"),
     ).toBe("or_d(multi(2,key_0_0,key_1_0),and_v(v:multi(2,key_0_1,key_1_1,key_2_0),older(1)))");
   });
 
   it("builds decaying multisig for native segwit", () => {
     expect(
-      decayingMultisigMiniscriptTemplate(
-        2,
-        2,
-        1,
-        true,
-        HEIGHT_RELATIVE_LOCK,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
+      decayingMultisigMiniscriptTemplate(2, 2, 1, true, HEIGHT_RELATIVE_LOCK, "NATIVE_SEGWIT"),
     ).toBe("or_d(multi(2,key_0_0,key_1_0),and_v(v:multi(1,key_0_1,key_1_1),older(1)))");
   });
 
   it("builds flexible multisig for taproot", () => {
     expect(
-      flexibleMultisigMiniscriptTemplate(
-        2,
-        2,
-        1,
-        3,
-        false,
-        HEIGHT_RELATIVE_LOCK,
-        MINISCRIPT_ADDRESS_TYPE_TAPROOT,
-      ),
+      flexibleMultisigMiniscriptTemplate(2, 2, 1, 3, false, HEIGHT_RELATIVE_LOCK, "TAPROOT"),
     ).toBe("{multi_a(2,key_0_0,key_1_0),and_v(v:multi_a(1,key_2_0,key_3_0,key_4_0),older(1))}");
   });
 });
@@ -90,41 +66,73 @@ describe("policy conversion", () => {
   it("validates policy syntax", () => {
     expect(isValidPolicy("and(pk(alice),after(144))")).toBe(true);
     expect(isValidPolicy("and(pk(alice),)")).toBe(false);
+    expect(isValidPolicy("and(pk(alice),pk(bob),pk(carol))")).toBe(false);
+    expect(isValidPolicy("or(0@pk(alice),pk(bob))")).toBe(false);
   });
 
   it("converts simple policies to miniscript", () => {
     expect(policyToMiniscript("and(pk(alice),after(144))")).toBe("and_v(v:pk(alice),after(144))");
-    expect(policyToMiniscript("or(pk(alice),pk(bob))")).toBe("or_i(pk(alice),pk(bob))");
+    expect(policyToMiniscript("or(pk(alice),pk(bob))")).toBe("or_b(pk(alice),s:pk(bob))");
   });
 
   it("converts threshold key policies to multi/multi_a", () => {
     expect(policyToMiniscript("thresh(2,pk(a),pk(b),pk(c))")).toBe("multi(2,a,b,c)");
-    expect(
-      policyToMiniscript("thresh(2,pk(a),pk(b),pk(c))", {}, MINISCRIPT_ADDRESS_TYPE_TAPROOT),
-    ).toBe("multi_a(2,a,b,c)");
+    expect(policyToMiniscript("thresh(2,pk(a),pk(b),pk(c))", {}, "TAPROOT")).toBe(
+      "multi_a(2,a,b,c)",
+    );
   });
 });
 
 describe("miniscript validation and substitution", () => {
   it("rejects taproot-only fragments in native segwit", () => {
-    expect(isValidMiniscriptTemplate("multi_a(2,a,b)", MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT)).toBe(
-      false,
-    );
+    expect(isValidMiniscriptTemplate("multi_a(2,a,b)", "NATIVE_SEGWIT")).toBe(false);
   });
 
   it("rejects mixed time- and height-locks", () => {
-    expect(
-      isValidMiniscriptTemplate(
-        "and_v(v:after(1),after(500000000))",
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
-    ).toBe(false);
+    expect(isValidMiniscriptTemplate("and_v(v:after(1),after(500000000))", "NATIVE_SEGWIT")).toBe(
+      false,
+    );
   });
 
   it("substitutes signer descriptors into miniscript templates", () => {
     expect(miniscriptTemplateToMiniscript("multi(2,key_0_0,key_1_0)", TEST_SIGNERS, "/*")).toBe(
       "multi(2,[534a4a82/48'/1'/0'/2']tpubDFeha94AzbvqSzMLj6iihYeP1zwfW3KgNcmd7oXvKD9dApjWK4KT1RzzbSNUgmsgBs8sshky7pLTUZahkfPTNVck2fwS5wXyn1nTAy8jZCJ/*,[4bda0966/48'/1'/0'/2']tpubDFTwhyhyq2m2eQGCGQvzgZocFVsQAyjYCAMdGs9ahzTsvd49M3ekAiZvpzyjXF57FpC5zm8NVEPgnptFGSdzM6aZcWVrB6cqVC7fXhXzW6s/*)",
     );
+  });
+
+  it("accepts compact wrapper chains in miniscript templates", () => {
+    const template = "thresh(3,pk(key_1),s:pk(key_2),s:pk(key_3),sln:older(12960))";
+
+    expect(isValidMiniscriptTemplate(template, "NATIVE_SEGWIT")).toBe(true);
+    expect(parseSignerNames(template)).toEqual({
+      keypathM: 0,
+      names: ["key_1", "key_2", "key_3"],
+    });
+  });
+
+  it("applies wrappers to constants like libnunchuk", () => {
+    expect(miniscriptTemplateToMiniscript("n:0", {}, "")).toBe("n:0");
+    expect(miniscriptTemplateToMiniscript("l:1", {}, "")).toBe("l:1");
+    expect(miniscriptTemplateToMiniscript("u:1", {}, "")).toBe("u:1");
+  });
+
+  it("rejects consecutive verify wrappers like libnunchuk", () => {
+    expect(isValidMiniscriptTemplate("vv:pk(key_1)", "NATIVE_SEGWIT")).toBe(false);
+  });
+
+  it("rejects separated wrapper groups like libnunchuk", () => {
+    expect(isValidMiniscriptTemplate("s:l:n:older(12960)", "NATIVE_SEGWIT")).toBe(false);
+  });
+
+  it("rejects empty and separated miniscript arguments like libnunchuk", () => {
+    for (const template of [
+      "multi(1,key_1,)",
+      "multi(1,,key_1)",
+      "thresh(1,pk(key_1),)",
+      "and_v(v:pk(key_1), pk(key_2))",
+    ]) {
+      expect(isValidMiniscriptTemplate(template, "NATIVE_SEGWIT")).toBe(false);
+    }
   });
 });
 
@@ -260,7 +268,7 @@ describe("timeline and timelock helpers", () => {
 
 describe("descriptor and satisfiability helpers", () => {
   it("builds miniscript descriptors", () => {
-    expect(buildMiniscriptDescriptor("pk(alice)", MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT)).toMatch(
+    expect(buildMiniscriptDescriptor("pk(alice)", "NATIVE_SEGWIT")).toMatch(
       /^wsh\(pk\(alice\)\)#.{8}$/,
     );
   });

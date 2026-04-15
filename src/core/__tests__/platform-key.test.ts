@@ -15,7 +15,7 @@ import {
 } from "../platform-key.js";
 import { TESTNET_VERSIONS } from "../address.js";
 import { buildWalletDescriptor } from "../descriptor.js";
-import { buildMiniscriptDescriptor, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT } from "../miniscript.js";
+import { buildMiniscriptDescriptor } from "../miniscript.js";
 import { signWalletPsbtWithKey } from "../psbt-sign.js";
 import { encryptWalletPayload, decryptWalletPayload } from "../wallet-keys.js";
 import type { WalletData } from "../storage.js";
@@ -597,7 +597,7 @@ const TEST_WALLET: WalletData = {
   name: "Wallet 1",
   m: 2,
   n: 3,
-  addressType: 3,
+  addressType: "NATIVE_SEGWIT",
   descriptor: buildWalletDescriptor(
     [
       "[b9a14f1a/48'/1'/0'/2']tpubDDuXvjq5jan2EVqnJpQjUcUAhYWVf4rrfuAgPp2oLqeGE6eZXvci5dbzuwpHdHrmGVzeBVZSCLavn4Fr5sYAd5PtzcufWwNH78KpUm37RRs",
@@ -605,7 +605,7 @@ const TEST_WALLET: WalletData = {
       "[ecfed4c1/48'/1'/45'/2']tpubDEeLpUMN5J595ocbHwWGyX39k7X8Jae5DqyQe5csXgJAnUZsAKrP6dhy2WDtxXvMmYCGTXo5eUuMAKV9dQryVyx3kW1EZnLXtcTTxsBvrnD",
     ],
     2,
-    3,
+    "NATIVE_SEGWIT",
   ),
   signers: [
     "[b9a14f1a/48'/1'/0'/2']tpubDDuXvjq5jan2EVqnJpQjUcUAhYWVf4rrfuAgPp2oLqeGE6eZXvci5dbzuwpHdHrmGVzeBVZSCLavn4Fr5sYAd5PtzcufWwNH78KpUm37RRs",
@@ -636,7 +636,7 @@ describe("createDummyPsbt", () => {
       m: 0,
       descriptor: buildMiniscriptDescriptor(
         `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),pk(${TEST_WALLET.signers[1]}/<0;1>/*))`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        "NATIVE_SEGWIT",
       ),
     };
 
@@ -651,7 +651,7 @@ describe("createDummyPsbt", () => {
       m: 0,
       descriptor: buildMiniscriptDescriptor(
         `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),pk(${TEST_WALLET.signers[1]}/<0;1>/*))`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        "NATIVE_SEGWIT",
       ),
     };
     const psbt = createDummyPsbt(miniscriptWallet, TEST_REQUEST_BODY, "testnet");
@@ -669,7 +669,7 @@ describe("createDummyPsbt", () => {
       m: 0,
       descriptor: buildMiniscriptDescriptor(
         `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),older(10))`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        "NATIVE_SEGWIT",
       ),
     };
 
@@ -683,7 +683,7 @@ describe("createDummyPsbt", () => {
       m: 0,
       descriptor: buildMiniscriptDescriptor(
         `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        "NATIVE_SEGWIT",
       ),
     };
 

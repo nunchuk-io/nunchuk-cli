@@ -10,7 +10,7 @@ import {
   deriveDescriptorPayment,
 } from "../address.js";
 import { parseSignerDescriptor } from "../descriptor.js";
-import { buildMiniscriptDescriptor, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT } from "../miniscript.js";
+import { buildMiniscriptDescriptor } from "../miniscript.js";
 
 const TEST_SIGNERS = [
   "[534a4a82/48'/1'/0'/2']tpubDFeha94AzbvqSzMLj6iihYeP1zwfW3KgNcmd7oXvKD9dApjWK4KT1RzzbSNUgmsgBs8sshky7pLTUZahkfPTNVck2fwS5wXyn1nTAy8jZCJ",
@@ -19,7 +19,7 @@ const TEST_SIGNERS = [
 
 const MINISCRIPT_DESCRIPTOR = buildMiniscriptDescriptor(
   `and_v(v:pk(${TEST_SIGNERS[0]}/<0;1>/*),pk(${TEST_SIGNERS[1]}/<0;1>/*))`,
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  "NATIVE_SEGWIT",
 );
 
 function derivePubkey(signer: string, chain: 0 | 1, index: number): Uint8Array {

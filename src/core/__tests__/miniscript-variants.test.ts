@@ -253,7 +253,7 @@ function createWallet(descriptor: string): WalletData {
     name: "Four-key miniscript",
     m: 0,
     n: TEST_SIGNERS.length,
-    addressType: 3,
+    addressType: "NATIVE_SEGWIT",
     descriptor,
     signers: TEST_SIGNERS.map((signer) => signer.descriptor),
     secretboxKey: "test",

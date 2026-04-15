@@ -5,7 +5,7 @@ import { Transaction, TEST_NETWORK } from "@scure/btc-signer";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { deriveDescriptorAddresses, TESTNET_VERSIONS } from "../address.js";
 import { addressToScripthash } from "../electrum.js";
-import { buildMiniscriptDescriptor, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT } from "../miniscript.js";
+import { buildMiniscriptDescriptor } from "../miniscript.js";
 import { finalizeMiniscriptPsbt } from "../miniscript-finalize.js";
 import { signWalletPsbtWithKey } from "../psbt-sign.js";
 import { combinePendingPsbt, createTransaction, decodePsbtDetail } from "../transaction.js";
@@ -21,7 +21,7 @@ const TEST_WALLET: WalletData = {
   name: "Wallet 1",
   m: 2,
   n: 3,
-  addressType: 3,
+  addressType: "NATIVE_SEGWIT",
   descriptor: "",
   signers: [
     "[b9a14f1a/48'/1'/0'/2']tpubDDuXvjq5jan2EVqnJpQjUcUAhYWVf4rrfuAgPp2oLqeGE6eZXvci5dbzuwpHdHrmGVzeBVZSCLavn4Fr5sYAd5PtzcufWwNH78KpUm37RRs",
@@ -196,7 +196,7 @@ describe("createTransaction miniscript", () => {
   it("uses absolute timelocks as transaction locktime", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -230,7 +230,7 @@ describe("createTransaction miniscript", () => {
   it("uses relative timelocks as input sequence", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),older(10))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -265,7 +265,7 @@ describe("createTransaction miniscript", () => {
   it("uses an explicit miniscript path selection when provided", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `or_d(pk(${TEST_WALLET.signers[0]}/<0;1>/*),and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10)))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -307,7 +307,7 @@ describe("createTransaction miniscript", () => {
     const futureLocktime = 2_100_000_000;
     const descriptor = buildMiniscriptDescriptor(
       `or_d(pk(${TEST_WALLET.signers[0]}/<0;1>/*),and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),after(${futureLocktime})))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -363,7 +363,7 @@ describe("createTransaction miniscript", () => {
   it("signs miniscript PSBT inputs with the local fallback signer", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),pk(${TEST_WALLET.signers[1]}/<0;1>/*))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -400,7 +400,7 @@ describe("createTransaction miniscript", () => {
   it("reports partial progress for miniscript multi branches", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:multi(2,${TEST_WALLET.signers[0]}/<0;1>/*,${TEST_WALLET.signers[1]}/<0;1>/*,${TEST_WALLET.signers[2]}/<0;1>/*),after(1))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -452,7 +452,7 @@ describe("createTransaction miniscript", () => {
   it("finalizes a signed miniscript PSBT locally", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -489,7 +489,7 @@ describe("createTransaction miniscript", () => {
   it("finalizes hashed-key miniscript PSBTs locally", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `pkh(${TEST_WALLET.signers[1]}/<0;1>/*)`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -526,7 +526,7 @@ describe("createTransaction miniscript", () => {
   it("marks a satisfiable miniscript PSBT as ready to broadcast", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `or_i(pk(${TEST_WALLET.signers[1]}/<0;1>/*),after(144))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -574,7 +574,7 @@ describe("createTransaction miniscript", () => {
   it("does not over-attribute signer fingerprints for server-style finalized miniscript PSBTs", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:multi(2,${TEST_WALLET.signers[0]}/<0;1>/*,${TEST_WALLET.signers[1]}/<0;1>/*,${TEST_WALLET.signers[2]}/<0;1>/*),after(1))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
@@ -638,7 +638,7 @@ describe("createTransaction miniscript", () => {
     const digest = hex.encode(sha256(preimage));
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),sha256(${digest}))`,
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { getNextReceiveAddress, getWalletBalance, scanUtxos } from "../transaction.js";
 import { deriveAddresses, deriveDescriptorAddresses } from "../address.js";
 import { buildWalletDescriptor } from "../descriptor.js";
-import { buildMiniscriptDescriptor, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT } from "../miniscript.js";
+import { buildMiniscriptDescriptor } from "../miniscript.js";
 import { addressToScripthash } from "../electrum.js";
 import type { WalletData } from "../storage.js";
 import type { ElectrumClient, HistoryItem, ScripthashBalance, UnspentItem } from "../electrum.js";
@@ -20,8 +20,8 @@ const TEST_WALLET: WalletData = {
   name: "Test Wallet",
   m: 2,
   n: 2,
-  addressType: 3, // NATIVE_SEGWIT
-  descriptor: buildWalletDescriptor(TEST_SIGNERS, 2, 3),
+  addressType: "NATIVE_SEGWIT", // NATIVE_SEGWIT
+  descriptor: buildWalletDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT"),
   signers: TEST_SIGNERS,
   secretboxKey: "",
   createdAt: "2025-01-01T00:00:00.000Z",
@@ -29,7 +29,7 @@ const TEST_WALLET: WalletData = {
 
 const TEST_MINISCRIPT_DESCRIPTOR = buildMiniscriptDescriptor(
   `and_v(v:pk(${TEST_SIGNERS[0]}/<0;1>/*),pk(${TEST_SIGNERS[1]}/<0;1>/*))`,
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+  "NATIVE_SEGWIT",
 );
 
 const TEST_MINISCRIPT_WALLET: WalletData = {
@@ -42,7 +42,7 @@ const TEST_MINISCRIPT_WALLET: WalletData = {
 
 // Pre-derive real scripthashes for known addresses so mock can match them
 function getScripthash(chain: 0 | 1, index: number): string {
-  const addrs = deriveAddresses(TEST_SIGNERS, 2, 3, "testnet", chain, index, 1);
+  const addrs = deriveAddresses(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet", chain, index, 1);
   return addressToScripthash(addrs[0], "testnet");
 }
 
@@ -316,7 +316,9 @@ describe("getNextReceiveAddress", () => {
     const electrum = createMockHistoryElectrum({});
     const result = await getNextReceiveAddress(TEST_WALLET, "testnet", electrum);
     expect(result.index).toBe(0);
-    expect(result.address).toBe(deriveAddresses(TEST_SIGNERS, 2, 3, "testnet", 0, 0, 1)[0]);
+    expect(result.address).toBe(
+      deriveAddresses(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet", 0, 0, 1)[0],
+    );
   });
 
   it("returns the next index after the highest used receive address", async () => {
@@ -329,7 +331,9 @@ describe("getNextReceiveAddress", () => {
 
     const result = await getNextReceiveAddress(TEST_WALLET, "testnet", electrum);
     expect(result.index).toBe(3);
-    expect(result.address).toBe(deriveAddresses(TEST_SIGNERS, 2, 3, "testnet", 0, 3, 1)[0]);
+    expect(result.address).toBe(
+      deriveAddresses(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet", 0, 3, 1)[0],
+    );
   });
 
   it("supports miniscript wallets", async () => {

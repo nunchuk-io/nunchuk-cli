@@ -21,10 +21,10 @@ const TEST_SIGNERS = [
 ];
 
 // Pre-computed descriptors from build functions for roundtrip tests
-const EXTERNAL_DESC = buildExternalDescriptor(TEST_SIGNERS, 2, 3);
-const ANY_DESC = buildAnyDescriptor(TEST_SIGNERS, 2, 3);
-const WALLET_DESC = buildWalletDescriptor(TEST_SIGNERS, 2, 3);
-const WALLET_ID = getWalletId(TEST_SIGNERS, 2, 3);
+const EXTERNAL_DESC = buildExternalDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+const ANY_DESC = buildAnyDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+const WALLET_DESC = buildWalletDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+const WALLET_ID = getWalletId(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
 const MINISCRIPT_EXTERNAL_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/0/*),pk(${TEST_SIGNERS[1]}/0/*)))`;
 const MINISCRIPT_EXTERNAL_DESC = `${MINISCRIPT_EXTERNAL_BODY}#${descriptorChecksum(MINISCRIPT_EXTERNAL_BODY)}`;
 const MINISCRIPT_ANY_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/*),pk(${TEST_SIGNERS[1]}/*)))`;
@@ -37,7 +37,7 @@ describe("parseDescriptor", () => {
     const result = parseDescriptor(EXTERNAL_DESC);
     expect(result.m).toBe(2);
     expect(result.n).toBe(2);
-    expect(result.addressType).toBe(3);
+    expect(result.addressType).toBe("NATIVE_SEGWIT");
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
 
@@ -45,7 +45,7 @@ describe("parseDescriptor", () => {
     const result = parseDescriptor(ANY_DESC);
     expect(result.m).toBe(2);
     expect(result.n).toBe(2);
-    expect(result.addressType).toBe(3);
+    expect(result.addressType).toBe("NATIVE_SEGWIT");
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
 
@@ -53,22 +53,22 @@ describe("parseDescriptor", () => {
     const result = parseDescriptor(WALLET_DESC);
     expect(result.m).toBe(2);
     expect(result.n).toBe(2);
-    expect(result.addressType).toBe(3);
+    expect(result.addressType).toBe("NATIVE_SEGWIT");
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
 
   it("parses NESTED_SEGWIT (sh(wsh)) descriptor", () => {
-    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, 2);
+    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, "NESTED_SEGWIT");
     const result = parseDescriptor(desc);
-    expect(result.addressType).toBe(2);
+    expect(result.addressType).toBe("NESTED_SEGWIT");
     expect(result.m).toBe(2);
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
 
   it("parses LEGACY (sh) descriptor", () => {
-    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, 1);
+    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, "LEGACY");
     const result = parseDescriptor(desc);
-    expect(result.addressType).toBe(1);
+    expect(result.addressType).toBe("LEGACY");
     expect(result.m).toBe(2);
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
@@ -144,7 +144,7 @@ describe("parseDescriptor", () => {
   it("parses miniscript descriptor and normalizes it to wallet form", () => {
     const result = parseDescriptor(MINISCRIPT_EXTERNAL_DESC);
     expect(result.kind).toBe("miniscript");
-    expect(result.addressType).toBe(3);
+    expect(result.addressType).toBe("NATIVE_SEGWIT");
     expect(result.m).toBe(0);
     expect(result.n).toBe(2);
     expect(result.signers).toEqual(TEST_SIGNERS);
@@ -166,8 +166,8 @@ describe("parseDescriptor", () => {
 describe("parseBsmsRecord", () => {
   async function buildBsmsContent(network: "mainnet" | "testnet"): Promise<string> {
     const { deriveFirstAddress } = await import("../address.js");
-    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, 3);
-    const firstAddr = deriveFirstAddress(TEST_SIGNERS, 2, 3, network);
+    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+    const firstAddr = deriveFirstAddress(TEST_SIGNERS, 2, "NATIVE_SEGWIT", network);
     return `BSMS 1.0\n${desc}\nNo path restrictions\n${firstAddr}`;
   }
 
@@ -176,14 +176,14 @@ describe("parseBsmsRecord", () => {
     const result = await parseBsmsRecord(content, "testnet");
     expect(result.m).toBe(2);
     expect(result.n).toBe(2);
-    expect(result.addressType).toBe(3);
+    expect(result.addressType).toBe("NATIVE_SEGWIT");
     expect(result.signers).toEqual(TEST_SIGNERS);
   });
 
   it("parses BSMS with /0/*,/1/* path restriction", async () => {
     const { deriveFirstAddress } = await import("../address.js");
-    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, 3);
-    const firstAddr = deriveFirstAddress(TEST_SIGNERS, 2, 3, "testnet");
+    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+    const firstAddr = deriveFirstAddress(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet");
     const content = `BSMS 1.0\n${desc}\n/0/*,/1/*\n${firstAddr}`;
     const result = await parseBsmsRecord(content, "testnet");
     expect(result.m).toBe(2);
@@ -195,13 +195,13 @@ describe("parseBsmsRecord", () => {
   });
 
   it("rejects invalid path restriction", async () => {
-    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, 3);
+    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
     const content = `BSMS 1.0\n${desc}\ninvalid restriction\ntb1q...`;
     await expect(parseBsmsRecord(content, "testnet")).rejects.toThrow("invalid path restriction");
   });
 
   it("rejects address mismatch", async () => {
-    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, 3);
+    const desc = buildAnyDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
     const content = `BSMS 1.0\n${desc}\nNo path restrictions\ntb1qwrongaddress`;
     await expect(parseBsmsRecord(content, "testnet")).rejects.toThrow(
       "first address does not match",
@@ -226,27 +226,27 @@ describe("parseBsmsRecord", () => {
 
 describe("walletId and key derivation consistency", () => {
   it("walletId is deterministic for same signers/m/addressType", () => {
-    const id1 = getWalletId(TEST_SIGNERS, 2, 3);
-    const id2 = getWalletId(TEST_SIGNERS, 2, 3);
+    const id1 = getWalletId(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+    const id2 = getWalletId(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
     expect(id1).toBe(id2);
     expect(id1.length).toBe(8); // descriptor checksum is always 8 chars
   });
 
   it("walletId differs for different m", () => {
-    const id1 = getWalletId(TEST_SIGNERS, 1, 3);
-    const id2 = getWalletId(TEST_SIGNERS, 2, 3);
+    const id1 = getWalletId(TEST_SIGNERS, 1, "NATIVE_SEGWIT");
+    const id2 = getWalletId(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
     expect(id1).not.toBe(id2);
   });
 
   it("walletId matches after roundtrip parse", () => {
-    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, 3);
+    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
     const parsed = parseDescriptor(desc);
     const id = getWalletId(parsed.signers, parsed.m, parsed.addressType);
     expect(id).toBe(WALLET_ID);
   });
 
   it("parsed signers produce same ANY descriptor for PBKDF2", () => {
-    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, 3);
+    const desc = buildExternalDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
     const parsed = parseDescriptor(desc);
     const anyDesc = buildAnyDescriptor(parsed.signers, parsed.m, parsed.addressType);
     expect(anyDesc).toBe(ANY_DESC);

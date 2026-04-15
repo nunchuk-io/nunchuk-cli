@@ -1,10 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { generateKeypair } from "../crypto.js";
-import {
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-  buildMiniscriptDescriptor,
-  miniscriptTemplateToMiniscript,
-} from "../miniscript.js";
+import { buildMiniscriptDescriptor, miniscriptTemplateToMiniscript } from "../miniscript.js";
 import {
   buildCreateGroupBody,
   buildJoinGroupEvent,
@@ -522,11 +518,9 @@ describe("buildFinalizeBody", () => {
       template,
       { key_0_0: signerA, key_1_0: signerB },
       "/<0;1>/*",
-      MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+      "NATIVE_SEGWIT",
     );
-    expect(result.descriptor).toBe(
-      buildMiniscriptDescriptor(miniscript, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT),
-    );
+    expect(result.descriptor).toBe(buildMiniscriptDescriptor(miniscript, "NATIVE_SEGWIT"));
     expect(result.m).toBe(0);
     expect(result.n).toBe(2);
     expect(result.signers).toEqual([signerA, signerB]);

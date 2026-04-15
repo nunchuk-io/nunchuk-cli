@@ -4,12 +4,7 @@ import { hex } from "@scure/base";
 import { Script, type ScriptOP } from "@scure/btc-signer/script.js";
 import { describe, expect, it } from "vitest";
 import { deriveDescriptorPayment } from "../address.js";
-import {
-  MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-  MINISCRIPT_ADDRESS_TYPE_TAPROOT,
-  buildMiniscriptDescriptor,
-  isValidMiniscriptTemplate,
-} from "../miniscript.js";
+import { buildMiniscriptDescriptor, isValidMiniscriptTemplate } from "../miniscript.js";
 
 const KEY_0 = "03841ad0999320d435ce8e1e7dc8b2fb7abaa4bd2e5b8599bf2c02eba66b12b869";
 const KEY_1 = "030bab88fd386b5da3091705821dc25982f9ee1826027965361c9ac21017d2606b";
@@ -31,7 +26,7 @@ function scriptHex(ops: ScriptOP[]): string {
 }
 
 function witnessScriptHex(miniscript: string): string {
-  const descriptor = buildMiniscriptDescriptor(miniscript, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT);
+  const descriptor = buildMiniscriptDescriptor(miniscript, "NATIVE_SEGWIT");
   const payment = deriveDescriptorPayment(descriptor, "testnet", 0, 0);
   if (!payment.witnessScript) {
     throw new Error("Expected miniscript witness script");
@@ -157,8 +152,8 @@ describe("BIP-0379 miniscript script translation", () => {
       [KEY_1_BYTES, "CHECKSIG", "SWAP", KEY_0_BYTES, "CHECKSIG", "BOOLAND"],
     ],
     ["c wrapper", `c:pk_k(${KEY_0})`, [KEY_0_BYTES, "CHECKSIG"]],
-    ["t wrapper", `t:v:pk(${KEY_0})`, [KEY_0_BYTES, "CHECKSIGVERIFY", 1]],
-    ["d wrapper", "d:v:after(10)", ["DUP", "IF", 10, "CHECKLOCKTIMEVERIFY", "VERIFY", "ENDIF"]],
+    ["t wrapper", `tv:pk(${KEY_0})`, [KEY_0_BYTES, "CHECKSIGVERIFY", 1]],
+    ["d wrapper", "dv:after(10)", ["DUP", "IF", 10, "CHECKLOCKTIMEVERIFY", "VERIFY", "ENDIF"]],
     [
       "v wrapper",
       `and_v(v:after(10),pk(${KEY_0}))`,
@@ -191,77 +186,51 @@ describe("BIP-0379 miniscript validation constraints", () => {
       `or_c(pk(${KEY_0}),v:pk(${KEY_1}))`,
       `thresh(2,pk(${KEY_0}),pk(${KEY_1}),pk(${KEY_2}))`,
     ]) {
-      expect(isValidMiniscriptTemplate(miniscript, MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT)).toBe(
-        false,
-      );
+      expect(isValidMiniscriptTemplate(miniscript, "NATIVE_SEGWIT")).toBe(false);
     }
   });
 
   it("enforces timelock and multi constraints", () => {
     const twentyOneKeys = Array.from({ length: 21 }, (_, index) => `key_${index}`);
 
-    expect(isValidMiniscriptTemplate("older(0)", MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT)).toBe(
+    expect(isValidMiniscriptTemplate("older(0)", "NATIVE_SEGWIT")).toBe(false);
+    expect(isValidMiniscriptTemplate("after(0)", "NATIVE_SEGWIT")).toBe(false);
+    expect(isValidMiniscriptTemplate("older(2147483648)", "NATIVE_SEGWIT")).toBe(false);
+    expect(isValidMiniscriptTemplate(`multi(1,${twentyOneKeys.join(",")})`, "NATIVE_SEGWIT")).toBe(
       false,
     );
-    expect(isValidMiniscriptTemplate("after(0)", MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT)).toBe(
-      false,
-    );
-    expect(
-      isValidMiniscriptTemplate("older(2147483648)", MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT),
-    ).toBe(false);
-    expect(
-      isValidMiniscriptTemplate(
-        `multi(1,${twentyOneKeys.join(",")})`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
-    ).toBe(false);
   });
 
   it("matches BIP-0379 timelock mixing rules", () => {
+    expect(isValidMiniscriptTemplate("and_v(v:after(1),after(500000000))", "NATIVE_SEGWIT")).toBe(
+      false,
+    );
     expect(
-      isValidMiniscriptTemplate(
-        "and_v(v:after(1),after(500000000))",
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
+      isValidMiniscriptTemplate(`and_v(v:older(1),older(${RELATIVE_TIME_LOCK}))`, "NATIVE_SEGWIT"),
     ).toBe(false);
     expect(
       isValidMiniscriptTemplate(
-        `and_v(v:older(1),older(${RELATIVE_TIME_LOCK}))`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
-    ).toBe(false);
-    expect(
-      isValidMiniscriptTemplate(
-        "or_i(after(1),after(500000000))",
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        `or_i(and_v(v:pk(${KEY_0}),after(1)),and_v(v:pk(${KEY_1}),after(144)))`,
+        "NATIVE_SEGWIT",
       ),
     ).toBe(true);
     expect(
       isValidMiniscriptTemplate(
-        `andor(pk(${KEY_0}),after(1),after(500000000))`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        `andor(pk(${KEY_0}),and_v(v:pk(${KEY_1}),after(1)),and_v(v:pk(${KEY_2}),after(144)))`,
+        "NATIVE_SEGWIT",
       ),
     ).toBe(true);
     expect(
       isValidMiniscriptTemplate(
-        "and_v(v:after(500000000),older(10))",
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
+        `and_v(v:after(500000000),and_v(v:older(${RELATIVE_TIME_LOCK}),pk(${KEY_0})))`,
+        "NATIVE_SEGWIT",
       ),
     ).toBe(true);
   });
 
   it("keeps multi and multi_a in their BIP-0379 address contexts", () => {
-    expect(
-      isValidMiniscriptTemplate(
-        `multi_a(2,${KEY_0},${KEY_1})`,
-        MINISCRIPT_ADDRESS_TYPE_NATIVE_SEGWIT,
-      ),
-    ).toBe(false);
-    expect(
-      isValidMiniscriptTemplate(`multi(2,${KEY_0},${KEY_1})`, MINISCRIPT_ADDRESS_TYPE_TAPROOT),
-    ).toBe(false);
-    expect(
-      isValidMiniscriptTemplate(`multi_a(2,${KEY_0},${KEY_1})`, MINISCRIPT_ADDRESS_TYPE_TAPROOT),
-    ).toBe(true);
+    expect(isValidMiniscriptTemplate(`multi_a(2,${KEY_0},${KEY_1})`, "NATIVE_SEGWIT")).toBe(false);
+    expect(isValidMiniscriptTemplate(`multi(2,${KEY_0},${KEY_1})`, "TAPROOT")).toBe(false);
+    expect(isValidMiniscriptTemplate(`multi_a(2,${KEY_0},${KEY_1})`, "TAPROOT")).toBe(true);
   });
 });
