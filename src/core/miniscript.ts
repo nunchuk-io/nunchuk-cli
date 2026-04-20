@@ -223,8 +223,6 @@ const TYPE_FLAG_BITS: Record<string, number> = {
   k: 1 << 18,
 };
 
-const miniscriptTemplateValidationCache = new Map<string, ValidateResult>();
-
 function invalid(message: string): never {
   throw new Error(message);
 }
@@ -3428,21 +3426,13 @@ export function validateMiniscriptTemplate(
   addressType?: AddressType,
 ): ValidateResult {
   const normalizedExpression = normalizeMiniscriptTemplate(expression);
-  const cacheKey = `${addressType}\u0000${normalizedExpression}`;
-  const cached = miniscriptTemplateValidationCache.get(cacheKey);
-  if (cached) {
-    return { ...cached };
-  }
 
-  let result: ValidateResult;
   try {
     validateMiniscriptTemplateStrict(normalizedExpression, addressType);
-    result = { ok: true };
+    return { ok: true };
   } catch (error) {
-    result = { error: (error as Error).message, ok: false };
+    return { error: (error as Error).message, ok: false };
   }
-  miniscriptTemplateValidationCache.set(cacheKey, result);
-  return { ...result };
 }
 
 export function miniscriptNeedsExplicitVerify(
