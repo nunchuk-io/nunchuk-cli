@@ -752,7 +752,7 @@ txCommand
             return;
           }
 
-          console.log("Source: electrum (confirmed)");
+          console.log(`Source: electrum (${confirmations > 0 ? "confirmed" : "pending"})`);
           console.log(`Transaction ID: ${options.txId}`);
           console.log(`Status: ${status}`);
           console.log(`Date: ${formatDate(blocktime)}`);
