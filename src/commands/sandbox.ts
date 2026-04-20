@@ -358,17 +358,18 @@ sandboxCommand
         `/v1.1/shared-wallets/groups/${sandboxId}`,
       );
       const state = getGroupDisplayState(groupData.group, pub, priv);
+      const requestedSlot = String(options.slot).trim();
 
       let slot: number;
-      if (/^\d+$/.test(String(options.slot))) {
-        slot = Number(options.slot);
+      if (/^\d+$/.test(requestedSlot)) {
+        slot = Number(requestedSlot);
       } else if (state.kind === "miniscript") {
-        slot = state.slotNames.indexOf(String(options.slot));
+        slot = state.slotNames.indexOf(requestedSlot);
         if (slot === -1) {
           printError(
             {
               error: "INVALID_PARAM",
-              message: `Unknown miniscript signer slot: ${options.slot}`,
+              message: `Unknown miniscript signer slot: ${requestedSlot}`,
             },
             cmd,
           );
@@ -389,7 +390,7 @@ sandboxCommand
         printError(
           {
             error: "INVALID_PARAM",
-            message: `Slot ${options.slot} is out of range`,
+            message: `Slot ${requestedSlot} is out of range`,
           },
           cmd,
         );

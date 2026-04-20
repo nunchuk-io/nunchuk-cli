@@ -11,6 +11,7 @@ import type { PlatformKeyPolicies, PlatformKeyConfig } from "./platform-key.js";
 import { ADDRESS_TYPE_TO_NUMBER, numberToAddressType, type AddressType } from "./address-type.js";
 import {
   miniscriptTemplateToMiniscript,
+  normalizeMiniscriptTemplate,
   parseSignerNames,
   validateMiniscriptTemplate,
 } from "./miniscript.js";
@@ -46,7 +47,7 @@ export function buildCreateGroupBody(
   miniscriptTemplate = "",
 ): string {
   const resolvedAddressType = ADDRESS_TYPE_TO_NUMBER[addressType];
-  const normalizedTemplate = miniscriptTemplate.trim();
+  const normalizedTemplate = normalizeMiniscriptTemplate(miniscriptTemplate);
   let resolvedM = m;
   let resolvedN = n;
   if (normalizedTemplate) {
@@ -222,7 +223,9 @@ function getMiniscriptTemplateMetadata(
 
 function getGroupDescriptorMetadata(pubstate: Record<string, unknown>): GroupDescriptorMetadata {
   const miniscriptTemplate =
-    typeof pubstate.miniscriptTemplate === "string" ? pubstate.miniscriptTemplate.trim() : "";
+    typeof pubstate.miniscriptTemplate === "string"
+      ? normalizeMiniscriptTemplate(pubstate.miniscriptTemplate)
+      : "";
 
   if (miniscriptTemplate.length > 0) {
     const { keypathM, slotNames } = getMiniscriptTemplateMetadata(
@@ -640,6 +643,7 @@ export async function buildFinalizeBody(
 ): Promise<FinalizeResult> {
   const { signers, pubstate, stateId } = decryptSigners(groupJson, ephemeralPub, ephemeralPriv);
   const parsed = buildParsedDescriptorFromGroup(signers, pubstate);
+  const metadata = getGroupDescriptorMetadata(pubstate);
   const m = parsed.m;
   const n = parsed.n;
   const addressType = parsed.addressType;
@@ -686,8 +690,7 @@ export async function buildFinalizeBody(
       n,
       addressType: ADDRESS_TYPE_TO_NUMBER[addressType],
       walletTemplate: 0,
-      miniscriptTemplate:
-        typeof pubstate.miniscriptTemplate === "string" ? pubstate.miniscriptTemplate : "",
+      miniscriptTemplate: metadata.kind === "miniscript" ? metadata.miniscriptTemplate : "",
       name,
       occupied: [],
       added,

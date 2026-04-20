@@ -16,6 +16,7 @@ import {
   isValidTapscriptTemplate,
   miniscriptTemplateToMiniscript,
   MiniscriptTimeline,
+  normalizeMiniscriptTemplate,
   parseSignerNames,
   parseTapscriptTemplate,
   policyToMiniscript,
@@ -100,6 +101,20 @@ describe("miniscript validation and substitution", () => {
     );
   });
 
+  it("canonicalizes insignificant whitespace in miniscript templates", () => {
+    const template =
+      "or_d(multi(2, key_0_0, key_1_0),\n\tand_v(v:multi(1, key_2_0, key_3_0), older(4194318)))";
+
+    expect(normalizeMiniscriptTemplate(template)).toBe(
+      "or_d(multi(2,key_0_0,key_1_0),and_v(v:multi(1,key_2_0,key_3_0),older(4194318)))",
+    );
+    expect(parseSignerNames(template)).toEqual({
+      keypathM: 0,
+      names: ["key_0_0", "key_1_0", "key_2_0", "key_3_0"],
+    });
+    expect(isValidMiniscriptTemplate("and_v(v:pk(key_1), pk(key_2))", "NATIVE_SEGWIT")).toBe(true);
+  });
+
   it("accepts compact wrapper chains in miniscript templates", () => {
     const template = "thresh(3,pk(key_1),s:pk(key_2),s:pk(key_3),sln:older(12960))";
 
@@ -125,12 +140,7 @@ describe("miniscript validation and substitution", () => {
   });
 
   it("rejects empty and separated miniscript arguments like libnunchuk", () => {
-    for (const template of [
-      "multi(1,key_1,)",
-      "multi(1,,key_1)",
-      "thresh(1,pk(key_1),)",
-      "and_v(v:pk(key_1), pk(key_2))",
-    ]) {
+    for (const template of ["multi(1,key_1,)", "multi(1,,key_1)", "thresh(1,pk(key_1),)"]) {
       expect(isValidMiniscriptTemplate(template, "NATIVE_SEGWIT")).toBe(false);
     }
   });

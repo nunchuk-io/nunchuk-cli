@@ -135,7 +135,10 @@ describe("buildCreateGroupBody", () => {
   });
 
   it("derives miniscript slot count and stores template metadata", () => {
-    const template = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    const template =
+      "or_d(multi(2, key_0_0, key_1_0),and_v(v:multi(1, key_2_0, key_3_0),older(4194318)))";
+    const normalizedTemplate =
+      "or_d(multi(2,key_0_0,key_1_0),and_v(v:multi(1,key_2_0,key_3_0),older(4194318)))";
     const body = buildCreateGroupBody(
       "Policy Wallet",
       0,
@@ -148,8 +151,8 @@ describe("buildCreateGroupBody", () => {
     const parsed = JSON.parse(body);
 
     expect(parsed.data.pubstate.m).toBe(0);
-    expect(parsed.data.pubstate.n).toBe(2);
-    expect(parsed.data.pubstate.miniscriptTemplate).toBe(template);
+    expect(parsed.data.pubstate.n).toBe(4);
+    expect(parsed.data.pubstate.miniscriptTemplate).toBe(normalizedTemplate);
   });
 });
 
@@ -435,14 +438,15 @@ describe("getGroupDisplayState", () => {
   });
 
   it("includes miniscript slot names and type label", () => {
-    const template = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    const template = "and_v(v:pk(key_0_0), pk(key_1_0))";
+    const normalizedTemplate = "and_v(v:pk(key_0_0),pk(key_1_0))";
     const group = createGroup(0, 0, "NATIVE_SEGWIT", template);
     const display = getGroupDisplayState(group, creator.pub, creator.priv);
 
     expect(display.kind).toBe("miniscript");
     expect(display.typeLabel).toBe("MINISCRIPT");
     expect(display.slotNames).toEqual(["key_0_0", "key_1_0"]);
-    expect(display.miniscriptTemplate).toBe(template);
+    expect(display.miniscriptTemplate).toBe(normalizedTemplate);
   });
 });
 
@@ -501,7 +505,8 @@ describe("decryptSigners", () => {
 
 describe("buildFinalizeBody", () => {
   it("builds miniscript descriptors from the sandbox template", async () => {
-    const template = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    const template = "and_v(v:pk(key_0_0), pk(key_1_0))";
+    const normalizedTemplate = "and_v(v:pk(key_0_0),pk(key_1_0))";
     let group = createGroup(0, 0, "NATIVE_SEGWIT", template);
     const signerA = "[aaaa0000/48'/1'/0'/2']tpubA";
     const signerB = "[bbbb0000/48'/1'/0'/2']tpubB";
@@ -513,14 +518,16 @@ describe("buildFinalizeBody", () => {
     group = { init: JSON.parse(body).data, status: "PENDING" };
 
     const result = await buildFinalizeBody("g1", group, creator.pub, creator.priv, "testnet");
+    const finalizeBody = JSON.parse(result.body);
 
     const miniscript = miniscriptTemplateToMiniscript(
-      template,
+      normalizedTemplate,
       { key_0_0: signerA, key_1_0: signerB },
       "/<0;1>/*",
       "NATIVE_SEGWIT",
     );
     expect(result.descriptor).toBe(buildMiniscriptDescriptor(miniscript, "NATIVE_SEGWIT"));
+    expect(finalizeBody.data.pubstate.miniscriptTemplate).toBe(normalizedTemplate);
     expect(result.m).toBe(0);
     expect(result.n).toBe(2);
     expect(result.signers).toEqual([signerA, signerB]);

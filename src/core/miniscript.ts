@@ -256,6 +256,10 @@ function isHex(value: string): boolean {
   return /^[0-9a-fA-F]+$/.test(value);
 }
 
+export function normalizeMiniscriptTemplate(miniscriptTemplate: string): string {
+  return miniscriptTemplate.replace(/\s+/g, "");
+}
+
 function splitTopLevel(value: string, delimiter: string): string[] {
   const parts: string[] = [];
   let depthParen = 0;
@@ -3371,8 +3375,9 @@ export function timelockToMiniscript(lock: Timelock): string {
 }
 
 export function parseMiniscript(expression: string, addressType?: AddressType): MiniscriptFragment {
-  const node = parseMiniscriptFragment(expression, addressType);
-  const effectiveAddressType = resolveMiniscriptContext(expression, addressType);
+  const normalizedExpression = normalizeMiniscriptTemplate(expression);
+  const node = parseMiniscriptFragment(normalizedExpression, addressType);
+  const effectiveAddressType = resolveMiniscriptContext(normalizedExpression, addressType);
   validateMiniscriptNode(node, effectiveAddressType);
   return node;
 }
@@ -3422,7 +3427,8 @@ export function validateMiniscriptTemplate(
   expression: string,
   addressType?: AddressType,
 ): ValidateResult {
-  const cacheKey = `${addressType}\u0000${expression}`;
+  const normalizedExpression = normalizeMiniscriptTemplate(expression);
+  const cacheKey = `${addressType}\u0000${normalizedExpression}`;
   const cached = miniscriptTemplateValidationCache.get(cacheKey);
   if (cached) {
     return { ...cached };
@@ -3430,7 +3436,7 @@ export function validateMiniscriptTemplate(
 
   let result: ValidateResult;
   try {
-    validateMiniscriptTemplateStrict(expression, addressType);
+    validateMiniscriptTemplateStrict(normalizedExpression, addressType);
     result = { ok: true };
   } catch (error) {
     result = { error: (error as Error).message, ok: false };
@@ -3543,12 +3549,12 @@ export function miniscriptTemplateToMiniscript(
   childPath = "/<0;1>/*",
   addressType?: AddressType,
 ): string {
-  const node = parseMiniscript(miniscriptTemplate, addressType);
+  const node = parseMiniscript(normalizeMiniscriptTemplate(miniscriptTemplate), addressType);
   return substituteMiniscriptKeys(node, signers, childPath);
 }
 
 export function parseTapscriptTemplate(expression: string): ParsedTapscriptTemplate {
-  const trimmed = expression.trim();
+  const trimmed = normalizeMiniscriptTemplate(expression);
   if (trimmed.length === 0) {
     invalid("Taproot script tree is empty");
   }
@@ -3687,7 +3693,7 @@ export function tapscriptTemplateToTapscript(
 }
 
 export function getScriptNode(expression: string): GetScriptNodeResult {
-  const trimmed = expression.trim();
+  const trimmed = normalizeMiniscriptTemplate(expression);
   if (trimmed.startsWith("tr(") || trimmed.startsWith("{")) {
     const parsed = parseTapscriptTemplate(trimmed);
     if (parsed.subscripts.length > 0) {
@@ -4014,10 +4020,11 @@ export function getCoinsGroupedBySubPolicies<T extends TimelineCoin>(
 }
 
 export function parseSignerNames(scriptTemplate: string): { keypathM: number; names: string[] } {
-  if (scriptTemplate.length === 0) {
+  const normalizedTemplate = normalizeMiniscriptTemplate(scriptTemplate);
+  if (normalizedTemplate.length === 0) {
     invalid("Miniscript only");
   }
-  const { keypath, node } = getScriptNode(scriptTemplate);
+  const { keypath, node } = getScriptNode(normalizedTemplate);
   const names = [...keypath];
   const keypathM = names.length;
 
