@@ -8,7 +8,13 @@ import { addressToScripthash } from "../electrum.js";
 import { buildMiniscriptDescriptor } from "../miniscript.js";
 import { finalizeMiniscriptPsbt } from "../miniscript-finalize.js";
 import { signWalletPsbtWithKey } from "../psbt-sign.js";
-import { combinePendingPsbt, createTransaction, decodePsbtDetail } from "../transaction.js";
+import {
+  combinePendingPsbt,
+  createTransaction,
+  decodePsbtDetail,
+  fetchPendingTxInputTimelockMetadataBatch,
+  fetchPsbtInputTimelockMetadata,
+} from "../transaction.js";
 import { createDummyPsbt } from "../platform-key.js";
 import { buildWalletDescriptor } from "../descriptor.js";
 import type { WalletData } from "../storage.js";
@@ -129,10 +135,27 @@ function createFundingHex(address: string, amount: bigint): { rawHex: string; tx
   };
 }
 
+function createBlockHeaderHex(blocktime: number): string {
+  const header = Buffer.alloc(80);
+  header.writeUInt32LE(blocktime, 68);
+  return header.toString("hex");
+}
+
+function removeInputWitnessUtxo(psbtB64: string): string {
+  const tx = Transaction.fromPSBT(Buffer.from(psbtB64, "base64"));
+  const inputs = (tx as unknown as { inputs?: Array<Record<string, unknown>> }).inputs;
+  if (!inputs?.[0]) {
+    throw new Error("Missing PSBT input");
+  }
+  delete inputs[0].witnessUtxo;
+  return Buffer.from(tx.toPSBT()).toString("base64");
+}
+
 function createMiniscriptElectrumMock(
   descriptor: string,
   fundingAmount: bigint,
   height = 200,
+  blocktime = 1_700_000_000,
 ): { electrum: ElectrumClient; txid: string } {
   const receiveAddress = deriveDescriptorAddresses(descriptor, "testnet", 0, 0, 1)[0];
   const { rawHex, txid } = createFundingHex(receiveAddress, fundingAmount);
@@ -149,6 +172,12 @@ function createMiniscriptElectrumMock(
   const getHistory = vi.fn(async (hash: string) =>
     hash === scripthash ? [{ tx_hash: txid, height }] : [],
   );
+  const getBlockHeader = vi.fn(async (requestedHeight: number) => {
+    if (requestedHeight !== height) {
+      throw new Error("unknown block");
+    }
+    return createBlockHeaderHex(blocktime);
+  });
 
   return {
     txid,
@@ -162,6 +191,10 @@ function createMiniscriptElectrumMock(
       listUnspentBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(listUnspent))),
       getHistory,
       getHistoryBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(getHistory))),
+      getBlockHeader,
+      getBlockHeaderBatch: vi.fn(async (heights: number[]) =>
+        Promise.all(heights.map(getBlockHeader)),
+      ),
     } as unknown as ElectrumClient,
   };
 }
@@ -303,7 +336,7 @@ describe("createTransaction miniscript", () => {
     }
   });
 
-  it("keeps a future-locktime miniscript branch pending until the locktime matures", async () => {
+  it("reports future absolute locktime separately from ready status", async () => {
     const futureLocktime = 2_100_000_000;
     const descriptor = buildMiniscriptDescriptor(
       `or_d(pk(${TEST_WALLET.signers[0]}/<0;1>/*),and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),after(${futureLocktime})))`,
@@ -344,7 +377,7 @@ describe("createTransaction miniscript", () => {
         { currentUnixTime: futureLocktime - 1 },
       );
 
-      expect(detail?.status).toBe("PENDING_LOCKTIME");
+      expect(detail?.status).toBe("READY_TO_BROADCAST");
       expect(detail?.signedCount).toBe(1);
       expect(detail?.requiredCount).toBe(1);
       expect(detail?.miniscriptPath).toMatchObject({
@@ -353,8 +386,322 @@ describe("createTransaction miniscript", () => {
         requiredSignatures: 1,
         signerNames: [`${TEST_WALLET.signers[1]}/<0;1>/*`],
       });
+      expect(detail?.timelockedUntil).toEqual({
+        based: "TIME_LOCK",
+        mature: false,
+        value: futureLocktime,
+      });
       expect(detail?.signers["b9a14f1a"]).toBe(false);
       expect(detail?.signers["8317a853"]).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports immature relative timelocks separately from ready status", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum, txid } = createMiniscriptElectrumMock(descriptor, 50_000n, 100);
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
+
+      const detail = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { currentHeight: 105, inputUtxos: [{ txHash: txid, txPos: 0, height: 100 }] },
+      );
+
+      expect(detail?.status).toBe("READY_TO_BROADCAST");
+      expect(detail?.timelockedUntil).toEqual({
+        based: "HEIGHT_LOCK",
+        mature: false,
+        value: 110,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports mature relative timelocks separately from ready status", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum, txid } = createMiniscriptElectrumMock(descriptor, 50_000n, 100);
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
+
+      const detail = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { currentHeight: 110, inputUtxos: [{ txHash: txid, txPos: 0, height: 100 }] },
+      );
+
+      expect(detail?.status).toBe("READY_TO_BROADCAST");
+      expect(detail?.timelockedUntil).toEqual({
+        based: "HEIGHT_LOCK",
+        mature: true,
+        value: 110,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports unconfirmed relative timelocks as undetermined", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum, txid } = createMiniscriptElectrumMock(descriptor, 50_000n, 0);
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
+
+      const detail = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { currentHeight: 110, inputUtxos: [{ txHash: txid, txPos: 0, height: 0 }] },
+      );
+
+      expect(detail?.status).toBe("READY_TO_BROADCAST");
+      expect(detail?.timelockedUntil).toEqual({
+        based: "HEIGHT_LOCK",
+        mature: null,
+        value: null,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("resolves relative time lock targets from PSBT input history", async () => {
+    const sequence = 0x400000 | 7;
+    const relativeSeconds = 7 * 512;
+    const blocktime = 1_700_000_000;
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(${sequence}))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum, txid } = createMiniscriptElectrumMock(descriptor, 50_000n, 100, blocktime);
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(tx.getInput(0).sequence).toBe(sequence);
+      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
+
+      const psbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
+      const inputUtxos = await fetchPsbtInputTimelockMetadata(psbtB64, electrum, "testnet");
+
+      expect(inputUtxos).toEqual([{ txHash: txid, txPos: 0, height: 100, blocktime }]);
+
+      const detail = decodePsbtDetail(
+        psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { currentUnixTime: blocktime + relativeSeconds - 1, inputUtxos },
+      );
+
+      expect(detail?.status).toBe("READY_TO_BROADCAST");
+      expect(detail?.timelockedUntil).toEqual({
+        based: "TIME_LOCK",
+        mature: false,
+        value: blocktime + relativeSeconds,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("dedupes timelock metadata lookups across pending PSBTs", async () => {
+    const blocktime = 1_700_000_000;
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum, txid } = createMiniscriptElectrumMock(descriptor, 50_000n, 100, blocktime);
+    const mockedElectrum = electrum as unknown as {
+      getTransactionBatch: ReturnType<typeof vi.fn>;
+      getHistoryBatch: ReturnType<typeof vi.fn>;
+      getBlockHeaderBatch: ReturnType<typeof vi.fn>;
+    };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const psbtWithoutWitnessUtxo = removeInputWitnessUtxo(result.psbtB64);
+      mockedElectrum.getTransactionBatch.mockClear();
+      mockedElectrum.getHistoryBatch.mockClear();
+      mockedElectrum.getBlockHeaderBatch.mockClear();
+
+      const metadataByTxId = await fetchPendingTxInputTimelockMetadataBatch(
+        [
+          { txId: "pending-a", psbt: psbtWithoutWitnessUtxo },
+          { txId: "pending-b", psbt: psbtWithoutWitnessUtxo },
+        ],
+        electrum,
+        "testnet",
+      );
+
+      const expected = [{ txHash: txid, txPos: 0, height: 100, blocktime }];
+      expect(metadataByTxId.get("pending-a")).toEqual(expected);
+      expect(metadataByTxId.get("pending-b")).toEqual(expected);
+      expect(mockedElectrum.getTransactionBatch).toHaveBeenCalledTimes(1);
+      expect(mockedElectrum.getTransactionBatch.mock.calls[0][0]).toEqual([txid]);
+      expect(mockedElectrum.getHistoryBatch).toHaveBeenCalledTimes(1);
+      expect(mockedElectrum.getHistoryBatch.mock.calls[0][0]).toHaveLength(1);
+      expect(mockedElectrum.getBlockHeaderBatch).toHaveBeenCalledTimes(1);
+      expect(mockedElectrum.getBlockHeaderBatch.mock.calls[0][0]).toEqual([100]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("skips malformed PSBTs when resolving pending timelock metadata in batch", async () => {
+    const blocktime = 1_700_000_000;
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[1]],
+    };
+    const { electrum, txid } = createMiniscriptElectrumMock(descriptor, 50_000n, 100, blocktime);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+
+      const metadataByTxId = await fetchPendingTxInputTimelockMetadataBatch(
+        [
+          { txId: "bad", psbt: "not-a-psbt" },
+          { txId: "good", psbt: result.psbtB64 },
+        ],
+        electrum,
+        "testnet",
+      );
+
+      expect(metadataByTxId.has("bad")).toBe(false);
+      expect(metadataByTxId.get("good")).toEqual([
+        { txHash: txid, txPos: 0, height: 100, blocktime },
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
     }

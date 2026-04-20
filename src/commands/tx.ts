@@ -27,7 +27,12 @@ import {
   combinePendingPsbt,
   decodePsbtDetail,
   fetchConfirmedTransactions,
+  fetchPendingTxInputTimelockMetadataBatch,
+  fetchPsbtInputTimelockMetadata,
   ServerTxResponse,
+  type PendingTx,
+  type PendingTxDetail,
+  type PendingTxInputTimelockMetadata,
 } from "../core/transaction.js";
 import {
   formatBtc,
@@ -86,6 +91,31 @@ function printMiniscriptPathSummary(
   );
 }
 
+function printTimelockSummary(
+  timelockedUntil:
+    | {
+        based: string;
+        mature: boolean | null;
+        value: number | null;
+      }
+    | undefined,
+  indent = "  ",
+): void {
+  if (!timelockedUntil || timelockedUntil.based === "NONE") {
+    return;
+  }
+
+  const target =
+    timelockedUntil.value == null
+      ? "undetermined"
+      : timelockedUntil.based === "TIME_LOCK"
+        ? `${timelockedUntil.value} (${formatDate(timelockedUntil.value)})`
+        : String(timelockedUntil.value);
+  const state =
+    timelockedUntil.mature == null ? "undetermined" : timelockedUntil.mature ? "mature" : "pending";
+  console.log(`${indent}Timelock: ${state} ${timelockedUntil.based} until ${target}`);
+}
+
 function getGlobals(cmd: Command): { apiKey: string; network: Network; email: string } {
   const globals = cmd.optsWithGlobals();
   return {
@@ -104,6 +134,69 @@ function requireWallet(email: string, network: Network, walletId: string): Walle
     process.exit(1);
   }
   return wallet;
+}
+
+interface DecodedPendingTx {
+  tx: PendingTx;
+  detail: PendingTxDetail | null;
+}
+
+function decodePendingTxWithoutMetadata(
+  tx: PendingTx,
+  network: Network,
+  wallet: WalletData,
+): DecodedPendingTx {
+  return {
+    tx,
+    detail: decodePsbtDetail(tx.psbt, network, wallet.m, wallet.signers, wallet.descriptor),
+  };
+}
+
+async function decodePendingTxsWithTimelockMetadata(
+  pending: PendingTx[],
+  network: Network,
+  wallet: WalletData,
+): Promise<DecodedPendingTx[]> {
+  if (pending.length === 0) {
+    return [];
+  }
+
+  const server = getElectrumServer(network);
+  const electrum = new ElectrumClient();
+  let currentHeight: number | undefined;
+  let currentUnixTime: number | undefined;
+
+  try {
+    await electrum.connect(server.host, server.port, server.protocol);
+    await electrum.serverVersion("nunchuk-cli", "1.4");
+    const tip = await electrum.headersSubscribe();
+    currentHeight = tip.height;
+    currentUnixTime = parseBlockTime(tip.hex);
+
+    let metadataByTxId = new Map<string, PendingTxInputTimelockMetadata[]>();
+    try {
+      metadataByTxId = await fetchPendingTxInputTimelockMetadataBatch(pending, electrum, network);
+    } catch {
+      metadataByTxId = new Map();
+    }
+
+    const decoded: DecodedPendingTx[] = [];
+    for (const tx of pending) {
+      decoded.push({
+        tx,
+        detail: decodePsbtDetail(tx.psbt, network, wallet.m, wallet.signers, wallet.descriptor, {
+          currentHeight,
+          currentUnixTime,
+          inputUtxos: metadataByTxId.get(tx.txId),
+        }),
+      });
+    }
+    return decoded;
+  } catch {
+    return pending.map((tx) => decodePendingTxWithoutMetadata(tx, network, wallet));
+  } finally {
+    electrum.close();
+  }
 }
 
 export const txCommand = new Command("tx").description("Create, sign, and broadcast transactions");
@@ -344,6 +437,7 @@ txCommand
             status: detail?.status ?? "PENDING_SIGNATURES",
             signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
             miniscriptPath: detail?.miniscriptPath,
+            timelockedUntil: detail?.timelockedUntil,
           },
           cmd,
         );
@@ -379,6 +473,7 @@ txCommand
       console.log(`  Transaction ID: ${options.txId}`);
       console.log(`  Status: ${detail?.status ?? "PENDING_SIGNATURES"}${sigInfo}`);
       printMiniscriptPathSummary(detail?.miniscriptPath);
+      printTimelockSummary(detail?.timelockedUntil);
       if (detail?.status === "READY_TO_BROADCAST") {
         console.log(
           `\nBroadcast with: nunchuk tx broadcast --wallet ${options.wallet} --tx-id ${options.txId}`,
@@ -488,27 +583,22 @@ txCommand
       // Reference: libnunchuk uses txid as primary key in SQLite — single entry per tx
       const confirmedTxIds = new Set(confirmed.map((c) => c.txHash));
       const pending = allPending.filter((p) => !confirmedTxIds.has(p.txId));
+      const decodedPending = await decodePendingTxsWithTimelockMetadata(pending, network, wallet);
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
           {
-            pending: pending.map((p) => {
-              const detail = decodePsbtDetail(
-                p.psbt,
-                network,
-                wallet.m,
-                wallet.signers,
-                wallet.descriptor,
-              );
+            pending: decodedPending.map(({ tx, detail }) => {
               return {
-                txId: p.txId,
+                txId: tx.txId,
                 status: detail?.status ?? "PENDING_SIGNATURES",
                 signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
                 fee: detail?.fee,
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
                 miniscriptPath: detail?.miniscriptPath,
+                timelockedUntil: detail?.timelockedUntil,
                 outputs: detail?.outputs,
                 signers: detail?.signers,
               };
@@ -537,19 +627,12 @@ txCommand
 
       if (pending.length > 0) {
         console.log("Pending transactions (from group server):");
-        pending.forEach((p, i) => {
-          const detail = decodePsbtDetail(
-            p.psbt,
-            network,
-            wallet.m,
-            wallet.signers,
-            wallet.descriptor,
-          );
+        decodedPending.forEach(({ tx, detail }, i) => {
           const status = detail?.status ?? "PENDING_SIGNATURES";
           const sigInfo = detail
             ? ` (${detail.signedCount}/${detail.requiredCount} signatures)`
             : "";
-          console.log(`  ${i}: ${p.txId}`);
+          console.log(`  ${i}: ${tx.txId}`);
           console.log(`     Status: ${status}${sigInfo}`);
           if (detail) {
             console.log(`     Fee: ${detail.feeBtc} (${detail.fee})`);
@@ -568,6 +651,7 @@ txCommand
               console.log(`     Signers: ${signerStr}`);
             }
             printMiniscriptPathSummary(detail.miniscriptPath, "     ");
+            printTimelockSummary(detail.timelockedUntil, "     ");
           }
         });
       }
@@ -611,11 +695,15 @@ txCommand
       const server = getElectrumServer(network);
       const electrum = new ElectrumClient();
       let foundOnChain = false;
+      let currentHeight: number | undefined;
+      let currentUnixTime: number | undefined;
       try {
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
         const tip = await electrum.headersSubscribe();
+        currentHeight = tip.height;
+        currentUnixTime = parseBlockTime(tip.hex);
 
         let rawHex: string;
         try {
@@ -787,8 +875,29 @@ txCommand
         if (data && data.transaction && data.transaction.data && data.transaction.data.msg) {
           const plain = secretOpen(data.transaction.data.msg, secretboxKey);
           const parsed = JSON.parse(plain);
+          let inputUtxos: PendingTxInputTimelockMetadata[] | undefined;
+          if (parsed.psbt) {
+            const metadataElectrum = new ElectrumClient();
+            try {
+              await metadataElectrum.connect(server.host, server.port, server.protocol);
+              await metadataElectrum.serverVersion("nunchuk-cli", "1.4");
+              inputUtxos = await fetchPsbtInputTimelockMetadata(
+                parsed.psbt,
+                metadataElectrum,
+                network,
+              );
+            } catch {
+              inputUtxos = undefined;
+            } finally {
+              metadataElectrum.close();
+            }
+          }
           const detail = parsed.psbt
-            ? decodePsbtDetail(parsed.psbt, network, wallet.m, wallet.signers, wallet.descriptor)
+            ? decodePsbtDetail(parsed.psbt, network, wallet.m, wallet.signers, wallet.descriptor, {
+                currentHeight,
+                currentUnixTime,
+                inputUtxos,
+              })
             : null;
           const status = detail?.status ?? "PENDING_SIGNATURES";
 
@@ -804,6 +913,7 @@ txCommand
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
                 miniscriptPath: detail?.miniscriptPath,
+                timelockedUntil: detail?.timelockedUntil,
                 outputs: detail?.outputs,
                 signers: detail?.signers,
                 psbt: parsed.psbt,
@@ -836,6 +946,7 @@ txCommand
               console.log(`Signers: ${signerStr}`);
             }
             printMiniscriptPathSummary(detail.miniscriptPath, "");
+            printTimelockSummary(detail.timelockedUntil, "");
           }
           if (parsed.psbt) {
             console.log(`PSBT: ${parsed.psbt}`);

@@ -42,7 +42,7 @@ import {
 } from "./miniscript-preimage.js";
 import { formatBtc, formatSats, getOutputAddress } from "./format.js";
 import { estimateFeeRate } from "./fees.js";
-import { timelockFromK } from "./miniscript.js";
+import { timelockFromK, type TimelockBased } from "./miniscript.js";
 
 const GAP_LIMIT = 20;
 const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
@@ -63,9 +63,18 @@ export interface WalletUtxo {
   txHash: string;
   txPos: number;
   value: bigint;
+  height: number;
+  blocktime?: number;
   chain: 0 | 1;
   index: number;
   address: string;
+}
+
+export interface PendingTxInputTimelockMetadata {
+  txHash: string;
+  txPos: number;
+  height: number;
+  blocktime?: number;
 }
 
 export interface PendingTx {
@@ -99,6 +108,11 @@ export interface PendingTxDetail {
     sequence: number;
     signerNames: string[];
   };
+  timelockedUntil?: {
+    based: TimelockBased;
+    mature: boolean | null;
+    value: number | null;
+  };
   fee: string;
   feeBtc: string;
   outputs: Array<{ address: string | null; amount: string; amountBtc: string; isChange: boolean }>;
@@ -110,6 +124,7 @@ export interface PendingTxDetail {
 export interface PendingTxDecodeOptions {
   currentHeight?: number;
   currentUnixTime?: number;
+  inputUtxos?: PendingTxInputTimelockMetadata[];
 }
 
 export interface ConfirmedTx {
@@ -201,6 +216,10 @@ interface MiniscriptPlanProgress {
   signedFingerprints: Set<number>;
 }
 
+interface PendingTxInputOutpoint extends PendingTxInputTimelockMetadata {
+  inputIndex: number;
+}
+
 function buildMiniscriptDummyWitness(
   plan: MiniscriptSpendingPlan,
   witnessScript: Uint8Array,
@@ -259,22 +278,88 @@ function hasActiveLockTime(tx: Transaction): boolean {
   return false;
 }
 
-function isTransactionBroadcastMature(tx: Transaction, options?: PendingTxDecodeOptions): boolean {
-  if (!hasActiveLockTime(tx)) {
-    return true;
+function getInputOutpoint(
+  tx: Transaction,
+  inputIndex: number,
+): { txHash: string; txPos: number } | null {
+  const input = tx.getInput(inputIndex);
+  if (!input.txid) {
+    return null;
+  }
+  return {
+    txHash: Buffer.from(input.txid).toString("hex"),
+    txPos: input.index ?? 0,
+  };
+}
+
+function getTimelockedUntil(
+  tx: Transaction,
+  plan: MiniscriptSpendingPlan | null,
+  options?: PendingTxDecodeOptions,
+): PendingTxDetail["timelockedUntil"] {
+  if (!plan || (plan.lockTime === 0 && plan.sequence === 0)) {
+    return undefined;
   }
 
-  const lock = timelockFromK(true, tx.lockTime);
-  if (lock.based === "TIME_LOCK") {
-    return (options?.currentUnixTime ?? Math.floor(Date.now() / 1000)) >= lock.value;
-  }
-  if (lock.based === "HEIGHT_LOCK") {
-    if (options?.currentHeight == null) {
-      return false;
+  let based: TimelockBased = "NONE";
+  let mature: boolean | null = true;
+  let value: number | null = 0;
+
+  const setUnknown = (lockBased: TimelockBased): void => {
+    based = lockBased;
+    mature = null;
+    value = null;
+  };
+
+  if (hasActiveLockTime(tx) && plan.lockTime > 0) {
+    const lock = timelockFromK(true, plan.lockTime);
+    based = lock.based;
+    value = lock.value;
+    if (lock.based === "TIME_LOCK") {
+      mature = (options?.currentUnixTime ?? Math.floor(Date.now() / 1000)) >= lock.value;
+    } else if (lock.based === "HEIGHT_LOCK") {
+      mature = options?.currentHeight == null ? null : options.currentHeight >= lock.value;
     }
-    return options.currentHeight >= lock.value;
   }
-  return true;
+
+  if (plan.sequence > 0) {
+    const lock = timelockFromK(false, plan.sequence);
+    based = lock.based;
+
+    let maxRelativeValue = value ?? 0;
+    for (let inputIndex = 0; inputIndex < tx.inputsLength; inputIndex++) {
+      const outpoint = getInputOutpoint(tx, inputIndex);
+      const utxo = outpoint
+        ? options?.inputUtxos?.find(
+            (item) => item.txHash === outpoint.txHash && item.txPos === outpoint.txPos,
+          )
+        : undefined;
+
+      if (!utxo || utxo.height <= 0) {
+        setUnknown(lock.based);
+        return { based, mature, value };
+      }
+
+      if (lock.based === "TIME_LOCK") {
+        if (!utxo.blocktime || utxo.blocktime <= 0) {
+          setUnknown(lock.based);
+          return { based, mature, value };
+        }
+        maxRelativeValue = Math.max(maxRelativeValue, utxo.blocktime + lock.value);
+      } else if (lock.based === "HEIGHT_LOCK") {
+        maxRelativeValue = Math.max(maxRelativeValue, utxo.height + lock.value);
+      }
+    }
+
+    value = maxRelativeValue;
+    if (lock.based === "TIME_LOCK") {
+      mature = (options?.currentUnixTime ?? Math.floor(Date.now() / 1000)) >= maxRelativeValue;
+    } else if (lock.based === "HEIGHT_LOCK") {
+      mature = options?.currentHeight == null ? null : options.currentHeight >= maxRelativeValue;
+    }
+  }
+
+  return based === "NONE" ? undefined : { based, mature, value };
 }
 
 function getInputMiniscriptSignatureState(
@@ -910,6 +995,7 @@ export async function scanUtxos(
             txHash: u.tx_hash,
             txPos: u.tx_pos,
             value: BigInt(u.value),
+            height: u.height,
             chain,
             index: startIndex + offset,
             address: addr,
@@ -1119,10 +1205,10 @@ export function decodePsbtDetail(
       parsedDescriptor?.kind === "miniscript"
         ? inferMiniscriptSpendingPlan(walletDescriptor!, tx, txState)
         : null;
+    const timelockedUntil = getTimelockedUntil(tx, miniscriptPlan, options);
     let requiredCount = miniscriptPlan?.requiredSignatures ?? walletM ?? 0;
     let signedCount = 0;
     const signedXfps = new Set<number>();
-    const broadcastMature = isTransactionBroadcastMature(tx, options);
     const canAttributeSigners = !(
       parsedDescriptor?.kind === "miniscript" &&
       tx.isFinal &&
@@ -1135,7 +1221,7 @@ export function decodePsbtDetail(
       requiredCount = miniscriptPlan.requiredSignatures;
       if (tx.isFinal) {
         signedCount = requiredCount;
-        status = broadcastMature ? "READY_TO_BROADCAST" : "PENDING_LOCKTIME";
+        status = "READY_TO_BROADCAST";
       } else {
         const progress = getMiniscriptPlanProgress(tx, walletDescriptor, network, miniscriptPlan);
         signedCount = progress.signedCount;
@@ -1145,17 +1231,17 @@ export function decodePsbtDetail(
         if (!progress.ready) {
           status = "PENDING_SIGNATURES";
         } else {
-          status = broadcastMature ? "READY_TO_BROADCAST" : "PENDING_LOCKTIME";
+          status = "READY_TO_BROADCAST";
         }
       }
     } else if (tx.isFinal) {
       signedCount = requiredCount;
-      status = broadcastMature ? "READY_TO_BROADCAST" : "PENDING_LOCKTIME";
+      status = "READY_TO_BROADCAST";
     } else {
       try {
         const clone = tx.clone();
         clone.finalize();
-        status = broadcastMature ? "READY_TO_BROADCAST" : "PENDING_LOCKTIME";
+        status = "READY_TO_BROADCAST";
       } catch {
         status = "PENDING_SIGNATURES";
       }
@@ -1175,7 +1261,7 @@ export function decodePsbtDetail(
               }
             }
           }
-        } else if (status === "READY_TO_BROADCAST" || status === "PENDING_LOCKTIME") {
+        } else if (status === "READY_TO_BROADCAST") {
           signedCount = requiredCount;
         }
       }
@@ -1196,6 +1282,7 @@ export function decodePsbtDetail(
       signedCount,
       requiredCount,
       miniscriptPath: miniscriptPlan ? buildMiniscriptPathSummary(miniscriptPlan) : undefined,
+      timelockedUntil,
       fee: formatSats(tx.fee),
       feeBtc: formatBtc(tx.fee),
       outputs,
@@ -1268,6 +1355,175 @@ async function fetchBlockHeaderBatchMap(
     );
     return result;
   }
+}
+
+function outpointKey(txHash: string, txPos: number): string {
+  return `${txHash}:${txPos}`;
+}
+
+async function fetchAddressHistoryBatchMap(
+  electrum: ElectrumClient,
+  addresses: string[],
+  network: Network,
+): Promise<Map<string, HistoryItem[]>> {
+  const unique = [...new Set(addresses)];
+  const result = new Map<string, HistoryItem[]>();
+  if (unique.length === 0) {
+    return result;
+  }
+
+  const scripthashes = unique.map((address) => addressToScripthash(address, network));
+  try {
+    const histories = await electrum.getHistoryBatch(scripthashes);
+    for (let i = 0; i < unique.length; i++) {
+      result.set(unique[i], histories[i]);
+    }
+    return result;
+  } catch {
+    await Promise.all(
+      unique.map(async (address, index) => {
+        try {
+          result.set(address, await electrum.getHistory(scripthashes[index]));
+        } catch {
+          result.set(address, []);
+        }
+      }),
+    );
+    return result;
+  }
+}
+
+export async function fetchPsbtInputTimelockMetadata(
+  psbtB64: string,
+  electrum: ElectrumClient,
+  network: Network,
+): Promise<PendingTxInputTimelockMetadata[]> {
+  const metadataByTxId = await fetchPendingTxInputTimelockMetadataBatch(
+    [{ txId: "", psbt: psbtB64 }],
+    electrum,
+    network,
+  );
+  return metadataByTxId.get("") ?? [];
+}
+
+export async function fetchPendingTxInputTimelockMetadataBatch(
+  pending: PendingTx[],
+  electrum: ElectrumClient,
+  network: Network,
+): Promise<Map<string, PendingTxInputTimelockMetadata[]>> {
+  const outpointsByTxId = new Map<string, PendingTxInputOutpoint[]>();
+  const addressByOutpoint = new Map<string, string>();
+
+  for (const pendingTx of pending) {
+    let tx: Transaction;
+    try {
+      tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
+    } catch {
+      continue;
+    }
+
+    const outpoints: PendingTxInputOutpoint[] = [];
+    for (let inputIndex = 0; inputIndex < tx.inputsLength; inputIndex++) {
+      const outpoint = getInputOutpoint(tx, inputIndex);
+      if (!outpoint) {
+        continue;
+      }
+
+      const input = tx.getInput(inputIndex);
+      const witnessScript = input.witnessUtxo?.script;
+      const address = witnessScript ? getOutputAddress(witnessScript, network) : null;
+      outpoints.push({ ...outpoint, inputIndex, height: 0 });
+      if (address) {
+        addressByOutpoint.set(outpointKey(outpoint.txHash, outpoint.txPos), address);
+      }
+    }
+    outpointsByTxId.set(pendingTx.txId, outpoints);
+  }
+
+  if (outpointsByTxId.size === 0) {
+    return new Map();
+  }
+
+  const missingPrevTxHashes = new Set<string>();
+  for (const outpoints of outpointsByTxId.values()) {
+    for (const outpoint of outpoints) {
+      const key = outpointKey(outpoint.txHash, outpoint.txPos);
+      if (!addressByOutpoint.has(key)) {
+        missingPrevTxHashes.add(outpoint.txHash);
+      }
+    }
+  }
+
+  if (missingPrevTxHashes.size > 0) {
+    const rawTxByHash = await fetchTransactionBatchMap(electrum, [...missingPrevTxHashes]);
+    for (const outpoints of outpointsByTxId.values()) {
+      for (const outpoint of outpoints) {
+        const key = outpointKey(outpoint.txHash, outpoint.txPos);
+        if (addressByOutpoint.has(key)) {
+          continue;
+        }
+
+        const rawHex = rawTxByHash.get(outpoint.txHash);
+        if (!rawHex) {
+          continue;
+        }
+
+        try {
+          const prevTx = Transaction.fromRaw(Buffer.from(rawHex, "hex"), {
+            allowUnknownOutputs: true,
+          });
+          const prevOut = prevTx.getOutput(outpoint.txPos);
+          const address = prevOut.script ? getOutputAddress(prevOut.script, network) : null;
+          if (address) {
+            addressByOutpoint.set(key, address);
+          }
+        } catch {
+          // Missing or malformed previous transaction data leaves this input undetermined.
+        }
+      }
+    }
+  }
+
+  const historyByAddress = await fetchAddressHistoryBatchMap(
+    electrum,
+    [...addressByOutpoint.values()],
+    network,
+  );
+
+  const metadataByTxId = new Map<string, PendingTxInputTimelockMetadata[]>();
+  for (const [txId, outpoints] of outpointsByTxId.entries()) {
+    metadataByTxId.set(
+      txId,
+      outpoints.map((outpoint) => {
+        const address = addressByOutpoint.get(outpointKey(outpoint.txHash, outpoint.txPos));
+        const history = address ? historyByAddress.get(address) : undefined;
+        const match = history?.find((item) => item.tx_hash === outpoint.txHash);
+        return { txHash: outpoint.txHash, txPos: outpoint.txPos, height: match?.height ?? 0 };
+      }),
+    );
+  }
+
+  const allMetadata = [...metadataByTxId.values()].flat();
+
+  const blockHeadersByHeight = await fetchBlockHeaderBatchMap(
+    electrum,
+    allMetadata.map((item) => item.height),
+  );
+
+  for (const [txId, metadata] of metadataByTxId.entries()) {
+    metadataByTxId.set(
+      txId,
+      metadata.map((item) => {
+        const headerHex = blockHeadersByHeight.get(item.height);
+        if (!headerHex) {
+          return item;
+        }
+        return { ...item, blocktime: parseBlockTime(headerHex) };
+      }),
+    );
+  }
+
+  return metadataByTxId;
 }
 
 export async function fetchConfirmedTransactions(
