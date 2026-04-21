@@ -16,6 +16,14 @@ export const ADDRESS_TYPE_LABELS: Record<number, AddressType> = {
   4: "TAPROOT",
 };
 
+export function parseAddressTypeInput(value: string): AddressType {
+  const normalized = value.trim().toUpperCase().replace(/-/g, "_") as AddressType;
+  if (!ADDRESS_TYPES.includes(normalized)) {
+    throw new Error(`Invalid address type: ${value}. Must be one of: ${ADDRESS_TYPES.join(", ")}`);
+  }
+  return normalized;
+}
+
 export function addressTypeToNumber(addressType: AddressType): number {
   return ADDRESS_TYPE_TO_NUMBER[addressType];
 }

@@ -1,6 +1,6 @@
 import { Command, InvalidArgumentError, Option } from "commander";
 import { getNetwork, requireEmail } from "../core/config.js";
-import type { AddressType } from "../core/address-type.js";
+import { parseAddressTypeInput, type AddressType } from "../core/address-type.js";
 import { loadWallet } from "../core/storage.js";
 import { buildWalletDescriptorForParsed, parseDescriptor } from "../core/descriptor.js";
 import { buildMiniscriptDescriptor, validateMiniscriptTemplate } from "../core/miniscript.js";
@@ -15,29 +15,19 @@ export const miniscriptCommand = new Command("miniscript").description(
   "Inspect and validate miniscript wallets and descriptors",
 );
 
-function parseAddressTypeOption(value: string): AddressType | undefined {
-  const upper = value.toUpperCase().replace(/-/g, "_");
-
-  if (upper === "ANY") {
-    return undefined;
-  }
-  if (upper === "NATIVE_SEGWIT") {
-    return "NATIVE_SEGWIT";
-  }
-  if (upper === "TAPROOT") {
-    return "TAPROOT";
+function parseAddressTypeOption(value: string): AddressType {
+  const addressType = parseAddressTypeInput(value);
+  if (addressType === "NATIVE_SEGWIT") {
+    return addressType;
   }
 
   throw new InvalidArgumentError(
-    `Invalid miniscript address type: ${value}. Use ANY, NATIVE_SEGWIT, or TAPROOT`,
+    `Invalid miniscript address type: ${value}. Miniscript currently supports NATIVE_SEGWIT only`,
   );
 }
 
 function miniscriptAddressTypeOption(): Option {
-  return new Option(
-    "--address-type <type>",
-    "Address type for --miniscript (ANY, NATIVE_SEGWIT, TAPROOT)",
-  )
+  return new Option("--address-type <type>", "Address type for --miniscript (NATIVE_SEGWIT only)")
     .argParser(parseAddressTypeOption)
     .default("NATIVE_SEGWIT" satisfies AddressType, "NATIVE_SEGWIT");
 }
@@ -105,8 +95,8 @@ type MiniscriptSourceOptions = {
 };
 
 function requireMiniscriptAddressType(addressType: AddressType): AddressType {
-  if (addressType !== "NATIVE_SEGWIT" && addressType !== "TAPROOT") {
-    throw new Error("Only native segwit and taproot miniscript descriptors are supported");
+  if (addressType !== "NATIVE_SEGWIT") {
+    throw new Error("Only native segwit miniscript descriptors are supported");
   }
   return addressType;
 }
@@ -212,7 +202,7 @@ function getMiniscriptSource(
 }
 
 function formatAddressTypeLabel(addressType: AddressType | undefined): string {
-  return addressType ?? "ANY";
+  return addressType ?? "NATIVE_SEGWIT";
 }
 
 miniscriptCommand
