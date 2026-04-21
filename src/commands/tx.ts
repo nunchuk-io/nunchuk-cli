@@ -199,6 +199,37 @@ async function decodePendingTxsWithTimelockMetadata(
   }
 }
 
+async function decodePsbtDetailWithTimelockMetadata(
+  psbtB64: string,
+  network: Network,
+  wallet: WalletData,
+  electrum: ElectrumClient,
+): Promise<PendingTxDetail | null> {
+  let currentHeight: number | undefined;
+  let currentUnixTime: number | undefined;
+
+  try {
+    const tip = await electrum.headersSubscribe();
+    currentHeight = tip.height;
+    currentUnixTime = parseBlockTime(tip.hex);
+  } catch {
+    return decodePsbtDetail(psbtB64, network, wallet.m, wallet.signers, wallet.descriptor);
+  }
+
+  let inputUtxos: PendingTxInputTimelockMetadata[] | undefined;
+  try {
+    inputUtxos = await fetchPsbtInputTimelockMetadata(psbtB64, electrum, network);
+  } catch {
+    inputUtxos = undefined;
+  }
+
+  return decodePsbtDetail(psbtB64, network, wallet.m, wallet.signers, wallet.descriptor, {
+    currentHeight,
+    currentUnixTime,
+    inputUtxos,
+  });
+}
+
 export const txCommand = new Command("tx").description("Create, sign, and broadcast transactions");
 
 // tx create — Build PSBT locally, upload to group server
@@ -255,6 +286,12 @@ txCommand
         });
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
+        const detail = await decodePsbtDetailWithTimelockMetadata(
+          result.psbtB64,
+          network,
+          wallet,
+          electrum,
+        );
 
         const globals = cmd.optsWithGlobals();
         if (globals.json) {
@@ -265,7 +302,8 @@ txCommand
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
-              miniscriptPath: result.miniscriptPath,
+              miniscriptPath: detail?.miniscriptPath ?? result.miniscriptPath,
+              timelockedUntil: detail?.timelockedUntil,
             },
             cmd,
           );
@@ -281,7 +319,8 @@ txCommand
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
         }
-        printMiniscriptPathSummary(result.miniscriptPath);
+        printMiniscriptPathSummary(detail?.miniscriptPath ?? result.miniscriptPath);
+        printTimelockSummary(detail?.timelockedUntil);
         console.log(
           `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId} --xprv <your-xprv>`,
         );
