@@ -48,14 +48,32 @@ const TEST_RECIPIENT = deriveDescriptorAddresses(TEST_WALLET.descriptor, "testne
 
 const TEST_XPRV =
   "tprv8indigs9s1wXrGCnzFR8m65FU1BmZ7UMR8TqVArSk3KegTFipNCWQJenF45BjmrcPXXfNjyx5NrsU1gEd5BKYog9dEHuu7YqWB7HUt7AuzM";
-const TEST_SIGNER_0_XPRV =
-  "tprv8ZgxMBicQKsPcsrtKiH9QjEKETBYXnT7hc5Rqcr4jmRDSxguKdSXKSdkBkPRk43YtBML3U2xJEj4dMo1832UwM46AnyVRNwnVNJHxBknYRs";
 
 const TEST_XFP = 0x8317a853;
-const TEST_XFP_0 = 0xb9a14f1a;
 const TEST_PREIMAGE_7 = new Uint8Array(32).fill(7);
 const TEST_PREIMAGE_11 = new Uint8Array(32).fill(0x11);
 const TEST_PREIMAGE_22 = new Uint8Array(32).fill(0x22);
+
+const VALID_MINISCRIPT_SIGNERS = [
+  {
+    descriptor:
+      "[96eca294/48'/1'/0'/2']tpubDFPj9hqgQDd6XmwP6rFLyfan3WwEXgAvWWwCAyTVfqegGX6FBofdCagNzn6FveEnaqa9k3sHdAX9Styj4LXVdT9FGiZcRhKE8pMEvZoSn7Y",
+    fingerprint: 0x96eca294,
+    xprv: "tprv8ihh1HoSFqwReJubDCakaFvfUVRJNLz1wDLQtTRCFZrHS2qUZQr3264Wpcbv8CxAYKYV2ZuucLntw96V9X1ZFeuoRQqdPcz3PACnJeHX5Eq",
+  },
+  {
+    descriptor:
+      "[e442ae1d/48'/1'/0'/2']tpubDFUQmRE5eeoBnPfjy3RkqCfGdzsbnTzJHqM7ioNrFspMUrgvBMJkUurg9dCmeb9zd9rTaVoNkMzPku6VsopVnhAPMyQs95KoK8Q1zUCtX2B",
+    fingerprint: 0xe442ae1d,
+    xprv: "tprv8inNd1BqWH7Wtvdx5PmARo1A4yMfd8oPiXkLSHLYqc1xeNS9YxVAJREoyUJpUAqJbY9EMeALmYe3dXPBtAMqpwuZeXv4WAgEMfDs48TyMk9",
+  },
+  {
+    descriptor:
+      "[dd38da6b/48'/1'/0'/2']tpubDFJiyLvovM1LQjFEiPb4Mbwc1RwksKEhaik61g4ayMUF2TjwqFBpKYh53cNCnxNiuzmpxjJ9UiTGJMKQ8RVCTv2bV4xv9FcaMmPhLjYPx7b",
+    fingerprint: 0xdd38da6b,
+    xprv: "tprv8icgpvtZmyKfXGDSpjvTxCHVSQRphz3o1R9JjA2HZ5frByVBCrNE945CsV8Z1xgqsBC7BQHMKcrWH4zSreE4RLsjRxNHg4d6ULj75y6xskC",
+  },
+] as const;
 
 function hash160(data: Uint8Array): Uint8Array {
   return ripemd160(sha256(data));
@@ -80,19 +98,33 @@ function walletSigners(indexes: number[]): string[] {
   return indexes.map((index) => TEST_WALLET.signers[index]);
 }
 
-function signWithKnownTestSigner(tx: Transaction, signerIndex: 0 | 1, descriptor: string): number {
-  if (signerIndex === 0) {
-    return signWalletPsbtWithKey(
-      tx,
-      HDKey.fromExtendedKey(TEST_SIGNER_0_XPRV, TESTNET_VERSIONS),
-      TEST_XFP_0,
-      descriptor,
-    );
-  }
+function signWithKnownTestSigner(tx: Transaction, signerIndex: 1, descriptor: string): number {
   return signWalletPsbtWithKey(
     tx,
     HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS),
     TEST_XFP,
+    descriptor,
+  );
+}
+
+function materializeValidMiniscriptTemplate(template: string): string {
+  let result = template;
+  for (const [index, signer] of VALID_MINISCRIPT_SIGNERS.entries()) {
+    result = result.replaceAll(`key_${index}_0`, `${signer.descriptor}/<0;1>/*`);
+  }
+  return result;
+}
+
+function signWithValidMiniscriptSigner(
+  tx: Transaction,
+  signerIndex: 0 | 1 | 2,
+  descriptor: string,
+): number {
+  const signer = VALID_MINISCRIPT_SIGNERS[signerIndex];
+  return signWalletPsbtWithKey(
+    tx,
+    HDKey.fromExtendedKey(signer.xprv, TESTNET_VERSIONS),
+    signer.fingerprint,
     descriptor,
   );
 }
@@ -967,17 +999,16 @@ describe("createTransaction miniscript", () => {
 
   it("does not over-attribute signer fingerprints for server-style finalized miniscript PSBTs", async () => {
     const descriptor = buildMiniscriptDescriptor(
-      `and_v(v:multi(2,${TEST_WALLET.signers[0]}/<0;1>/*,${TEST_WALLET.signers[1]}/<0;1>/*,${TEST_WALLET.signers[2]}/<0;1>/*),after(1))`,
+      materializeValidMiniscriptTemplate("and_v(v:multi(2,key_0_0,key_1_0,key_2_0),after(1))"),
       "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
       m: 0,
       descriptor,
-      signers: [TEST_WALLET.signers[0], TEST_WALLET.signers[1], TEST_WALLET.signers[2]],
+      signers: VALID_MINISCRIPT_SIGNERS.map((signer) => signer.descriptor),
     };
     const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
-    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async () => {
       throw new Error("offline");
@@ -993,8 +1024,8 @@ describe("createTransaction miniscript", () => {
       });
       const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
 
-      expect(signWalletPsbtWithKey(tx, signerKey, TEST_XFP, wallet.descriptor)).toBe(1);
-      expect(signWithKnownTestSigner(tx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 1, wallet.descriptor)).toBe(1);
       finalizeMiniscriptPsbt(tx, wallet.descriptor, "testnet");
 
       const inputs = (tx as unknown as { inputs?: Array<Record<string, unknown>> }).inputs;
@@ -1028,7 +1059,7 @@ describe("createTransaction miniscript", () => {
       hash: hex.encode(sha256(TEST_PREIMAGE_7)),
       name: "sha256 signer+preimage template",
       preimage: TEST_PREIMAGE_7,
-      template: "and_v(v:pk(key_0_0),sha256(HASH))",
+      template: "and_v(v:pk(key_1_0),sha256(HASH))",
       type: "SHA256" as const,
     },
     {
@@ -1036,7 +1067,7 @@ describe("createTransaction miniscript", () => {
       hash: hex.encode(hash256(TEST_PREIMAGE_11)),
       name: "hash256 signer+preimage template",
       preimage: TEST_PREIMAGE_11,
-      template: "and_v(v:pk(key_0_0),hash256(HASH))",
+      template: "and_v(v:pk(key_1_0),hash256(HASH))",
       type: "HASH256" as const,
     },
     {
@@ -1044,7 +1075,7 @@ describe("createTransaction miniscript", () => {
       hash: hex.encode(ripemd160(TEST_PREIMAGE_22)),
       name: "ripemd160 signer+preimage template",
       preimage: TEST_PREIMAGE_22,
-      template: "and_v(v:pk(key_0_0),ripemd160(HASH))",
+      template: "and_v(v:pk(key_1_0),ripemd160(HASH))",
       type: "RIPEMD160" as const,
     },
     {
@@ -1052,7 +1083,7 @@ describe("createTransaction miniscript", () => {
       hash: hex.encode(hash160(TEST_PREIMAGE_7)),
       name: "hash160 signer+preimage template",
       preimage: TEST_PREIMAGE_7,
-      template: "and_v(v:pk(key_0_0),hash160(HASH))",
+      template: "and_v(v:pk(key_1_0),hash160(HASH))",
       type: "HASH160" as const,
     },
   ];
@@ -1068,7 +1099,7 @@ describe("createTransaction miniscript", () => {
         ...TEST_WALLET,
         m: 0,
         descriptor,
-        signers: walletSigners([0]),
+        signers: walletSigners([1]),
       };
       const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
       const originalFetch = globalThis.fetch;
@@ -1085,7 +1116,7 @@ describe("createTransaction miniscript", () => {
           amount: 10_000n,
         });
         const unsignedTx = Transaction.fromPSBT(Buffer.from(withoutPreimage.psbtB64, "base64"));
-        expect(signWithKnownTestSigner(unsignedTx, 0, wallet.descriptor)).toBe(1);
+        expect(signWithKnownTestSigner(unsignedTx, 1, wallet.descriptor)).toBe(1);
         expect(() => finalizeMiniscriptPsbt(unsignedTx, wallet.descriptor, "testnet")).toThrow(
           "Not enough signatures or hash preimages to finalize miniscript PSBT",
         );
@@ -1108,7 +1139,7 @@ describe("createTransaction miniscript", () => {
           ((tx.getInput(0) as unknown as Record<string, unknown>)[field] as unknown[]) ?? []
         ).length;
         expect(hashEntries).toBe(1);
-        expect(signWithKnownTestSigner(tx, 0, wallet.descriptor)).toBe(1);
+        expect(signWithKnownTestSigner(tx, 1, wallet.descriptor)).toBe(1);
         expect(finalizeMiniscriptPsbt(tx, wallet.descriptor, "testnet")).toMatchObject({
           requiredPreimages: 1,
           requiredSignatures: 1,
@@ -1195,14 +1226,16 @@ describe("createTransaction miniscript", () => {
   it("finalizes a 2-of-3 multi template that also requires a preimage", async () => {
     const digest = hex.encode(sha256(TEST_PREIMAGE_22));
     const descriptor = buildMiniscriptDescriptor(
-      materializeTemplate(`and_v(v:multi(2,key_0_0,key_1_0,key_2_0),sha256(${digest}))`),
+      materializeValidMiniscriptTemplate(
+        `and_v(v:multi(2,key_0_0,key_1_0,key_2_0),sha256(${digest}))`,
+      ),
       "NATIVE_SEGWIT",
     );
     const wallet: WalletData = {
       ...TEST_WALLET,
       m: 0,
       descriptor,
-      signers: walletSigners([0, 1, 2]),
+      signers: VALID_MINISCRIPT_SIGNERS.map((signer) => signer.descriptor),
     };
     const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
     const originalFetch = globalThis.fetch;
@@ -1219,8 +1252,8 @@ describe("createTransaction miniscript", () => {
         amount: 10_000n,
       });
       const unsignedTx = Transaction.fromPSBT(Buffer.from(withoutPreimage.psbtB64, "base64"));
-      expect(signWithKnownTestSigner(unsignedTx, 0, wallet.descriptor)).toBe(1);
-      expect(signWithKnownTestSigner(unsignedTx, 1, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(unsignedTx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(unsignedTx, 1, wallet.descriptor)).toBe(1);
       expect(() => finalizeMiniscriptPsbt(unsignedTx, wallet.descriptor, "testnet")).toThrow(
         "Not enough signatures or hash preimages to finalize miniscript PSBT",
       );
@@ -1239,8 +1272,8 @@ describe("createTransaction miniscript", () => {
         preimageRequirements: [{ hash: digest, type: "SHA256" }],
         requiredSignatures: 2,
       });
-      expect(signWithKnownTestSigner(tx, 0, wallet.descriptor)).toBe(1);
-      expect(signWithKnownTestSigner(tx, 1, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 1, wallet.descriptor)).toBe(1);
       expect(finalizeMiniscriptPsbt(tx, wallet.descriptor, "testnet")).toMatchObject({
         requiredPreimages: 1,
         requiredSignatures: 2,

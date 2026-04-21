@@ -104,6 +104,27 @@ function signMiniscriptInput(
   return true;
 }
 
+function deriveSignerChildKey(
+  signerKey: HDKey,
+  path: number[],
+  expectedPubkey: Uint8Array,
+): HDKey | null {
+  if (path.length < signerKey.depth) {
+    return null;
+  }
+
+  let current = signerKey;
+  for (const child of path.slice(signerKey.depth)) {
+    current = current.deriveChild(child);
+  }
+
+  if (!current.publicKey || !bytesEqual(current.publicKey, expectedPubkey)) {
+    return null;
+  }
+
+  return current;
+}
+
 export function signWalletPsbtWithKey(
   tx: Transaction,
   signerKey: HDKey,
@@ -124,13 +145,14 @@ export function signWalletPsbtWithKey(
     }
 
     for (const [pubkey, { fingerprint, path }] of bip32Derivation) {
-      if (fingerprint !== xfpInt || path.length < 2) {
+      if (fingerprint !== xfpInt) {
         continue;
       }
 
-      const chain = path[path.length - 2];
-      const index = path[path.length - 1];
-      const childKey = signerKey.deriveChild(chain).deriveChild(index);
+      const childKey = deriveSignerChildKey(signerKey, path, pubkey);
+      if (!childKey) {
+        continue;
+      }
       if (!childKey.privateKey || !childKey.publicKey) {
         break;
       }

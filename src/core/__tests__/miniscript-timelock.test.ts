@@ -38,11 +38,8 @@ const TEST_RECIPIENT = deriveDescriptorAddresses(TEST_WALLET.descriptor, "testne
 
 const TEST_XPRV =
   "tprv8indigs9s1wXrGCnzFR8m65FU1BmZ7UMR8TqVArSk3KegTFipNCWQJenF45BjmrcPXXfNjyx5NrsU1gEd5BKYog9dEHuu7YqWB7HUt7AuzM";
-const TEST_SIGNER_0_XPRV =
-  "tprv8ZgxMBicQKsPcsrtKiH9QjEKETBYXnT7hc5Rqcr4jmRDSxguKdSXKSdkBkPRk43YtBML3U2xJEj4dMo1832UwM46AnyVRNwnVNJHxBknYRs";
 
 const TEST_XFP = 0x8317a853;
-const TEST_XFP_0 = 0xb9a14f1a;
 
 type TimelockEndToEndCase = {
   currentHeight?: number;
@@ -58,7 +55,7 @@ type TimelockEndToEndCase = {
   fundingBlocktime?: number;
   fundingHeight?: number;
   name: string;
-  signerIndex: 0 | 1;
+  signerIndex: 1;
   walletSigners: string[];
 };
 
@@ -130,15 +127,7 @@ function createMiniscriptElectrumMock(
   };
 }
 
-function signWithKnownTestSigner(tx: Transaction, signerIndex: 0 | 1, descriptor: string): number {
-  if (signerIndex === 0) {
-    return signWalletPsbtWithKey(
-      tx,
-      HDKey.fromExtendedKey(TEST_SIGNER_0_XPRV, TESTNET_VERSIONS),
-      TEST_XFP_0,
-      descriptor,
-    );
-  }
+function signWithKnownTestSigner(tx: Transaction, signerIndex: 1, descriptor: string): number {
   return signWalletPsbtWithKey(
     tx,
     HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS),
@@ -151,7 +140,7 @@ const TIMELOCK_END_TO_END_CASES: TimelockEndToEndCase[] = [
   {
     currentHeight: 143,
     descriptor: buildMiniscriptDescriptor(
-      `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
+      `and_v(v:pk(${TEST_WALLET.signers[1]}/<0;1>/*),after(144))`,
       "NATIVE_SEGWIT",
     ),
     expectedLockTime: 144,
@@ -162,8 +151,8 @@ const TIMELOCK_END_TO_END_CASES: TimelockEndToEndCase[] = [
       value: 144,
     },
     name: "absolute height locks",
-    signerIndex: 0,
-    walletSigners: [TEST_WALLET.signers[0]],
+    signerIndex: 1,
+    walletSigners: [TEST_WALLET.signers[1]],
   },
   {
     currentUnixTime: 2_100_000_000 - 1,
