@@ -36,7 +36,6 @@ export function getOutputAddress(script: Uint8Array, network: Network): string |
 
 export function statusFromHeight(height: number): string {
   if (height > 0) return "CONFIRMED";
-  if (height === 0) return "PENDING_CONFIRMATION";
   if (height === -2) return "NETWORK_REJECTED";
-  return "READY_TO_BROADCAST";
+  return "PENDING_CONFIRMATION";
 }

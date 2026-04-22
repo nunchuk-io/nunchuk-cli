@@ -1,13 +1,16 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { generateKeypair } from "../crypto.js";
+import { generateKeypair, publicOpen } from "../crypto.js";
+import { buildMiniscriptDescriptor, miniscriptTemplateToMiniscript } from "../miniscript.js";
 import {
   buildCreateGroupBody,
   buildJoinGroupEvent,
   buildAddKeyBody,
+  buildGroupStateBroadcastBodyIfNeeded,
   buildSignerDescriptor,
   getGroupDisplayState,
   isGroupFinalized,
   decryptSigners,
+  buildFinalizeBody,
   buildEnablePlatformKeyBody,
   buildDisablePlatformKeyBody,
   buildSetPlatformKeyPolicyBody,
@@ -35,8 +38,17 @@ function createGroup(
   m = 2,
   n = 3,
   addressType: "NATIVE_SEGWIT" | "TAPROOT" = "NATIVE_SEGWIT",
+  miniscriptTemplate = "",
 ): Record<string, unknown> {
-  const body = buildCreateGroupBody("Test Wallet", m, n, addressType, creator.pub, creator.priv);
+  const body = buildCreateGroupBody(
+    "Test Wallet",
+    m,
+    n,
+    addressType,
+    creator.pub,
+    creator.priv,
+    miniscriptTemplate,
+  );
   const parsed = JSON.parse(body);
   return { init: parsed.data, status: "PENDING" };
 }
@@ -121,6 +133,27 @@ describe("buildCreateGroupBody", () => {
     const display = getGroupDisplayState(group, creator.pub, creator.priv);
 
     expect(display.signers).toEqual(["[]", "[]", "[]", "[]"]);
+  });
+
+  it("derives miniscript slot count and stores template metadata", () => {
+    const template =
+      "or_d(multi(2, key_0_0, key_1_0),and_v(v:multi(1, key_2_0, key_3_0),older(4194318)))";
+    const normalizedTemplate =
+      "or_d(multi(2,key_0_0,key_1_0),and_v(v:multi(1,key_2_0,key_3_0),older(4194318)))";
+    const body = buildCreateGroupBody(
+      "Policy Wallet",
+      0,
+      0,
+      "NATIVE_SEGWIT",
+      creator.pub,
+      creator.priv,
+      template,
+    );
+    const parsed = JSON.parse(body);
+
+    expect(parsed.data.pubstate.m).toBe(0);
+    expect(parsed.data.pubstate.n).toBe(4);
+    expect(parsed.data.pubstate.miniscriptTemplate).toBe(normalizedTemplate);
   });
 });
 
@@ -361,6 +394,25 @@ describe("getGroupDisplayState", () => {
     expect(display.added).toEqual([0]);
   });
 
+  it("shows ADDED placeholders when this device has no synced state yet", () => {
+    let group = createGroup(2, 2);
+    const body = buildAddKeyBody(
+      "g1",
+      clone(group),
+      0,
+      "[aaaa0000/48']xpub1",
+      creator.pub,
+      creator.priv,
+    );
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    const other = generateKeypair();
+    const display = getGroupDisplayState(group, other.pub, other.priv);
+    expect(display.signers[0]).toBe("ADDED");
+    expect(display.signers[1]).toBe("[]");
+    expect(display.added).toEqual([0]);
+  });
+
   it("merges modified signers from multiple participants", () => {
     let group = createGroup(2, 3);
 
@@ -403,6 +455,18 @@ describe("getGroupDisplayState", () => {
     const display = getGroupDisplayState(group, other.pub, other.priv);
 
     expect(display.signers).toEqual(["[]", "[]", "[]"]);
+  });
+
+  it("includes miniscript slot names and type label", () => {
+    const template = "and_v(v:pk(key_0_0), pk(key_1_0))";
+    const normalizedTemplate = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    const group = createGroup(0, 0, "NATIVE_SEGWIT", template);
+    const display = getGroupDisplayState(group, creator.pub, creator.priv);
+
+    expect(display.kind).toBe("miniscript");
+    expect(display.typeLabel).toBe("MINISCRIPT");
+    expect(display.slotNames).toEqual(["key_0_0", "key_1_0"]);
+    expect(display.miniscriptTemplate).toBe(normalizedTemplate);
   });
 });
 
@@ -453,9 +517,105 @@ describe("decryptSigners", () => {
   });
 
   it("throws when no state entry for ephemeral key", () => {
-    const group = createGroup();
+    let group = createGroup(2, 2);
+    let body = buildAddKeyBody(
+      "g1",
+      clone(group),
+      0,
+      "[aaaa0000/48']xpub1",
+      creator.pub,
+      creator.priv,
+    );
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+    body = buildAddKeyBody("g1", clone(group), 1, "[bbbb0000/48']xpub2", creator.pub, creator.priv);
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
     const other = generateKeypair();
-    expect(() => decryptSigners(group, other.pub, other.priv)).toThrow("no state entry");
+    expect(() => decryptSigners(group, other.pub, other.priv)).toThrow(
+      "Other devices in the group need to come online briefly to securely share their keys with this one",
+    );
+  });
+});
+
+describe("buildFinalizeBody", () => {
+  it("builds miniscript descriptors from the sandbox template", async () => {
+    const template = "and_v(v:pk(key_0_0), pk(key_1_0))";
+    const normalizedTemplate = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    let group = createGroup(0, 0, "NATIVE_SEGWIT", template);
+    const signerA = "[aaaa0000/48'/1'/0'/2']tpubA";
+    const signerB = "[bbbb0000/48'/1'/0'/2']tpubB";
+
+    let body = buildAddKeyBody("g1", clone(group), 0, signerA, creator.pub, creator.priv);
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    body = buildAddKeyBody("g1", clone(group), 1, signerB, creator.pub, creator.priv);
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    const result = await buildFinalizeBody("g1", group, creator.pub, creator.priv, "testnet");
+    const finalizeBody = JSON.parse(result.body);
+
+    const miniscript = miniscriptTemplateToMiniscript(
+      normalizedTemplate,
+      { key_0_0: signerA, key_1_0: signerB },
+      "/<0;1>/*",
+      "NATIVE_SEGWIT",
+    );
+    expect(result.descriptor).toBe(buildMiniscriptDescriptor(miniscript, "NATIVE_SEGWIT"));
+    expect(finalizeBody.data.pubstate.miniscriptTemplate).toBe(normalizedTemplate);
+    expect(result.m).toBe(0);
+    expect(result.n).toBe(2);
+    expect(result.signers).toEqual([signerA, signerB]);
+  });
+});
+
+describe("buildGroupStateBroadcastBodyIfNeeded", () => {
+  it("rebroadcasts state when another participant has an empty state entry", () => {
+    let group = createGroup(2, 2);
+    const joinBody = buildJoinGroupEvent("g1", clone(group), joiner.pub);
+    group = { id: "g1", init: JSON.parse(joinBody).data, status: "PENDING" };
+
+    const body = buildGroupStateBroadcastBodyIfNeeded("g1", group, creator.pub, creator.priv);
+    expect(body).not.toBeNull();
+
+    const parsed = JSON.parse(body!);
+    expect(parsed.type).toBe("init");
+    expect(parsed.data.stateId).toBe(
+      ((group.init as Record<string, unknown>).stateId as number) + 1,
+    );
+    expect(parsed.data.modified).toEqual({});
+    expect(typeof parsed.data.state[joiner.pub]).toBe("string");
+    expect(parsed.data.state[joiner.pub]).not.toBe("");
+
+    const plaintext = JSON.parse(publicOpen(parsed.data.state[joiner.pub], joiner.priv)) as {
+      signers: string[];
+    };
+    expect(plaintext.signers).toEqual(["[]", "[]"]);
+  });
+
+  it("rebroadcasts merged signer state from modified payloads", () => {
+    let group = createGroup(2, 2);
+    let body = buildJoinGroupEvent("g1", clone(group), joiner.pub);
+    group = { id: "g1", init: JSON.parse(body).data, status: "PENDING" };
+
+    body = buildAddKeyBody("g1", clone(group), 0, "[aaaa0000/48']xpub1", joiner.pub, joiner.priv);
+    group = { id: "g1", init: JSON.parse(body).data, status: "PENDING" };
+
+    const syncBody = buildGroupStateBroadcastBodyIfNeeded("g1", group, creator.pub, creator.priv);
+    expect(syncBody).not.toBeNull();
+
+    const parsed = JSON.parse(syncBody!);
+    expect(parsed.data.modified).toEqual({});
+    expect(parsed.data.pubstate.added).toEqual([0]);
+
+    const joinerPlaintext = JSON.parse(publicOpen(parsed.data.state[joiner.pub], joiner.priv)) as {
+      signers: string[];
+    };
+    expect(joinerPlaintext.signers).toEqual(["[aaaa0000/48']xpub1", "[]"]);
+  });
+
+  it("does nothing when no broadcast is needed", () => {
+    const group = createGroup(2, 2);
+    expect(buildGroupStateBroadcastBodyIfNeeded("g1", group, creator.pub, creator.priv)).toBeNull();
   });
 });
 
@@ -530,6 +690,45 @@ describe("buildEnablePlatformKeyBody", () => {
       buildEnablePlatformKeyBody("g1", group, backend.pub, creator.pub, creator.priv),
     ).toThrow("already finalized");
   });
+
+  it("enables platform key for miniscript sandboxes with named slots", () => {
+    const template = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    let group = createGroup(0, 0, "NATIVE_SEGWIT", template);
+    let body = buildAddKeyBody(
+      "g1",
+      clone(group),
+      0,
+      "[aaaa0000/48']xpub1",
+      creator.pub,
+      creator.priv,
+    );
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+    body = buildAddKeyBody("g1", clone(group), 1, "[bbbb0000/48']xpub2", creator.pub, creator.priv);
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    body = buildEnablePlatformKeyBody("g1", clone(group), backend.pub, creator.pub, creator.priv, [
+      "key_1_0",
+    ]);
+    const parsed = JSON.parse(body);
+    const updated = { init: parsed.data, status: "PENDING" };
+
+    expect(parsed.data.state[backend.pub]).toBeDefined();
+    expect(getGroupPlatformKeyState(updated, creator.pub, creator.priv)?.slots).toEqual([
+      "key_1_0",
+    ]);
+    expect(getGroupDisplayState(updated, creator.pub, creator.priv).signers).toEqual([
+      "[aaaa0000/48']xpub1",
+      "[bbbb0000/48']xpub2",
+    ]);
+  });
+
+  it("requires miniscript slot names when enabling platform key", () => {
+    const template = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    const group = createGroup(0, 0, "NATIVE_SEGWIT", template);
+    expect(() =>
+      buildEnablePlatformKeyBody("g1", clone(group), backend.pub, creator.pub, creator.priv),
+    ).toThrow("required for miniscript");
+  });
 });
 
 // ─── Platform Key: disable ──────────────────────────────────────────
@@ -573,6 +772,40 @@ describe("buildDisablePlatformKeyBody", () => {
     expect(() =>
       buildDisablePlatformKeyBody("g1", clone(group), backend.pub, creator.pub, creator.priv),
     ).toThrow("not enabled");
+  });
+
+  it("clears configured miniscript platform key slots on disable", () => {
+    const template = "and_v(v:pk(key_0_0),pk(key_1_0))";
+    let group = createGroup(0, 0, "NATIVE_SEGWIT", template);
+    let body = buildAddKeyBody(
+      "g1",
+      clone(group),
+      0,
+      "[aaaa0000/48']xpub1",
+      creator.pub,
+      creator.priv,
+    );
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+    body = buildAddKeyBody("g1", clone(group), 1, "[bbbb0000/48']xpub2", creator.pub, creator.priv);
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+    body = buildEnablePlatformKeyBody("g1", clone(group), backend.pub, creator.pub, creator.priv, [
+      "key_1_0",
+    ]);
+    const enabled = { init: JSON.parse(body).data, status: "PENDING" };
+
+    body = buildDisablePlatformKeyBody(
+      "g1",
+      clone(enabled),
+      backend.pub,
+      creator.pub,
+      creator.priv,
+    );
+    const updated = { init: JSON.parse(body).data, status: "PENDING" };
+
+    expect(getGroupDisplayState(updated, creator.pub, creator.priv).signers).toEqual([
+      "[aaaa0000/48']xpub1",
+      "[]",
+    ]);
   });
 });
 

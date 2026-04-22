@@ -8,12 +8,13 @@ import {
   loadConfig,
 } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
-import { ADDRESS_TYPES, ADDRESS_TYPE_LABELS, type AddressType } from "../core/address-type.js";
+import { ADDRESS_TYPES, numberToAddressType, type AddressType } from "../core/address-type.js";
 import {
   buildCreateGroupBody,
   buildJoinGroupEvent,
   buildAddKeyBody,
   buildFinalizeBody,
+  buildGroupStateBroadcastBodyIfNeeded,
   buildSignerDescriptor,
   getGroupDisplayState,
   isGroupFinalized,
@@ -108,6 +109,14 @@ function parseSigningDelayOption(value: string): number {
   }
 }
 
+function parseSlotListOption(value: string, previous: string[]): string[] {
+  const next = value
+    .split(",")
+    .map((slot) => slot.trim())
+    .filter((slot) => slot.length > 0);
+  return [...previous, ...next];
+}
+
 async function resolveSandboxId(client: ApiClient, input: string): Promise<string> {
   if (!looksLikeJoinUrl(input)) {
     return input;
@@ -131,8 +140,9 @@ sandboxCommand
   .command("create")
   .description("Create a new group wallet sandbox")
   .requiredOption("--name <name>", "Wallet name")
-  .requiredOption("--m <number>", "Required signatures", parseInt)
-  .requiredOption("--n <number>", "Total signers", parseInt)
+  .option("--m <number>", "Required signatures", parseInt)
+  .option("--n <number>", "Total signers", parseInt)
+  .option("--miniscript-template <template>", "Miniscript template for a wsh(miniscript) sandbox")
   .option(
     "--address-type <type>",
     "Address type (NATIVE_SEGWIT, NESTED_SEGWIT, LEGACY, TAPROOT)",
@@ -142,12 +152,45 @@ sandboxCommand
     try {
       const globals = cmd.optsWithGlobals();
       const { pub, priv } = requireEphemeralKeys(globals.network);
+      const miniscriptTemplate =
+        typeof options.miniscriptTemplate === "string" ? options.miniscriptTemplate.trim() : "";
 
-      if (options.m > options.n) {
+      if (miniscriptTemplate.length > 0 && (options.m != null || options.n != null)) {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: "Use either --miniscript-template or --m/--n, not both",
+          },
+          cmd,
+        );
+        return;
+      }
+      if (miniscriptTemplate.length === 0 && (options.m == null || options.n == null)) {
+        printError(
+          {
+            error: "MISSING_PARAM",
+            message: "Provide --m and --n for multisig, or use --miniscript-template",
+          },
+          cmd,
+        );
+        return;
+      }
+      if (miniscriptTemplate.length > 0 && options.addressType !== "NATIVE_SEGWIT") {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: "Miniscript sandboxes currently support NATIVE_SEGWIT only",
+          },
+          cmd,
+        );
+        return;
+      }
+
+      if (miniscriptTemplate.length === 0 && options.m > options.n) {
         printError({ error: "INVALID_PARAM", message: "m must be <= n" }, cmd);
         return;
       }
-      if (options.n < 2) {
+      if (miniscriptTemplate.length === 0 && options.n < 2) {
         printError(
           {
             error: "INVALID_PARAM",
@@ -170,11 +213,12 @@ sandboxCommand
 
       const body = buildCreateGroupBody(
         options.name,
-        options.m,
-        options.n,
+        options.m ?? 0,
+        options.n ?? 0,
         options.addressType as AddressType,
         pub,
         priv,
+        miniscriptTemplate,
       );
 
       const apiKey = requireApiKey(globals.apiKey, globals.network);
@@ -215,8 +259,26 @@ sandboxCommand
   .action(async (sandboxId, _options, cmd) => {
     try {
       const client = createClient(cmd);
+      const globals = cmd.optsWithGlobals();
+      const network = getNetwork(globals.network);
+      let result = await client.get<{ group: Record<string, unknown> }>(
+        `/v1.1/shared-wallets/groups/${sandboxId}`,
+      );
 
-      const result = await client.get(`/v1.1/shared-wallets/groups/${sandboxId}`);
+      const keys = getEphemeralKeypair(loadConfig(), network);
+      if (keys?.pub && keys?.priv) {
+        const syncBody = buildGroupStateBroadcastBodyIfNeeded(
+          sandboxId,
+          result.group,
+          keys.pub,
+          keys.priv,
+        );
+        if (syncBody) {
+          await client.post("/v1.1/shared-wallets/events/send", syncBody);
+          result = await client.get(`/v1.1/shared-wallets/groups/${sandboxId}`);
+        }
+      }
+
       printSandboxResult(result, cmd);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
@@ -256,7 +318,7 @@ sandboxCommand
   .command("add-key")
   .description("Add a signer key to a specific slot")
   .argument("<sandbox-id>", "Sandbox ID")
-  .requiredOption("--slot <number>", "Slot index", parseInt)
+  .requiredOption("--slot <slot>", "Slot index or miniscript signer name")
   .option("--fingerprint <xfp>", "Master fingerprint (8 hex chars)")
   .option("--descriptor <descriptor>", "Full signer descriptor [xfp/path]xpub (supports h or ')")
   .option("--xpub <xpub>", "Extended public key")
@@ -314,6 +376,45 @@ sandboxCommand
       const groupData = await client.get<{ group: Record<string, unknown> }>(
         `/v1.1/shared-wallets/groups/${sandboxId}`,
       );
+      const state = getGroupDisplayState(groupData.group, pub, priv);
+      const requestedSlot = String(options.slot).trim();
+
+      let slot: number;
+      if (/^\d+$/.test(requestedSlot)) {
+        slot = Number(requestedSlot);
+      } else if (state.kind === "miniscript") {
+        slot = state.slotNames.indexOf(requestedSlot);
+        if (slot === -1) {
+          printError(
+            {
+              error: "INVALID_PARAM",
+              message: `Unknown miniscript signer slot: ${requestedSlot}`,
+            },
+            cmd,
+          );
+          return;
+        }
+      } else {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: "--slot must be a numeric index for multisig sandboxes",
+          },
+          cmd,
+        );
+        return;
+      }
+
+      if (slot < 0 || slot >= state.n) {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: `Slot ${requestedSlot} is out of range`,
+          },
+          cmd,
+        );
+        return;
+      }
 
       let descriptor: string;
       if (isStoredKeyMode) {
@@ -332,8 +433,10 @@ sandboxCommand
 
         // Get sandbox address type to derive correct path
         const state = getGroupDisplayState(groupData.group, pub, priv);
-        const addressType = ADDRESS_TYPE_LABELS[state.addressType];
-        if (!addressType) {
+        let addressType: AddressType;
+        try {
+          addressType = numberToAddressType(state.addressType);
+        } catch {
           printError(
             {
               error: "INVALID_STATE",
@@ -385,7 +488,7 @@ sandboxCommand
       }
 
       // 3. Build encrypted event body
-      const body = buildAddKeyBody(sandboxId, groupData.group, options.slot, descriptor, pub, priv);
+      const body = buildAddKeyBody(sandboxId, groupData.group, slot, descriptor, pub, priv);
 
       // 4. Send event
       await client.post("/v1.1/shared-wallets/events/send", body);
@@ -489,6 +592,12 @@ platformKeyCommand
   .command("enable")
   .description("Enable platform key on a sandbox")
   .argument("<sandbox-id>", "Sandbox ID")
+  .option(
+    "--slot <slot>",
+    "Miniscript signer slot name (repeatable or comma-separated)",
+    parseSlotListOption,
+    [],
+  )
   .action(async (sandboxId, _options, cmd) => {
     try {
       const globals = cmd.optsWithGlobals();
@@ -500,8 +609,51 @@ platformKeyCommand
       const groupData = await client.get<{ group: Record<string, unknown> }>(
         `/v1.1/shared-wallets/groups/${sandboxId}`,
       );
+      const display = getGroupDisplayState(groupData.group, pub, priv);
+      const options = _options as { slot?: string[] };
+      const slots = Array.from(new Set(options.slot ?? []));
 
-      const body = buildEnablePlatformKeyBody(sandboxId, groupData.group, backendPubkey, pub, priv);
+      if (display.kind === "multisig" && slots.length > 0) {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: "Platform key slots must be empty for multisig sandboxes",
+          },
+          cmd,
+        );
+        return;
+      }
+      if (display.kind === "miniscript" && slots.length === 0) {
+        printError(
+          {
+            error: "MISSING_PARAM",
+            message: "Miniscript platform key enable requires at least one --slot",
+          },
+          cmd,
+        );
+        return;
+      }
+      for (const slot of slots) {
+        if (!display.slotNames.includes(slot)) {
+          printError(
+            {
+              error: "INVALID_PARAM",
+              message: `Unknown miniscript platform key slot: ${slot}`,
+            },
+            cmd,
+          );
+          return;
+        }
+      }
+
+      const body = buildEnablePlatformKeyBody(
+        sandboxId,
+        groupData.group,
+        backendPubkey,
+        pub,
+        priv,
+        slots,
+      );
 
       await client.post("/v1.1/shared-wallets/events/send", body);
 
@@ -696,13 +848,16 @@ platformKeyCommand
         if (!config) {
           print({ status: "disabled" }, cmd);
         } else {
-          print({ status: "enabled", policies: config.policies }, cmd);
+          print({ status: "enabled", policies: config.policies, slots: config.slots }, cmd);
         }
       } else {
         if (!config) {
           console.log("Platform Key:    Disabled");
         } else {
           console.log("Platform Key:    Enabled");
+          if (config.slots && config.slots.length > 0) {
+            console.log(`Slots:           ${config.slots.join(", ")}`);
+          }
           for (const line of formatPoliciesText(config.policies)) {
             console.log(line);
           }

@@ -14,6 +14,9 @@ import {
   type PlatformKeyPolicies,
 } from "../platform-key.js";
 import { TESTNET_VERSIONS } from "../address.js";
+import { buildWalletDescriptor } from "../descriptor.js";
+import { buildMiniscriptDescriptor } from "../miniscript.js";
+import { signWalletPsbtWithKey } from "../psbt-sign.js";
 import { encryptWalletPayload, decryptWalletPayload } from "../wallet-keys.js";
 import type { WalletData } from "../storage.js";
 
@@ -594,8 +597,16 @@ const TEST_WALLET: WalletData = {
   name: "Wallet 1",
   m: 2,
   n: 3,
-  addressType: 3,
-  descriptor: "",
+  addressType: "NATIVE_SEGWIT",
+  descriptor: buildWalletDescriptor(
+    [
+      "[b9a14f1a/48'/1'/0'/2']tpubDDuXvjq5jan2EVqnJpQjUcUAhYWVf4rrfuAgPp2oLqeGE6eZXvci5dbzuwpHdHrmGVzeBVZSCLavn4Fr5sYAd5PtzcufWwNH78KpUm37RRs",
+      "[8317a853/48'/1'/0'/2']tpubDFUfs6uQ1PdCjjEasu5jAVjN32hhiSfFzS4cmgtkAK83WwWVSm26aoGeRBqKry51WmZkUgewhRaJzGGb3YLdxCFyKL8f7zC9tsF7KhQ9RxZ",
+      "[ecfed4c1/48'/1'/45'/2']tpubDEeLpUMN5J595ocbHwWGyX39k7X8Jae5DqyQe5csXgJAnUZsAKrP6dhy2WDtxXvMmYCGTXo5eUuMAKV9dQryVyx3kW1EZnLXtcTTxsBvrnD",
+    ],
+    2,
+    "NATIVE_SEGWIT",
+  ),
   signers: [
     "[b9a14f1a/48'/1'/0'/2']tpubDDuXvjq5jan2EVqnJpQjUcUAhYWVf4rrfuAgPp2oLqeGE6eZXvci5dbzuwpHdHrmGVzeBVZSCLavn4Fr5sYAd5PtzcufWwNH78KpUm37RRs",
     "[8317a853/48'/1'/0'/2']tpubDFUfs6uQ1PdCjjEasu5jAVjN32hhiSfFzS4cmgtkAK83WwWVSm26aoGeRBqKry51WmZkUgewhRaJzGGb3YLdxCFyKL8f7zC9tsF7KhQ9RxZ",
@@ -617,6 +628,67 @@ describe("createDummyPsbt", () => {
 
     expect(psbt.inputsLength).toBe(1);
     expect(psbt.outputsLength).toBe(1);
+  });
+
+  it("supports miniscript wallets", () => {
+    const miniscriptWallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor: buildMiniscriptDescriptor(
+        `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),pk(${TEST_WALLET.signers[1]}/<0;1>/*))`,
+        "NATIVE_SEGWIT",
+      ),
+    };
+
+    const psbt = createDummyPsbt(miniscriptWallet, TEST_REQUEST_BODY, "testnet");
+    expect(psbt.inputsLength).toBe(1);
+    expect(psbt.outputsLength).toBe(1);
+  });
+
+  it("signs miniscript dummy PSBTs with the fallback signer", () => {
+    const miniscriptWallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor: buildMiniscriptDescriptor(
+        `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),pk(${TEST_WALLET.signers[1]}/<0;1>/*))`,
+        "NATIVE_SEGWIT",
+      ),
+    };
+    const psbt = createDummyPsbt(miniscriptWallet, TEST_REQUEST_BODY, "testnet");
+    const signerKey = HDKey.fromExtendedKey(TEST_XPRV, TESTNET_VERSIONS);
+
+    const signed = signWalletPsbtWithKey(psbt, signerKey, TEST_XFP, miniscriptWallet.descriptor);
+
+    expect(signed).toBe(1);
+    expect(extractPartialSignature(psbt, TEST_XFP)).toMatch(/^30[0-9a-f]+01$/);
+  });
+
+  it("uses miniscript relative timelocks as input sequence", () => {
+    const miniscriptWallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor: buildMiniscriptDescriptor(
+        `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),older(10))`,
+        "NATIVE_SEGWIT",
+      ),
+    };
+
+    const psbt = createDummyPsbt(miniscriptWallet, TEST_REQUEST_BODY, "testnet");
+    expect(psbt.getInput(0).sequence).toBe(10);
+  });
+
+  it("uses miniscript absolute timelocks as transaction locktime", () => {
+    const miniscriptWallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor: buildMiniscriptDescriptor(
+        `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
+        "NATIVE_SEGWIT",
+      ),
+    };
+
+    const psbt = createDummyPsbt(miniscriptWallet, TEST_REQUEST_BODY, "testnet");
+    expect(psbt.lockTime).toBe(144);
   });
 
   it("uses RBF sequence (0xfffffffd)", () => {

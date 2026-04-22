@@ -1,0 +1,447 @@
+{
+  "generatedFrom": "libnunchuk parity helper",
+  "note": "Static fixture so nunchuk-cli tests do not depend on a local libnunchuk binary.",
+  "policyCompilation": [
+    {
+      "request": {
+        "action": "policy_to_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "config": {
+          "alice": "alice",
+          "bob": "bob"
+        },
+        "policy": "or(pk(alice),pk(bob))"
+      },
+      "response": {
+        "miniscript": "or_b(pk(alice),s:pk(bob))",
+        "ok": true
+      }
+    },
+    {
+      "request": {
+        "action": "policy_to_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "config": {
+          "a": "a",
+          "b": "b"
+        },
+        "policy": "and(pk(a),or(pk(b),after(144)))"
+      },
+      "response": {
+        "miniscript": "and_v(v:pk(a),or_d(pk(b),after(144)))",
+        "ok": true
+      }
+    },
+    {
+      "request": {
+        "action": "policy_to_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "config": {
+          "a": "a",
+          "b": "b"
+        },
+        "policy": "or(3@and(pk(a),older(10)),1@pk(b))"
+      },
+      "response": {
+        "miniscript": "andor(pk(a),older(10),pkh(b))",
+        "ok": true
+      }
+    },
+    {
+      "request": {
+        "action": "policy_to_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "config": {
+          "a": "a",
+          "b": "b",
+          "c": "c"
+        },
+        "policy": "thresh(2,pk(a),pk(b),pk(c))"
+      },
+      "response": {
+        "miniscript": "multi(2,a,b,c)",
+        "ok": true
+      }
+    }
+  ],
+  "validTemplates": [
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "or_d(multi(2,key_0,key_1,key_2),and_v(v:pk(key_3),after(1785542400)))"
+      },
+      "response": {
+        "abbreviated": "or_d(multi(2,key_0,key_1,key_2),and_v(v:pk(key_3),after(1785542400)))",
+        "duplicateKeysOk": true,
+        "miniscript": "or_d(multi(2,key_0,key_1,key_2),and_v(v:pk(key_3),after(1785542400)))",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 9,
+        "sane": true,
+        "scriptNode": "or(multi(2,key_0,key_1,key_2),and(pk(key_3),after(1785542400)))",
+        "scriptSize": 149,
+        "signingPaths": [
+          [
+            []
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "stackSize": 4,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": true,
+        "witnessSize": 147
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "thresh(3,pk(key_1),s:pk(key_2),s:pk(key_3),sln:older(12960))"
+      },
+      "response": {
+        "abbreviated": "thresh(3,pk(key_1),s:pk(key_2),s:pk(key_3),sln:older(12960))",
+        "duplicateKeysOk": true,
+        "miniscript": "thresh(3,pk(key_1),s:pk(key_2),s:pk(key_3),sln:older(12960))",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 15,
+        "sane": true,
+        "scriptNode": "thresh(3,pk(key_1),pk(key_2),pk(key_3),older(12960))",
+        "scriptSize": 122,
+        "signingPaths": [
+          [
+            [],
+            [],
+            []
+          ],
+          [
+            [],
+            [],
+            []
+          ],
+          [
+            [],
+            [],
+            []
+          ],
+          [
+            [],
+            [],
+            []
+          ]
+        ],
+        "stackSize": 4,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": true,
+        "witnessSize": 221
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "andor(pk(a),older(10),pkh(b))"
+      },
+      "response": {
+        "abbreviated": "andor(pk(a),older(10),pkh(b))",
+        "duplicateKeysOk": true,
+        "miniscript": "andor(pk(a),older(10),pkh(b))",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 9,
+        "sane": true,
+        "scriptNode": "andor(pk(a),older(10),pk(b))",
+        "scriptSize": 65,
+        "signingPaths": [
+          [
+            [],
+            []
+          ],
+          [
+            []
+          ]
+        ],
+        "stackSize": 3,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": true,
+        "witnessSize": 108
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "and_v(v:pk(a),or_d(pk(b),after(144)))"
+      },
+      "response": {
+        "abbreviated": "and_v(v:pk(a),or_d(pk(b),after(144)))",
+        "duplicateKeysOk": true,
+        "miniscript": "and_v(v:pk(a),or_d(pk(b),after(144)))",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 6,
+        "sane": true,
+        "scriptNode": "and(pk(a),or(pk(b),after(144)))",
+        "scriptSize": 77,
+        "signingPaths": [
+          [
+            [],
+            []
+          ],
+          [
+            [],
+            []
+          ]
+        ],
+        "stackSize": 2,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": true,
+        "witnessSize": 146
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "and_b(pk(a),s:pk(b))"
+      },
+      "response": {
+        "abbreviated": "and_b(pk(a),s:pk(b))",
+        "duplicateKeysOk": true,
+        "miniscript": "and_b(pk(a),s:pk(b))",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 4,
+        "sane": true,
+        "scriptNode": "and(pk(a),pk(b))",
+        "scriptSize": 72,
+        "signingPaths": [
+          [
+            [],
+            []
+          ]
+        ],
+        "stackSize": 2,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": true,
+        "witnessSize": 146
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "and_v(v:pk(a),sha256(2222222222222222222222222222222222222222222222222222222222222222))"
+      },
+      "response": {
+        "abbreviated": "and_v(v:pk(a),sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+        "duplicateKeysOk": true,
+        "miniscript": "and_v(v:pk(a),sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 5,
+        "sane": true,
+        "scriptNode": "and(pk(a),sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+        "scriptSize": 74,
+        "signingPaths": [
+          [
+            [],
+            []
+          ]
+        ],
+        "stackSize": 2,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": true,
+        "witnessSize": 106
+      }
+    }
+  ],
+  "invalidTemplates": [
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "multi(1,key_1,)"
+      },
+      "response": {
+        "error": "Invalid miniscript",
+        "ok": false
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "multi(1,,key_1)"
+      },
+      "response": {
+        "error": "Invalid miniscript",
+        "ok": false
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "thresh(1,pk(key_1),)"
+      },
+      "response": {
+        "error": "Invalid miniscript",
+        "ok": false
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "and_v(v:pk(key_1), pk(key_2))"
+      },
+      "response": {
+        "error": "Invalid miniscript",
+        "ok": false
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "vv:pk(key_1)"
+      },
+      "response": {
+        "error": "Invalid miniscript",
+        "ok": false
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "s:l:n:older(12960)"
+      },
+      "response": {
+        "error": "Invalid miniscript",
+        "ok": false
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "n:0"
+      },
+      "response": {
+        "abbreviated": "n:0",
+        "duplicateKeysOk": true,
+        "miniscript": "n:0",
+        "needsSignature": true,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": null,
+        "sane": true,
+        "scriptNode": null,
+        "scriptSize": 2,
+        "signingPaths": [],
+        "stackSize": null,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": false,
+        "witnessSize": null
+      }
+    },
+    {
+      "request": {
+        "action": "parse_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "u:1"
+      },
+      "response": {
+        "abbreviated": "u:1",
+        "duplicateKeysOk": true,
+        "miniscript": "u:1",
+        "needsSignature": false,
+        "nonMalleable": true,
+        "ok": true,
+        "ops": 3,
+        "sane": false,
+        "scriptNode": null,
+        "scriptSize": 5,
+        "signingPaths": [],
+        "stackSize": 1,
+        "timeLocksOk": true,
+        "valid": true,
+        "validTopLevel": true,
+        "walletTemplateValid": false,
+        "witnessSize": 2
+      }
+    }
+  ],
+  "descriptorChecksums": [
+    {
+      "request": {
+        "action": "descriptor_for_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "or_d(multi(2,key_0,key_1,key_2),and_v(v:pk(key_3),after(1785542400)))"
+      },
+      "response": {
+        "descriptor": "wsh(or_d(multi(2,key_0,key_1,key_2),and_v(v:pk(key_3),after(1785542400))))#crpa6yd2",
+        "ok": true
+      }
+    },
+    {
+      "request": {
+        "action": "descriptor_for_miniscript",
+        "addressType": "NATIVE_SEGWIT",
+        "miniscript": "multi(2,[94334c52/48'/1'/0'/2']tpubDELqhHfquXR4mjoSjBm7FCyaMcd6zFoCiFSpvEQPwXr4oULNz9SozPgQvQGk3Sc8VxNtSbczDjhYQv95cpKR9FeCqWHEeL3395FohnX8KyD/<0;1>/*,[9b701d82/48'/1'/0'/2']tpubDEM4H9JMeDYxoj12zsMnfp4ESDkD6k4RBD7SBibX4Wk6Mme96633gfHkyhqHFewrHGoTbcEQ517STcEKBBg36o4D7BK6NCqTHmMoM7nUkRq/<0;1>/*,[a3fdcdd5/48'/1'/0'/2']tpubDEDtkrUUpfLYxoRG3NnwNYRB2V3ebaQFCYY9KyoPmaGHjY8vp2iwWiAJsNrV5PUTVvahfDvWK935T7hcjeHBNw9cJ2PmDKtueGuCykNEAr1/<0;1>/*)"
+      },
+      "response": {
+        "descriptor": "wsh(multi(2,[94334c52/48'/1'/0'/2']tpubDELqhHfquXR4mjoSjBm7FCyaMcd6zFoCiFSpvEQPwXr4oULNz9SozPgQvQGk3Sc8VxNtSbczDjhYQv95cpKR9FeCqWHEeL3395FohnX8KyD/<0;1>/*,[9b701d82/48'/1'/0'/2']tpubDEM4H9JMeDYxoj12zsMnfp4ESDkD6k4RBD7SBibX4Wk6Mme96633gfHkyhqHFewrHGoTbcEQ517STcEKBBg36o4D7BK6NCqTHmMoM7nUkRq/<0;1>/*,[a3fdcdd5/48'/1'/0'/2']tpubDEDtkrUUpfLYxoRG3NnwNYRB2V3ebaQFCYY9KyoPmaGHjY8vp2iwWiAJsNrV5PUTVvahfDvWK935T7hcjeHBNw9cJ2PmDKtueGuCykNEAr1/<0;1>/*))#0kz2jxlc",
+        "ok": true
+      }
+    }
+  ],
+  "descriptorMetadata": [
+    {
+      "request": {
+        "action": "parse_descriptor",
+        "descriptor": "wsh(multi(2,[94334c52/48'/1'/0'/2']tpubDELqhHfquXR4mjoSjBm7FCyaMcd6zFoCiFSpvEQPwXr4oULNz9SozPgQvQGk3Sc8VxNtSbczDjhYQv95cpKR9FeCqWHEeL3395FohnX8KyD/<0;1>/*,[9b701d82/48'/1'/0'/2']tpubDEM4H9JMeDYxoj12zsMnfp4ESDkD6k4RBD7SBibX4Wk6Mme96633gfHkyhqHFewrHGoTbcEQ517STcEKBBg36o4D7BK6NCqTHmMoM7nUkRq/<0;1>/*,[a3fdcdd5/48'/1'/0'/2']tpubDEDtkrUUpfLYxoRG3NnwNYRB2V3ebaQFCYY9KyoPmaGHjY8vp2iwWiAJsNrV5PUTVvahfDvWK935T7hcjeHBNw9cJ2PmDKtueGuCykNEAr1/<0;1>/*))#0kz2jxlc"
+      },
+      "response": {
+        "addressType": 3,
+        "descriptor": "wsh(multi(2,[94334c52/48'/1'/0'/2']tpubDELqhHfquXR4mjoSjBm7FCyaMcd6zFoCiFSpvEQPwXr4oULNz9SozPgQvQGk3Sc8VxNtSbczDjhYQv95cpKR9FeCqWHEeL3395FohnX8KyD/0/*,[9b701d82/48'/1'/0'/2']tpubDEM4H9JMeDYxoj12zsMnfp4ESDkD6k4RBD7SBibX4Wk6Mme96633gfHkyhqHFewrHGoTbcEQ517STcEKBBg36o4D7BK6NCqTHmMoM7nUkRq/0/*,[a3fdcdd5/48'/1'/0'/2']tpubDEDtkrUUpfLYxoRG3NnwNYRB2V3ebaQFCYY9KyoPmaGHjY8vp2iwWiAJsNrV5PUTVvahfDvWK935T7hcjeHBNw9cJ2PmDKtueGuCykNEAr1/0/*))#4x5sqpr0",
+        "m": 0,
+        "miniscript": "multi(2,[94334c52/48'/1'/0'/2']tpubDELqhHfquXR4mjoSjBm7FCyaMcd6zFoCiFSpvEQPwXr4oULNz9SozPgQvQGk3Sc8VxNtSbczDjhYQv95cpKR9FeCqWHEeL3395FohnX8KyD/*,[9b701d82/48'/1'/0'/2']tpubDEM4H9JMeDYxoj12zsMnfp4ESDkD6k4RBD7SBibX4Wk6Mme96633gfHkyhqHFewrHGoTbcEQ517STcEKBBg36o4D7BK6NCqTHmMoM7nUkRq/*,[a3fdcdd5/48'/1'/0'/2']tpubDEDtkrUUpfLYxoRG3NnwNYRB2V3ebaQFCYY9KyoPmaGHjY8vp2iwWiAJsNrV5PUTVvahfDvWK935T7hcjeHBNw9cJ2PmDKtueGuCykNEAr1/*)",
+        "n": 3,
+        "ok": true,
+        "signers": [
+          "[94334c52/48'/1'/0'/2']tpubDELqhHfquXR4mjoSjBm7FCyaMcd6zFoCiFSpvEQPwXr4oULNz9SozPgQvQGk3Sc8VxNtSbczDjhYQv95cpKR9FeCqWHEeL3395FohnX8KyD",
+          "[9b701d82/48'/1'/0'/2']tpubDEM4H9JMeDYxoj12zsMnfp4ESDkD6k4RBD7SBibX4Wk6Mme96633gfHkyhqHFewrHGoTbcEQ517STcEKBBg36o4D7BK6NCqTHmMoM7nUkRq",
+          "[a3fdcdd5/48'/1'/0'/2']tpubDEDtkrUUpfLYxoRG3NnwNYRB2V3ebaQFCYY9KyoPmaGHjY8vp2iwWiAJsNrV5PUTVvahfDvWK935T7hcjeHBNw9cJ2PmDKtueGuCykNEAr1"
+        ],
+        "walletType": 3
+      }
+    }
+  ]
+}

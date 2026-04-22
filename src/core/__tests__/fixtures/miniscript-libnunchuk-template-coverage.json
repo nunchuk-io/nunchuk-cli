@@ -1,0 +1,481 @@
+{
+  "generatedFrom": "libnunchuk parity helper",
+  "note": "Compact libnunchuk output covering native-segwit miniscript template primitives, wrappers, combinators, timelocks, hashes, and invalid wallet templates.",
+  "cases": [
+    {
+      "miniscript": "0",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "0",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "1",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "1",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "pk_k(key_0)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "pk_k(key_0)",
+      "sane": false,
+      "validTopLevel": false,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "pk_h(key_0)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "pk_h(key_0)",
+      "sane": false,
+      "validTopLevel": false,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(pk(key_0))#0q5afuwl"
+    },
+    {
+      "miniscript": "pkh(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "pkh(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(pkh(key_0))#avyvpvsf"
+    },
+    {
+      "miniscript": "older(10)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "older(10)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "older(4194305)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "older(4194305)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "after(144)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "after(144)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "after(500000001)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "after(500000001)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "sha256(2222222222222222222222222222222222222222222222222222222222222222)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "sha256(2222222222222222222222222222222222222222222222222222222222222222)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "hash256(2222222222222222222222222222222222222222222222222222222222222222)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "hash256(2222222222222222222222222222222222222222222222222222222222222222)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "ripemd160(1111111111111111111111111111111111111111)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "ripemd160(1111111111111111111111111111111111111111)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "hash160(1111111111111111111111111111111111111111)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "hash160(1111111111111111111111111111111111111111)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "andor(pk(key_0),pk(key_1),pk(key_2))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "andor(pk(key_0),pk(key_1),pk(key_2))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "andor(pk(key_0),pk(key_1),pk(key_2))",
+      "descriptor": "wsh(andor(pk(key_0),pk(key_1),pk(key_2)))#fhmamwzu"
+    },
+    {
+      "miniscript": "and_v(v:pk(key_0),pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_v(v:pk(key_0),pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(and_v(v:pk(key_0),pk(key_1)))#aqxp3u4n"
+    },
+    {
+      "miniscript": "and_b(pk(key_0),s:pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_b(pk(key_0),s:pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(and_b(pk(key_0),s:pk(key_1)))#2t4nc4y6"
+    },
+    {
+      "miniscript": "and_n(pk(key_0),pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_n(pk(key_0),pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(and_n(pk(key_0),pk(key_1)))#2nh9kra7"
+    },
+    {
+      "miniscript": "or_b(pk(key_0),s:pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "or_b(pk(key_0),s:pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "or(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(or_b(pk(key_0),s:pk(key_1)))#4vexcnqs"
+    },
+    {
+      "miniscript": "or_c(pk(key_0),v:pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "or_c(pk(key_0),v:pk(key_1))",
+      "sane": false,
+      "validTopLevel": false,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "t:or_c(pk(key_0),v:pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "t:or_c(pk(key_0),v:pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "or(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(t:or_c(pk(key_0),v:pk(key_1)))#etp8jtl3"
+    },
+    {
+      "miniscript": "or_d(pk(key_0),pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "or_d(pk(key_0),pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "or(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(or_d(pk(key_0),pk(key_1)))#43hdea4a"
+    },
+    {
+      "miniscript": "or_i(pk(key_0),pk(key_1))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "or_i(pk(key_0),pk(key_1))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "or(pk(key_0),pk(key_1))",
+      "descriptor": "wsh(or_i(pk(key_0),pk(key_1)))#9e5fdgz8"
+    },
+    {
+      "miniscript": "thresh(2,pk(key_0),s:pk(key_1),s:pk(key_2))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "thresh(2,pk(key_0),s:pk(key_1),s:pk(key_2))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "thresh(2,pk(key_0),pk(key_1),pk(key_2))",
+      "descriptor": "wsh(thresh(2,pk(key_0),s:pk(key_1),s:pk(key_2)))#a4z7sknp"
+    },
+    {
+      "miniscript": "multi(2,key_0,key_1,key_2)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "multi(2,key_0,key_1,key_2)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "multi(2,key_0,key_1,key_2)",
+      "descriptor": "wsh(multi(2,key_0,key_1,key_2))#pvm38cdf"
+    },
+    {
+      "miniscript": "a:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "a:pk(key_0)",
+      "sane": false,
+      "validTopLevel": false,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "and_b(pk(key_1),a:pk(key_0))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_b(pk(key_1),a:pk(key_0))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_1),pk(key_0))",
+      "descriptor": "wsh(and_b(pk(key_1),a:pk(key_0)))#60t6rnnf"
+    },
+    {
+      "miniscript": "s:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "s:pk(key_0)",
+      "sane": false,
+      "validTopLevel": false,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "and_b(pk(key_1),s:pk(key_0))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_b(pk(key_1),s:pk(key_0))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_1),pk(key_0))",
+      "descriptor": "wsh(and_b(pk(key_1),s:pk(key_0)))#nsq63n37"
+    },
+    {
+      "miniscript": "c:pk_k(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(c:pk_k(key_0))#vwn9y0d3"
+    },
+    {
+      "miniscript": "c:pk_h(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "pkh(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(c:pk_h(key_0))#4jzcsa6y"
+    },
+    {
+      "miniscript": "tv:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "tv:pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(tv:pk(key_0))#8v6ygkjw"
+    },
+    {
+      "miniscript": "dv:after(10)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "dv:after(10)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "and_v(v:after(10),pk(key_0))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_v(v:after(10),pk(key_0))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(after(10),pk(key_0))",
+      "descriptor": "wsh(and_v(v:after(10),pk(key_0)))#jdywr97s"
+    },
+    {
+      "miniscript": "j:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "j:pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(j:pk(key_0))#3dn5asv6"
+    },
+    {
+      "miniscript": "n:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "n:pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(n:pk(key_0))#xhmqtr5j"
+    },
+    {
+      "miniscript": "l:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "l:pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(l:pk(key_0))#wqh7kdq7"
+    },
+    {
+      "miniscript": "u:pk(key_0)",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "u:pk(key_0)",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "pk(key_0)",
+      "descriptor": "wsh(u:pk(key_0))#6cfylktq"
+    },
+    {
+      "miniscript": "or_d(pk(key_0),and_v(v:pk(key_1),older(10)))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "or_d(pk(key_0),and_v(v:pk(key_1),older(10)))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "or(pk(key_0),and(pk(key_1),older(10)))",
+      "descriptor": "wsh(or_d(pk(key_0),and_v(v:pk(key_1),older(10))))#aea9gcwp"
+    },
+    {
+      "miniscript": "or_d(multi(2,key_0,key_1),and_v(v:pk(key_2),after(500000001)))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "or_d(multi(2,key_0,key_1),and_v(v:pk(key_2),after(500000001)))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "or(multi(2,key_0,key_1),and(pk(key_2),after(500000001)))",
+      "descriptor": "wsh(or_d(multi(2,key_0,key_1),and_v(v:pk(key_2),after(500000001))))#2qpt5jkh"
+    },
+    {
+      "miniscript": "and_v(v:pk(key_0),sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_v(v:pk(key_0),sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "descriptor": "wsh(and_v(v:pk(key_0),sha256(2222222222222222222222222222222222222222222222222222222222222222)))#vgl29ags"
+    },
+    {
+      "miniscript": "and_v(v:pk(key_0),hash256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_v(v:pk(key_0),hash256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),hash256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "descriptor": "wsh(and_v(v:pk(key_0),hash256(2222222222222222222222222222222222222222222222222222222222222222)))#ttc579ka"
+    },
+    {
+      "miniscript": "and_v(v:pk(key_0),ripemd160(1111111111111111111111111111111111111111))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_v(v:pk(key_0),ripemd160(1111111111111111111111111111111111111111))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),ripemd160(1111111111111111111111111111111111111111))",
+      "descriptor": "wsh(and_v(v:pk(key_0),ripemd160(1111111111111111111111111111111111111111)))#n64vndqt"
+    },
+    {
+      "miniscript": "and_v(v:pk(key_0),hash160(1111111111111111111111111111111111111111))",
+      "ok": true,
+      "walletTemplateValid": true,
+      "abbreviated": "and_v(v:pk(key_0),hash160(1111111111111111111111111111111111111111))",
+      "sane": true,
+      "validTopLevel": true,
+      "scriptNode": "and(pk(key_0),hash160(1111111111111111111111111111111111111111))",
+      "descriptor": "wsh(and_v(v:pk(key_0),hash160(1111111111111111111111111111111111111111)))#4gmqrqur"
+    },
+    {
+      "miniscript": "thresh(2,pk(key_0),s:pk(key_1),a:sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "thresh(2,pk(key_0),s:pk(key_1),a:sha256(2222222222222222222222222222222222222222222222222222222222222222))",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "multi_a(2,key_0,key_1)",
+      "ok": false,
+      "walletTemplateValid": false,
+      "error": "Invalid miniscript"
+    },
+    {
+      "miniscript": "and_v(v:after(1),after(500000000))",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "and_v(v:after(1),after(500000000))",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "and_v(v:older(1),older(4194305))",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "and_v(v:older(1),older(4194305))",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "and_v(v:pk(key_0),pk(key_0))",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "and_v(v:pk(key_0),pk(key_0))",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    },
+    {
+      "miniscript": "multi(1,key_0,key_0)",
+      "ok": true,
+      "walletTemplateValid": false,
+      "abbreviated": "multi(1,key_0,key_0)",
+      "sane": false,
+      "validTopLevel": true,
+      "scriptNode": null
+    }
+  ]
+}

@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { HDKey } from "@scure/bip32";
 import { print, printError, printTable } from "../output.js";
 import { requireEmail, getNetwork } from "../core/config.js";
-import type { AddressType } from "../core/address-type.js";
+import { ADDRESS_TYPES, parseAddressTypeInput, type AddressType } from "../core/address-type.js";
 import {
   generateMnemonic24,
   generateMnemonic12,
@@ -14,18 +14,6 @@ import {
 } from "../core/keygen.js";
 import { MAINNET_VERSIONS, TESTNET_VERSIONS } from "../core/address.js";
 import { saveKey, listKeys } from "../core/storage.js";
-
-const VALID_ADDRESS_TYPES: AddressType[] = ["NATIVE_SEGWIT", "NESTED_SEGWIT", "LEGACY", "TAPROOT"];
-
-function parseAddressType(value: string): AddressType {
-  const upper = value.toUpperCase().replace(/-/g, "_") as AddressType;
-  if (!VALID_ADDRESS_TYPES.includes(upper)) {
-    throw new Error(
-      `Invalid address type: ${value}. Must be one of: ${VALID_ADDRESS_TYPES.join(", ")}`,
-    );
-  }
-  return upper;
-}
 
 export const keyCommand = new Command("key").description("Key generation and derivation");
 
@@ -94,11 +82,7 @@ keyCommand
   .option("--mnemonic <words>", "BIP39 mnemonic (space-separated, wrap in quotes)")
   .option("--xprv <xprv>", "BIP32 master extended private key (depth-0)")
   .option("--passphrase <passphrase>", "BIP39 passphrase (only with --mnemonic)")
-  .option(
-    "--address-type <type>",
-    `Address type: ${VALID_ADDRESS_TYPES.join(", ")}`,
-    "NATIVE_SEGWIT",
-  )
+  .option("--address-type <type>", `Address type: ${ADDRESS_TYPES.join(", ")}`, "NATIVE_SEGWIT")
   .option("--path <path>", "Custom derivation path (overrides --address-type)")
   .action((options, cmd) => {
     const globals = cmd.optsWithGlobals();
@@ -173,7 +157,7 @@ keyCommand
       }
     } else {
       // Standard multi-sig path
-      const addressType = parseAddressType(options.addressType);
+      const addressType = parseAddressTypeInput(options.addressType);
       const info = getSignerInfo(rootKey, network, addressType);
 
       if (globals.json) {

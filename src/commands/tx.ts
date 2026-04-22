@@ -1,16 +1,23 @@
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import { Transaction } from "@scure/btc-signer";
-import { HDKey } from "@scure/bip32";
 import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
 import type { Network } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/electrum.js";
-import { deriveAddresses } from "../core/address.js";
+import { deriveDescriptorAddresses } from "../core/address.js";
 import { loadWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
+import { signWalletPsbtWithKey } from "../core/psbt-sign.js";
+import { parseDescriptor } from "../core/descriptor.js";
+import { finalizeMiniscriptPsbt } from "../core/miniscript-finalize.js";
+import {
+  addMiniscriptPreimagesToPsbt,
+  formatMiniscriptPreimageRequirement,
+  type MiniscriptPreimageRequirement,
+} from "../core/miniscript-preimage.js";
 import {
   createTransaction,
   uploadTransaction,
@@ -20,7 +27,12 @@ import {
   combinePendingPsbt,
   decodePsbtDetail,
   fetchConfirmedTransactions,
+  fetchPendingTxInputTimelockMetadataBatch,
+  fetchPsbtInputTimelockMetadata,
   ServerTxResponse,
+  type PendingTx,
+  type PendingTxDetail,
+  type PendingTxInputTimelockMetadata,
 } from "../core/transaction.js";
 import {
   formatBtc,
@@ -29,8 +41,80 @@ import {
   getOutputAddress,
   statusFromHeight,
 } from "../core/format.js";
-import { convertAmount, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
+import { convertAmountInputToSats, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
 import { print, printError } from "../output.js";
+
+function parseMiniscriptPathOption(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("--miniscript-path must be a non-negative integer");
+  }
+  return parsed;
+}
+
+function parsePreimageOption(value: string, previous: string[]): string[] {
+  const next = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return [...previous, ...next];
+}
+
+function printMiniscriptPathSummary(
+  miniscriptPath:
+    | {
+        index: number;
+        lockTime: number;
+        preimageRequirements: MiniscriptPreimageRequirement[];
+        requiredSignatures: number;
+        sequence: number;
+        signerNames: string[];
+      }
+    | undefined,
+  indent = "  ",
+): void {
+  if (!miniscriptPath) {
+    return;
+  }
+
+  console.log(`${indent}Miniscript path: #${miniscriptPath.index}`);
+  console.log(`${indent}Required signers: ${miniscriptPath.requiredSignatures}`);
+  console.log(`${indent}Locktime: ${miniscriptPath.lockTime}`);
+  console.log(`${indent}Sequence: ${miniscriptPath.sequence}`);
+  if (miniscriptPath.preimageRequirements.length > 0) {
+    console.log(
+      `${indent}Hash preimages: ${miniscriptPath.preimageRequirements.map(formatMiniscriptPreimageRequirement).join(", ")}`,
+    );
+  }
+  console.log(
+    `${indent}Path signers: ${miniscriptPath.signerNames.length > 0 ? miniscriptPath.signerNames.join(", ") : "(none)"}`,
+  );
+}
+
+function printTimelockSummary(
+  timelockedUntil:
+    | {
+        based: string;
+        mature: boolean | null;
+        value: number | null;
+      }
+    | undefined,
+  indent = "  ",
+): void {
+  if (!timelockedUntil || timelockedUntil.based === "NONE") {
+    return;
+  }
+
+  const target =
+    timelockedUntil.value == null
+      ? "undetermined"
+      : timelockedUntil.based === "TIME_LOCK"
+        ? `${timelockedUntil.value} (${formatDate(timelockedUntil.value)})`
+        : String(timelockedUntil.value);
+  const state =
+    timelockedUntil.mature == null ? "undetermined" : timelockedUntil.mature ? "mature" : "pending";
+  console.log(`${indent}Timelock: ${state} ${timelockedUntil.based} until ${target}`);
+}
 
 function getGlobals(cmd: Command): { apiKey: string; network: Network; email: string } {
   const globals = cmd.optsWithGlobals();
@@ -52,6 +136,100 @@ function requireWallet(email: string, network: Network, walletId: string): Walle
   return wallet;
 }
 
+interface DecodedPendingTx {
+  tx: PendingTx;
+  detail: PendingTxDetail | null;
+}
+
+function decodePendingTxWithoutMetadata(
+  tx: PendingTx,
+  network: Network,
+  wallet: WalletData,
+): DecodedPendingTx {
+  return {
+    tx,
+    detail: decodePsbtDetail(tx.psbt, network, wallet.m, wallet.signers, wallet.descriptor),
+  };
+}
+
+async function decodePendingTxsWithTimelockMetadata(
+  pending: PendingTx[],
+  network: Network,
+  wallet: WalletData,
+): Promise<DecodedPendingTx[]> {
+  if (pending.length === 0) {
+    return [];
+  }
+
+  const server = getElectrumServer(network);
+  const electrum = new ElectrumClient();
+  let currentHeight: number | undefined;
+  let currentUnixTime: number | undefined;
+
+  try {
+    await electrum.connect(server.host, server.port, server.protocol);
+    await electrum.serverVersion("nunchuk-cli", "1.4");
+    const tip = await electrum.headersSubscribe();
+    currentHeight = tip.height;
+    currentUnixTime = parseBlockTime(tip.hex);
+
+    let metadataByTxId = new Map<string, PendingTxInputTimelockMetadata[]>();
+    try {
+      metadataByTxId = await fetchPendingTxInputTimelockMetadataBatch(pending, electrum, network);
+    } catch {
+      metadataByTxId = new Map();
+    }
+
+    const decoded: DecodedPendingTx[] = [];
+    for (const tx of pending) {
+      decoded.push({
+        tx,
+        detail: decodePsbtDetail(tx.psbt, network, wallet.m, wallet.signers, wallet.descriptor, {
+          currentHeight,
+          currentUnixTime,
+          inputUtxos: metadataByTxId.get(tx.txId),
+        }),
+      });
+    }
+    return decoded;
+  } catch {
+    return pending.map((tx) => decodePendingTxWithoutMetadata(tx, network, wallet));
+  } finally {
+    electrum.close();
+  }
+}
+
+async function decodePsbtDetailWithTimelockMetadata(
+  psbtB64: string,
+  network: Network,
+  wallet: WalletData,
+  electrum: ElectrumClient,
+): Promise<PendingTxDetail | null> {
+  let currentHeight: number | undefined;
+  let currentUnixTime: number | undefined;
+
+  try {
+    const tip = await electrum.headersSubscribe();
+    currentHeight = tip.height;
+    currentUnixTime = parseBlockTime(tip.hex);
+  } catch {
+    return decodePsbtDetail(psbtB64, network, wallet.m, wallet.signers, wallet.descriptor);
+  }
+
+  let inputUtxos: PendingTxInputTimelockMetadata[] | undefined;
+  try {
+    inputUtxos = await fetchPsbtInputTimelockMetadata(psbtB64, electrum, network);
+  } catch {
+    inputUtxos = undefined;
+  }
+
+  return decodePsbtDetail(psbtB64, network, wallet.m, wallet.signers, wallet.descriptor, {
+    currentHeight,
+    currentUnixTime,
+    inputUtxos,
+  });
+}
+
 export const txCommand = new Command("tx").description("Create, sign, and broadcast transactions");
 
 // tx create — Build PSBT locally, upload to group server
@@ -61,10 +239,21 @@ txCommand
   .description("Create a new transaction")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
   .requiredOption("--to <address>", "Recipient address")
-  .requiredOption("--amount <value>", "Amount to send", parseFloat)
+  .requiredOption("--amount <value>", "Amount to send")
   .option(
     "--currency <code>",
     "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
+  )
+  .option(
+    "--preimage <hex>",
+    "Attach a 32-byte miniscript hash preimage (repeat or comma-separate)",
+    parsePreimageOption,
+    [],
+  )
+  .option(
+    "--miniscript-path <index>",
+    "Select a miniscript signing path by index",
+    parseMiniscriptPathOption,
   )
   .action(async (options, cmd) => {
     try {
@@ -78,14 +267,12 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        let sendAmount: bigint;
         const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
-        if (currency !== "sat") {
-          const rates = await fetchMarketRates();
-          const converted = convertAmount(options.amount, currency, "sat", rates);
-          sendAmount = BigInt(Math.round(converted.converted));
-        } else {
-          sendAmount = BigInt(Math.round(options.amount));
+        const rates =
+          currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
+        const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
+        if (sendAmount <= 0n) {
+          throw new Error("Amount must convert to at least 1 sat");
         }
         const result = await createTransaction({
           wallet,
@@ -93,10 +280,18 @@ txCommand
           electrum,
           toAddress: options.to,
           amount: sendAmount,
+          miniscriptPath: options.miniscriptPath,
+          preimages: options.preimage,
           // Fee rate always estimated from Nunchuk API (with Electrum fallback)
         });
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
+        const detail = await decodePsbtDetailWithTimelockMetadata(
+          result.psbtB64,
+          network,
+          wallet,
+          electrum,
+        );
 
         const globals = cmd.optsWithGlobals();
         if (globals.json) {
@@ -107,6 +302,8 @@ txCommand
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
+              miniscriptPath: detail?.miniscriptPath ?? result.miniscriptPath,
+              timelockedUntil: detail?.timelockedUntil,
             },
             cmd,
           );
@@ -122,6 +319,8 @@ txCommand
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
         }
+        printMiniscriptPathSummary(detail?.miniscriptPath ?? result.miniscriptPath);
+        printTimelockSummary(detail?.timelockedUntil);
         console.log(
           `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId} --xprv <your-xprv>`,
         );
@@ -153,30 +352,6 @@ function hasSignerAlreadySigned(tx: Transaction, xfpInt: number): boolean {
   return false;
 }
 
-/** Sign PSBT inputs for a matched signer key. */
-function signPsbtWithKey(tx: Transaction, signerKey: HDKey, xfpInt: number): void {
-  for (let i = 0; i < tx.inputsLength; i++) {
-    const inp = tx.getInput(i);
-    const bip32Derivation = inp.bip32Derivation as
-      | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
-      | undefined;
-
-    if (!bip32Derivation) continue;
-
-    for (const [, { fingerprint, path }] of bip32Derivation) {
-      if (fingerprint === xfpInt) {
-        const chain = path[path.length - 2];
-        const index = path[path.length - 1];
-        const childKey = signerKey.deriveChild(chain).deriveChild(index);
-        if (childKey.privateKey) {
-          tx.signIdx(childKey.privateKey, i);
-        }
-        break;
-      }
-    }
-  }
-}
-
 // tx sign — Sign PSBT locally, re-upload to server
 // Reference: NunchukImpl::SignTransaction (nunchukimpl.cpp:1297-1371)
 // Reference: SoftwareSigner::SignTx (softwaresigner.cpp:192-216)
@@ -188,6 +363,12 @@ txCommand
   .option("--psbt <psbt>", "Signed PSBT to merge into the current pending transaction")
   .option("--xprv <xprv>", "Extended private key for signing")
   .option("--fingerprint <xfp>", "Fingerprint of a stored key")
+  .option(
+    "--preimage <hex>",
+    "Attach a 32-byte miniscript hash preimage (repeat or comma-separate)",
+    parsePreimageOption,
+    [],
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -196,6 +377,11 @@ txCommand
 
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
       let nextPsbtB64: string;
+      const hasPreimages = Array.isArray(options.preimage) && options.preimage.length > 0;
+      const hasExplicitSigner = Boolean(options.xprv || options.fingerprint);
+      const wantsLocalSigning = !options.psbt && (hasExplicitSigner || !hasPreimages);
+      let didAddPreimages = false;
+      let didLocalSign = false;
 
       if (options.psbt) {
         if (options.xprv || options.fingerprint) {
@@ -208,32 +394,48 @@ txCommand
           );
           return;
         }
-        nextPsbtB64 = String(options.psbt).trim();
+        const tx = Transaction.fromPSBT(Buffer.from(String(options.psbt).trim(), "base64"));
+        if (hasPreimages) {
+          addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, options.preimage);
+          didAddPreimages = true;
+        }
+        nextPsbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
       } else {
         const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
-        const resolved = resolveSignerKeys(options, email, network, wallet.signers);
-        if ("error" in resolved) {
-          printError({ error: "INVALID_PARAM", message: resolved.error }, cmd);
-          return;
+        if (wantsLocalSigning) {
+          const resolved = resolveSignerKeys(options, email, network, wallet.signers);
+          if ("error" in resolved) {
+            printError({ error: "INVALID_PARAM", message: resolved.error }, cmd);
+            return;
+          }
+
+          const toSign = resolved.matched.filter(
+            (m) => !hasSignerAlreadySigned(tx, parseInt(m.signerXfp, 16)),
+          );
+
+          if (toSign.length === 0 && !hasPreimages) {
+            const names = resolved.matched
+              .map((m) => (m.keyName ? `${m.keyName} (${m.signerXfp})` : m.signerXfp))
+              .join(", ");
+            printError({ error: "ALREADY_SIGNED", message: `Already signed by: ${names}` }, cmd);
+            return;
+          }
+
+          for (const matched of toSign) {
+            signWalletPsbtWithKey(
+              tx,
+              matched.signerKey,
+              parseInt(matched.signerXfp, 16),
+              wallet.descriptor,
+            );
+            didLocalSign = true;
+          }
         }
 
-        // Filter out signers that already signed
-        const toSign = resolved.matched.filter(
-          (m) => !hasSignerAlreadySigned(tx, parseInt(m.signerXfp, 16)),
-        );
-
-        if (toSign.length === 0) {
-          const names = resolved.matched
-            .map((m) => (m.keyName ? `${m.keyName} (${m.signerXfp})` : m.signerXfp))
-            .join(", ");
-          printError({ error: "ALREADY_SIGNED", message: `Already signed by: ${names}` }, cmd);
-          return;
+        if (hasPreimages) {
+          addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, options.preimage);
+          didAddPreimages = true;
         }
-
-        for (const matched of toSign) {
-          signPsbtWithKey(tx, matched.signerKey, parseInt(matched.signerXfp, 16));
-        }
-
         nextPsbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
       }
 
@@ -258,7 +460,13 @@ txCommand
         await uploadTransaction(client, wallet, merged.psbtB64, options.txId);
       }
 
-      const detail = decodePsbtDetail(merged.psbtB64, network, wallet.m, wallet.signers);
+      const detail = decodePsbtDetail(
+        merged.psbtB64,
+        network,
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
@@ -267,6 +475,8 @@ txCommand
             updated: merged.changed,
             status: detail?.status ?? "PENDING_SIGNATURES",
             signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
+            miniscriptPath: detail?.miniscriptPath,
+            timelockedUntil: detail?.timelockedUntil,
           },
           cmd,
         );
@@ -280,6 +490,18 @@ txCommand
             ? "Transaction PSBT combined and uploaded to group server."
             : "Provided PSBT added no new data. Group server PSBT unchanged.",
         );
+      } else if (didLocalSign && didAddPreimages) {
+        console.log(
+          merged.changed
+            ? "Transaction updated with signatures and miniscript preimages and uploaded to group server."
+            : "Transaction update produced no new PSBT changes.",
+        );
+      } else if (didAddPreimages) {
+        console.log(
+          merged.changed
+            ? "Transaction updated with miniscript preimages and uploaded to group server."
+            : "Transaction update produced no new PSBT changes.",
+        );
       } else {
         console.log(
           merged.changed
@@ -289,6 +511,8 @@ txCommand
       }
       console.log(`  Transaction ID: ${options.txId}`);
       console.log(`  Status: ${detail?.status ?? "PENDING_SIGNATURES"}${sigInfo}`);
+      printMiniscriptPathSummary(detail?.miniscriptPath);
+      printTimelockSummary(detail?.timelockedUntil);
       if (detail?.status === "READY_TO_BROADCAST") {
         console.log(
           `\nBroadcast with: nunchuk tx broadcast --wallet ${options.wallet} --tx-id ${options.txId}`,
@@ -314,17 +538,26 @@ txCommand
 
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
       const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
+      const parsedDescriptor = parseDescriptor(wallet.descriptor);
 
       // If PSBT is already finalized (e.g. by mobile app), skip finalize()
       // Reference: finalize() clears partialSig and sets finalScriptWitness/finalScriptSig
       // Calling finalize() again on an already-finalized PSBT fails because partialSig is empty
       if (!tx.isFinal) {
         try {
-          tx.finalize();
+          if (parsedDescriptor.kind === "miniscript") {
+            finalizeMiniscriptPsbt(tx, wallet.descriptor, network);
+          } else {
+            tx.finalize();
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`Error: Failed to finalize transaction: ${msg}`);
-          console.error(`Wallet requires ${wallet.m} signatures to broadcast.`);
+          if (parsedDescriptor.kind === "miniscript") {
+            console.error(`Error: Failed to finalize miniscript transaction: ${msg}`);
+          } else {
+            console.error(`Error: Failed to finalize transaction: ${msg}`);
+            console.error(`Wallet requires ${wallet.m} signatures to broadcast.`);
+          }
           process.exit(1);
         }
       }
@@ -389,20 +622,22 @@ txCommand
       // Reference: libnunchuk uses txid as primary key in SQLite — single entry per tx
       const confirmedTxIds = new Set(confirmed.map((c) => c.txHash));
       const pending = allPending.filter((p) => !confirmedTxIds.has(p.txId));
+      const decodedPending = await decodePendingTxsWithTimelockMetadata(pending, network, wallet);
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
           {
-            pending: pending.map((p) => {
-              const detail = decodePsbtDetail(p.psbt, network, wallet.m, wallet.signers);
+            pending: decodedPending.map(({ tx, detail }) => {
               return {
-                txId: p.txId,
+                txId: tx.txId,
                 status: detail?.status ?? "PENDING_SIGNATURES",
                 signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
                 fee: detail?.fee,
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
+                miniscriptPath: detail?.miniscriptPath,
+                timelockedUntil: detail?.timelockedUntil,
                 outputs: detail?.outputs,
                 signers: detail?.signers,
               };
@@ -431,13 +666,12 @@ txCommand
 
       if (pending.length > 0) {
         console.log("Pending transactions (from group server):");
-        pending.forEach((p, i) => {
-          const detail = decodePsbtDetail(p.psbt, network, wallet.m, wallet.signers);
+        decodedPending.forEach(({ tx, detail }, i) => {
           const status = detail?.status ?? "PENDING_SIGNATURES";
           const sigInfo = detail
             ? ` (${detail.signedCount}/${detail.requiredCount} signatures)`
             : "";
-          console.log(`  ${i}: ${p.txId}`);
+          console.log(`  ${i}: ${tx.txId}`);
           console.log(`     Status: ${status}${sigInfo}`);
           if (detail) {
             console.log(`     Fee: ${detail.feeBtc} (${detail.fee})`);
@@ -455,6 +689,8 @@ txCommand
                 .join("  ");
               console.log(`     Signers: ${signerStr}`);
             }
+            printMiniscriptPathSummary(detail.miniscriptPath, "     ");
+            printTimelockSummary(detail.timelockedUntil, "     ");
           }
         });
       }
@@ -498,11 +734,15 @@ txCommand
       const server = getElectrumServer(network);
       const electrum = new ElectrumClient();
       let foundOnChain = false;
+      let currentHeight: number | undefined;
+      let currentUnixTime: number | undefined;
       try {
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
         const tip = await electrum.headersSubscribe();
+        currentHeight = tip.height;
+        currentUnixTime = parseBlockTime(tip.hex);
 
         let rawHex: string;
         try {
@@ -519,7 +759,7 @@ txCommand
 
           // Derive change addresses to detect change outputs
           const changeAddrs = new Set(
-            deriveAddresses(wallet.signers, wallet.m, wallet.addressType, network, 1, 0, 20),
+            deriveDescriptorAddresses(wallet.descriptor, network, 1, 0, 20),
           );
 
           let totalOut = 0n;
@@ -582,19 +822,12 @@ txCommand
           let height = 0;
           let blocktime = 0;
           // Check both receive (chain=0) and change (chain=1) addresses
-          const receiveAddrs = deriveAddresses(
-            wallet.signers,
-            wallet.m,
-            wallet.addressType,
-            network,
-            0,
-            0,
-            20,
-          );
+          const receiveAddrs = deriveDescriptorAddresses(wallet.descriptor, network, 0, 0, 20);
           const allAddrs = [...receiveAddrs, ...changeAddrs];
-          for (const addr of allAddrs) {
-            const sh = addressToScripthash(addr, network);
-            const hist = await electrum.getHistory(sh);
+          const histories = await electrum.getHistoryBatch(
+            allAddrs.map((addr) => addressToScripthash(addr, network)),
+          );
+          for (const hist of histories) {
             const match = hist.find((h) => h.tx_hash === options.txId);
             if (match) {
               height = match.height;
@@ -646,7 +879,7 @@ txCommand
             return;
           }
 
-          console.log("Source: electrum (confirmed)");
+          console.log(`Source: electrum (${confirmations > 0 ? "confirmed" : "pending"})`);
           console.log(`Transaction ID: ${options.txId}`);
           console.log(`Status: ${status}`);
           console.log(`Date: ${formatDate(blocktime)}`);
@@ -681,8 +914,29 @@ txCommand
         if (data && data.transaction && data.transaction.data && data.transaction.data.msg) {
           const plain = secretOpen(data.transaction.data.msg, secretboxKey);
           const parsed = JSON.parse(plain);
+          let inputUtxos: PendingTxInputTimelockMetadata[] | undefined;
+          if (parsed.psbt) {
+            const metadataElectrum = new ElectrumClient();
+            try {
+              await metadataElectrum.connect(server.host, server.port, server.protocol);
+              await metadataElectrum.serverVersion("nunchuk-cli", "1.4");
+              inputUtxos = await fetchPsbtInputTimelockMetadata(
+                parsed.psbt,
+                metadataElectrum,
+                network,
+              );
+            } catch {
+              inputUtxos = undefined;
+            } finally {
+              metadataElectrum.close();
+            }
+          }
           const detail = parsed.psbt
-            ? decodePsbtDetail(parsed.psbt, network, wallet.m, wallet.signers)
+            ? decodePsbtDetail(parsed.psbt, network, wallet.m, wallet.signers, wallet.descriptor, {
+                currentHeight,
+                currentUnixTime,
+                inputUtxos,
+              })
             : null;
           const status = detail?.status ?? "PENDING_SIGNATURES";
 
@@ -697,6 +951,8 @@ txCommand
                 fee: detail?.fee,
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
+                miniscriptPath: detail?.miniscriptPath,
+                timelockedUntil: detail?.timelockedUntil,
                 outputs: detail?.outputs,
                 signers: detail?.signers,
                 psbt: parsed.psbt,
@@ -728,6 +984,8 @@ txCommand
                 .join("  ");
               console.log(`Signers: ${signerStr}`);
             }
+            printMiniscriptPathSummary(detail.miniscriptPath, "");
+            printTimelockSummary(detail.timelockedUntil, "");
           }
           if (parsed.psbt) {
             console.log(`PSBT: ${parsed.psbt}`);

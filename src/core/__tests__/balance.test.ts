@@ -1,9 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
-import { getNextReceiveAddress, getWalletBalance } from "../transaction.js";
-import { deriveAddresses } from "../address.js";
+import { getNextReceiveAddress, getWalletBalance, scanUtxos } from "../transaction.js";
+import { deriveAddresses, deriveDescriptorAddresses } from "../address.js";
+import { buildWalletDescriptor } from "../descriptor.js";
+import { buildMiniscriptDescriptor } from "../miniscript.js";
 import { addressToScripthash } from "../electrum.js";
 import type { WalletData } from "../storage.js";
-import type { ElectrumClient, ScripthashBalance } from "../electrum.js";
+import type { ElectrumClient, HistoryItem, ScripthashBalance, UnspentItem } from "../electrum.js";
 
 // Test signers — same as descriptor.test.ts
 const TEST_SIGNERS = [
@@ -18,34 +20,106 @@ const TEST_WALLET: WalletData = {
   name: "Test Wallet",
   m: 2,
   n: 2,
-  addressType: 3, // NATIVE_SEGWIT
-  descriptor: "wsh(sortedmulti(2,...))",
+  addressType: "NATIVE_SEGWIT", // NATIVE_SEGWIT
+  descriptor: buildWalletDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT"),
   signers: TEST_SIGNERS,
   secretboxKey: "",
   createdAt: "2025-01-01T00:00:00.000Z",
 };
 
+const TEST_MINISCRIPT_DESCRIPTOR = buildMiniscriptDescriptor(
+  `and_v(v:pk(${TEST_SIGNERS[0]}/<0;1>/*),pk(${TEST_SIGNERS[1]}/<0;1>/*))`,
+  "NATIVE_SEGWIT",
+);
+
+const TEST_MINISCRIPT_WALLET: WalletData = {
+  ...TEST_WALLET,
+  walletId: "testid-miniscript",
+  name: "Test Miniscript Wallet",
+  m: 0,
+  descriptor: TEST_MINISCRIPT_DESCRIPTOR,
+};
+
 // Pre-derive real scripthashes for known addresses so mock can match them
 function getScripthash(chain: 0 | 1, index: number): string {
-  const addrs = deriveAddresses(TEST_SIGNERS, 2, 3, "testnet", chain, index, 1);
+  const addrs = deriveAddresses(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet", chain, index, 1);
   return addressToScripthash(addrs[0], "testnet");
 }
 
-function createMockElectrum(balanceMap: Record<string, ScripthashBalance>): ElectrumClient {
+function getMiniscriptScripthash(chain: 0 | 1, index: number): string {
+  const addrs = deriveDescriptorAddresses(TEST_MINISCRIPT_DESCRIPTOR, "testnet", chain, index, 1);
+  return addressToScripthash(addrs[0], "testnet");
+}
+
+function createMockElectrum(
+  balanceMap: Record<string, ScripthashBalance>,
+  historyMap: Record<string, HistoryItem[]> = {},
+): ElectrumClient {
+  const getHistory = vi.fn(async (scripthash: string) => {
+    if (historyMap[scripthash]) {
+      return historyMap[scripthash];
+    }
+    const balance = balanceMap[scripthash];
+    if (balance && (balance.confirmed !== 0 || balance.unconfirmed !== 0)) {
+      return [{ tx_hash: `tx-${scripthash}`, height: 1 }];
+    }
+    return [];
+  });
+  const getBalance = vi.fn(async (scripthash: string) => {
+    return balanceMap[scripthash] ?? { confirmed: 0, unconfirmed: 0 };
+  });
+
   return {
-    getBalance: vi.fn(async (scripthash: string) => {
-      return balanceMap[scripthash] ?? { confirmed: 0, unconfirmed: 0 };
-    }),
+    getHistory,
+    getHistoryBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getHistory)),
+    ),
+    getBalance,
+    getBalanceBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getBalance)),
+    ),
+  } as unknown as ElectrumClient;
+}
+
+function createMockUtxoElectrum(
+  unspentMap: Record<string, UnspentItem[]>,
+  historyMap: Record<string, HistoryItem[]> = {},
+): ElectrumClient {
+  const getHistory = vi.fn(async (scripthash: string) => {
+    if (historyMap[scripthash]) {
+      return historyMap[scripthash];
+    }
+    if ((unspentMap[scripthash] ?? []).length > 0) {
+      return [{ tx_hash: `tx-${scripthash}`, height: 1 }];
+    }
+    return [];
+  });
+  const listUnspent = vi.fn(async (scripthash: string) => unspentMap[scripthash] ?? []);
+
+  return {
+    getHistory,
+    getHistoryBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getHistory)),
+    ),
+    listUnspent,
+    listUnspentBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(listUnspent)),
+    ),
   } as unknown as ElectrumClient;
 }
 
 function createMockHistoryElectrum(
   historyMap: Record<string, Array<{ tx_hash: string; height: number }>>,
 ): ElectrumClient {
+  const getHistory = vi.fn(async (scripthash: string) => {
+    return historyMap[scripthash] ?? [];
+  });
+
   return {
-    getHistory: vi.fn(async (scripthash: string) => {
-      return historyMap[scripthash] ?? [];
-    }),
+    getHistory,
+    getHistoryBatch: vi.fn(async (scripthashes: string[]) =>
+      Promise.all(scripthashes.map(getHistory)),
+    ),
   } as unknown as ElectrumClient;
 }
 
@@ -124,7 +198,8 @@ describe("getWalletBalance", () => {
     // chain 0: index 0 (hit) + 20 empty = 21 calls
     // chain 1: 20 empty = 20 calls
     // Total = 41 calls
-    expect(electrum.getBalance).toHaveBeenCalledTimes(41);
+    expect(electrum.getHistory).toHaveBeenCalledTimes(41);
+    expect(electrum.getBalance).toHaveBeenCalledTimes(1);
   });
 
   it("resets gap counter on non-empty address", async () => {
@@ -142,7 +217,97 @@ describe("getWalletBalance", () => {
     // chain 0: index 0 (hit) + 18 empty + index 19 (hit) + 20 empty = 40 calls
     // chain 1: 20 empty = 20 calls
     // Total = 60 calls
-    expect(electrum.getBalance).toHaveBeenCalledTimes(60);
+    expect(electrum.getHistory).toHaveBeenCalledTimes(60);
+    expect(electrum.getBalance).toHaveBeenCalledTimes(2);
+  });
+
+  it("supports miniscript wallets", async () => {
+    const shReceive = getMiniscriptScripthash(0, 0);
+    const shChange = getMiniscriptScripthash(1, 1);
+    const electrum = createMockElectrum({
+      [shReceive]: { confirmed: 42000, unconfirmed: 1000 },
+      [shChange]: { confirmed: 5000, unconfirmed: 0 },
+    });
+
+    const balance = await getWalletBalance(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(balance).toBe(48000n);
+  });
+
+  it("does not stop at spent addresses before a funded later index", async () => {
+    const historyMap: Record<string, HistoryItem[]> = {};
+    for (let index = 0; index < 20; index++) {
+      historyMap[getMiniscriptScripthash(0, index)] = [{ tx_hash: `spent-${index}`, height: 1 }];
+    }
+
+    const funded = getMiniscriptScripthash(0, 20);
+    historyMap[funded] = [{ tx_hash: "funded", height: 1 }];
+    const electrum = createMockElectrum(
+      {
+        [funded]: { confirmed: 12345, unconfirmed: 0 },
+      },
+      historyMap,
+    );
+
+    const balance = await getWalletBalance(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(balance).toBe(12345n);
+  });
+});
+
+describe("scanUtxos", () => {
+  it("does not stop at spent addresses before a later UTXO", async () => {
+    const historyMap: Record<string, HistoryItem[]> = {};
+    for (let index = 0; index < 20; index++) {
+      historyMap[getMiniscriptScripthash(0, index)] = [{ tx_hash: `spent-${index}`, height: 1 }];
+    }
+
+    const funded = getMiniscriptScripthash(0, 20);
+    historyMap[funded] = [{ tx_hash: "funded", height: 1 }];
+    const electrum = createMockUtxoElectrum(
+      {
+        [funded]: [{ tx_hash: "funded", tx_pos: 0, height: 1, value: 6789 }],
+      },
+      historyMap,
+    );
+
+    const result = await scanUtxos(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(result.utxos).toHaveLength(1);
+    expect(result.utxos[0]).toMatchObject({
+      txHash: "funded",
+      txPos: 0,
+      value: 6789n,
+      chain: 0,
+      index: 20,
+    });
+  });
+
+  it("records the address index for a UTXO at a non-zero batch offset", async () => {
+    const funded = getMiniscriptScripthash(0, 5);
+    const electrum = createMockUtxoElectrum({
+      [funded]: [{ tx_hash: "funded-offset", tx_pos: 1, height: 1, value: 6789 }],
+    });
+
+    const result = await scanUtxos(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(result.utxos).toHaveLength(1);
+    expect(result.utxos[0]).toMatchObject({
+      txHash: "funded-offset",
+      txPos: 1,
+      value: 6789n,
+      chain: 0,
+      index: 5,
+    });
+  });
+
+  it("advances change index past spent change addresses", async () => {
+    const spentChange = getMiniscriptScripthash(1, 0);
+    const electrum = createMockUtxoElectrum(
+      {},
+      {
+        [spentChange]: [{ tx_hash: "spent-change", height: 1 }],
+      },
+    );
+
+    const result = await scanUtxos(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(result.nextChangeIndex).toBe(1);
   });
 });
 
@@ -151,7 +316,9 @@ describe("getNextReceiveAddress", () => {
     const electrum = createMockHistoryElectrum({});
     const result = await getNextReceiveAddress(TEST_WALLET, "testnet", electrum);
     expect(result.index).toBe(0);
-    expect(result.address).toBe(deriveAddresses(TEST_SIGNERS, 2, 3, "testnet", 0, 0, 1)[0]);
+    expect(result.address).toBe(
+      deriveAddresses(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet", 0, 0, 1)[0],
+    );
   });
 
   it("returns the next index after the highest used receive address", async () => {
@@ -164,6 +331,23 @@ describe("getNextReceiveAddress", () => {
 
     const result = await getNextReceiveAddress(TEST_WALLET, "testnet", electrum);
     expect(result.index).toBe(3);
-    expect(result.address).toBe(deriveAddresses(TEST_SIGNERS, 2, 3, "testnet", 0, 3, 1)[0]);
+    expect(result.address).toBe(
+      deriveAddresses(TEST_SIGNERS, 2, "NATIVE_SEGWIT", "testnet", 0, 3, 1)[0],
+    );
+  });
+
+  it("supports miniscript wallets", async () => {
+    const sh0 = getMiniscriptScripthash(0, 0);
+    const sh1 = getMiniscriptScripthash(0, 1);
+    const electrum = createMockHistoryElectrum({
+      [sh0]: [{ tx_hash: "tx0", height: 1 }],
+      [sh1]: [{ tx_hash: "tx1", height: 2 }],
+    });
+
+    const result = await getNextReceiveAddress(TEST_MINISCRIPT_WALLET, "testnet", electrum);
+    expect(result.index).toBe(2);
+    expect(result.address).toBe(
+      deriveDescriptorAddresses(TEST_MINISCRIPT_DESCRIPTOR, "testnet", 0, 2, 1)[0],
+    );
   });
 });

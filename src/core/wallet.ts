@@ -3,7 +3,11 @@
 
 import type { ApiClient } from "./api-client.js";
 import type { Network } from "./config.js";
-import { buildAnyDescriptor, buildWalletDescriptor, getWalletId } from "./descriptor.js";
+import {
+  buildAnyDescriptorForParsed,
+  buildWalletDescriptorForParsed,
+  getWalletIdForParsed,
+} from "./descriptor.js";
 import type { ParsedDescriptor } from "./descriptor.js";
 import { loadWallet, saveWallet } from "./storage.js";
 import type { WalletData } from "./storage.js";
@@ -36,7 +40,7 @@ export async function recoverWallet(params: RecoverWalletParams): Promise<Recove
   const { client, parsed, network, email, name } = params;
 
   // Step 1: Compute wallet ID
-  const walletId = getWalletId(parsed.signers, parsed.m, parsed.addressType);
+  const walletId = getWalletIdForParsed(parsed);
 
   // Step 2: Check if wallet already exists locally
   const existing = loadWallet(email, network, walletId);
@@ -45,7 +49,7 @@ export async function recoverWallet(params: RecoverWalletParams): Promise<Recove
   }
 
   // Step 3: Derive GID and check server
-  const anyDescriptor = buildAnyDescriptor(parsed.signers, parsed.m, parsed.addressType);
+  const anyDescriptor = buildAnyDescriptorForParsed(parsed);
   const rootKey = await deriveRootKeyFromDescriptor(anyDescriptor);
   const gid = deriveGID(rootKey, network);
 
@@ -70,7 +74,7 @@ export async function recoverWallet(params: RecoverWalletParams): Promise<Recove
     m: parsed.m,
     n: parsed.n,
     addressType: parsed.addressType,
-    descriptor: buildWalletDescriptor(parsed.signers, parsed.m, parsed.addressType),
+    descriptor: buildWalletDescriptorForParsed(parsed),
     signers: parsed.signers,
     secretboxKey: Buffer.from(secretboxKey).toString("base64"),
     createdAt: new Date().toISOString(),

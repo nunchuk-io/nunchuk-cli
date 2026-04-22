@@ -27,6 +27,7 @@ import {
   getSandboxIds,
 } from "../storage.js";
 import type { Profile, WalletData, StoredKey } from "../storage.js";
+import { buildWalletDescriptor } from "../descriptor.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -37,6 +38,10 @@ process.env.NUNCHUK_CLI_HOME = TEST_HOME;
 
 const DATA_DIR = path.join(TEST_HOME, "data");
 const MASTER_KEY_FILE = path.join(TEST_HOME, ".master-key");
+const TEST_SIGNERS = [
+  "[534a4a82/48'/1'/0'/2']tpubDFeha94AzbvqSzMLj6iihYeP1zwfW3KgNcmd7oXvKD9dApjWK4KT1RzzbSNUgmsgBs8sshky7pLTUZahkfPTNVck2fwS5wXyn1nTAy8jZCJ",
+  "[4bda0966/48'/1'/0'/2']tpubDFTwhyhyq2m2eQGCGQvzgZocFVsQAyjYCAMdGs9ahzTsvd49M3ekAiZvpzyjXF57FpC5zm8NVEPgnptFGSdzM6aZcWVrB6cqVC7fXhXzW6s",
+];
 
 let testCounter = 0;
 
@@ -318,10 +323,10 @@ describe("wallet storage", () => {
       gid: "gid-1",
       name: `Wallet ${id}`,
       m: 2,
-      n: 3,
-      addressType: 2,
-      descriptor: "wsh(sortedmulti(...))",
-      signers: ["signer1", "signer2"],
+      n: 2,
+      addressType: "NESTED_SEGWIT",
+      descriptor: buildWalletDescriptor(TEST_SIGNERS, 2, "NESTED_SEGWIT"),
+      signers: TEST_SIGNERS,
       secretboxKey: Buffer.from("a".repeat(32)).toString("base64"),
       createdAt: new Date().toISOString(),
     };
@@ -332,6 +337,69 @@ describe("wallet storage", () => {
     const wallet = makeWallet("w1");
     saveWallet(email, network, wallet);
     expect(loadWallet(email, network, "w1")).toEqual(wallet);
+  });
+
+  it("persists descriptor as the canonical wallet source", () => {
+    const email = trackEmail(uniqueEmail("wallet"));
+    const wallet = makeWallet("w1");
+    saveWallet(email, network, wallet);
+
+    const db = new Database(storageDbFile(email, network), { readonly: true });
+    const row = db.prepare("SELECT encrypted FROM wallets WHERE wallet_id = ?").get("w1") as {
+      encrypted: Uint8Array;
+    };
+    db.close();
+
+    const stored = JSON.parse(
+      decrypt(Buffer.from(row.encrypted), getOrCreateMasterKey()),
+    ) as Record<string, unknown>;
+    expect(stored.descriptor).toBe(wallet.descriptor);
+    expect(stored.m).toBeUndefined();
+    expect(stored.n).toBeUndefined();
+    expect(stored.addressType).toBeUndefined();
+    expect(stored.signers).toBeUndefined();
+  });
+
+  it("migrates v1 wallet rows to descriptor-only payloads", () => {
+    const email = trackEmail(uniqueEmail("wallet"));
+    const wallet = makeWallet("w1");
+    saveWallet(email, network, wallet);
+    _closeDatabase();
+
+    const dbFile = storageDbFile(email, network);
+    const legacyPayload = {
+      ...wallet,
+      addressType: 2,
+    };
+    const db = new Database(dbFile);
+    db.prepare("UPDATE wallets SET encrypted = ? WHERE wallet_id = ?").run(
+      encrypt(JSON.stringify(legacyPayload), getOrCreateMasterKey()),
+      wallet.walletId,
+    );
+    db.prepare("UPDATE meta SET value = ? WHERE key = ?").run("1", "schema_version");
+    db.close();
+
+    expect(loadWallet(email, network, wallet.walletId)).toEqual(wallet);
+    _closeDatabase();
+
+    const migratedDb = new Database(dbFile, { readonly: true });
+    const version = migratedDb
+      .prepare("SELECT value FROM meta WHERE key = ?")
+      .get("schema_version") as { value: string };
+    const row = migratedDb
+      .prepare("SELECT encrypted FROM wallets WHERE wallet_id = ?")
+      .get(wallet.walletId) as { encrypted: Uint8Array };
+    migratedDb.close();
+
+    const stored = JSON.parse(
+      decrypt(Buffer.from(row.encrypted), getOrCreateMasterKey()),
+    ) as Record<string, unknown>;
+    expect(version.value).toBe("2");
+    expect(stored.descriptor).toBe(wallet.descriptor);
+    expect(stored.m).toBeUndefined();
+    expect(stored.n).toBeUndefined();
+    expect(stored.addressType).toBeUndefined();
+    expect(stored.signers).toBeUndefined();
   });
 
   it("returns null for non-existent wallet", () => {
@@ -477,7 +545,7 @@ describe("encrypted storage properties", () => {
       | undefined;
     db.close();
 
-    expect(row?.value).toBe("1");
+    expect(row?.value).toBe("2");
   });
 
   it("stores encrypted profile blobs in meta", () => {

@@ -3,24 +3,24 @@ import { Command, InvalidArgumentError } from "commander";
 import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
 import type { Network } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
-import { formatAddressType } from "../core/address-type.js";
 import { listWallets, loadWallet, removeWallet, saveWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { print, printError, printTable, printWalletResult } from "../output.js";
 import {
-  buildWalletDescriptor,
-  buildExternalDescriptor,
-  buildAnyDescriptor,
+  buildWalletDescriptorForParsed,
+  buildExternalDescriptorForParsed,
+  buildAnyDescriptorForParsed,
   parseDescriptor,
   parseBsmsRecord,
 } from "../core/descriptor.js";
 import { buildMultisigConfig, parseMultisigConfig } from "../core/multisig-config.js";
-import { deriveFirstAddress } from "../core/address.js";
+import { deriveDescriptorFirstAddress } from "../core/address.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
 import { recoverWallet } from "../core/wallet.js";
 import { ElectrumClient } from "../core/electrum.js";
 import { getNextReceiveAddress, getWalletBalance } from "../core/transaction.js";
 import { formatBtc } from "../core/format.js";
+import { signWalletPsbtWithKey } from "../core/psbt-sign.js";
 import {
   getWalletPlatformKeyConfig,
   buildGlobalPolicyFromFlags,
@@ -57,22 +57,20 @@ function looksLikeMultisigConfig(content: string): boolean {
     /(^|\n)\s*[0-9a-fA-F]{8}\s*:/i.test(content)
   );
 }
+function parseWalletDescriptor(wallet: WalletData) {
+  return parseDescriptor(wallet.descriptor);
+}
 
-function formatWalletOutput<T extends { addressType?: number }>(
-  wallet: T,
-):
-  | T
-  | (Omit<T, "addressType"> & {
-      addressType?: number | string;
-    }) {
-  if (wallet.addressType == null) {
-    return wallet;
-  }
+function getWalletTypeLabel(wallet: WalletData): string {
+  return parseWalletDescriptor(wallet).kind === "miniscript"
+    ? "MINISCRIPT"
+    : `${wallet.m}-of-${wallet.n}`;
+}
 
-  return {
-    ...wallet,
-    addressType: formatAddressType(wallet.addressType),
-  };
+function toWalletView(wallet: WalletData) {
+  const { gid: _gid, secretboxKey: _secretboxKey, descriptor: _descriptor, ...walletView } = wallet;
+
+  return { ...walletView, typeLabel: getWalletTypeLabel(wallet) };
 }
 
 walletCommand
@@ -100,12 +98,11 @@ walletCommand
 
           const results = [];
           for (const w of wallets) {
-            const balance = await getWalletBalance(w, network, electrum);
             results.push({
               walletId: w.walletId,
               name: w.name,
-              type: `${w.m}-of-${w.n}`,
-              balance: formatBtc(balance),
+              type: getWalletTypeLabel(w),
+              balance: formatBtc(await getWalletBalance(w, network, electrum)),
               createdAt: w.createdAt,
             });
           }
@@ -123,7 +120,7 @@ walletCommand
       const results = wallets.map((w) => ({
         walletId: w.walletId,
         name: w.name,
-        type: `${w.m}-of-${w.n}`,
+        type: getWalletTypeLabel(w),
         createdAt: w.createdAt,
       }));
       if (globals.json) {
@@ -153,12 +150,7 @@ walletCommand
         return;
       }
 
-      const {
-        gid: _gid,
-        secretboxKey: _secretboxKey,
-        descriptor: _descriptor,
-        ...walletView
-      } = wallet;
+      const walletView = toWalletView(wallet);
       const client = new ApiClient(requireApiKey(globals.apiKey, globals.network), network);
       const pkConfig = await getWalletPlatformKeyConfig(client, wallet);
 
@@ -275,11 +267,13 @@ walletCommand
         return;
       }
 
+      const parsed = parseWalletDescriptor(wallet);
+
       if (type === "descriptor") {
         const descriptor =
           format === "all"
-            ? buildExternalDescriptor(wallet.signers, wallet.m, wallet.addressType)
-            : buildWalletDescriptor(wallet.signers, wallet.m, wallet.addressType);
+            ? buildExternalDescriptorForParsed(parsed)
+            : buildWalletDescriptorForParsed(parsed);
 
         if (globals.json) {
           print({ descriptor }, cmd);
@@ -307,11 +301,12 @@ walletCommand
           );
         }
       } else {
+        const descriptor = buildAnyDescriptorForParsed(parsed);
         const bsms = {
           version: "BSMS 1.0",
-          descriptor: buildAnyDescriptor(wallet.signers, wallet.m, wallet.addressType),
+          descriptor,
           pathRestrictions: "No path restrictions",
-          firstAddress: deriveFirstAddress(wallet.signers, wallet.m, wallet.addressType, network),
+          firstAddress: deriveDescriptorFirstAddress(descriptor, network),
         };
 
         if (globals.json) {
@@ -375,12 +370,7 @@ walletCommand
 
       wallet.name = options.name;
       saveWallet(email, network, wallet);
-      const {
-        gid: _gid,
-        secretboxKey: _secretboxKey,
-        descriptor: _descriptor,
-        ...walletView
-      } = wallet;
+      const walletView = toWalletView(wallet);
       const client = new ApiClient(requireApiKey(globals.apiKey, globals.network), network);
       const pkConfig = await getWalletPlatformKeyConfig(client, wallet);
       printWalletResult({ ...walletView, platformKey: pkConfig.platformKey ?? undefined }, cmd);
@@ -436,7 +426,16 @@ walletCommand
         name: options.name,
       });
 
-      print({ ...result, wallet: formatWalletOutput(result.wallet) }, cmd);
+      print(
+        {
+          ...result,
+          wallet: {
+            ...result.wallet,
+            typeLabel: getWalletTypeLabel(result.wallet),
+          },
+        },
+        cmd,
+      );
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -753,27 +752,7 @@ dummyTxCommand
       for (const matched of toSign) {
         const dummyPsbt = createDummyPsbt(wallet, dummyTx.requestBody, network);
         const xfpInt = parseInt(matched.signerXfp, 16);
-
-        for (let i = 0; i < dummyPsbt.inputsLength; i++) {
-          const inp = dummyPsbt.getInput(i);
-          const bip32Derivation = inp.bip32Derivation as
-            | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
-            | undefined;
-
-          if (!bip32Derivation) continue;
-
-          for (const [, { fingerprint, path }] of bip32Derivation) {
-            if (fingerprint === xfpInt) {
-              const chain = path[path.length - 2];
-              const index = path[path.length - 1];
-              const childKey = matched.signerKey.deriveChild(chain).deriveChild(index);
-              if (childKey.privateKey) {
-                dummyPsbt.signIdx(childKey.privateKey, i);
-              }
-              break;
-            }
-          }
-        }
+        signWalletPsbtWithKey(dummyPsbt, matched.signerKey, xfpInt, wallet.descriptor);
 
         const signature = extractPartialSignature(dummyPsbt, xfpInt);
         requestTokens.push(`${matched.signerXfp}.${signature}`);

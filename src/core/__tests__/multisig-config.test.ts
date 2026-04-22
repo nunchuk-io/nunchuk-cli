@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSignerDescriptor } from "../descriptor.js";
+import { buildWalletDescriptor, parseSignerDescriptor } from "../descriptor.js";
 import { buildMultisigConfig, parseMultisigConfig } from "../multisig-config.js";
 
 const TEST_SIGNERS = [
@@ -8,7 +8,7 @@ const TEST_SIGNERS = [
 ];
 describe("buildMultisigConfig", () => {
   it("exports derivation paths with m/ prefix", () => {
-    const result = buildMultisigConfig("Test Wallet", TEST_SIGNERS, 2, 2, 3);
+    const result = buildMultisigConfig("Test Wallet", TEST_SIGNERS, 2, 2, "NATIVE_SEGWIT");
 
     expect(result).toBe(
       "# Export from nunchuk-cli\n" +
@@ -25,7 +25,13 @@ describe("buildMultisigConfig", () => {
   });
 
   it("truncates the name to 20 characters", () => {
-    const result = buildMultisigConfig("Long Wallet Name For Coldcard", TEST_SIGNERS, 2, 2, 2);
+    const result = buildMultisigConfig(
+      "Long Wallet Name For Coldcard",
+      TEST_SIGNERS,
+      2,
+      2,
+      "NESTED_SEGWIT",
+    );
 
     expect(result).toContain("Name: Long Wallet Name For");
     expect(result).not.toContain("Name: Long Wallet Name For Coldcard");
@@ -38,7 +44,7 @@ describe("buildMultisigConfig", () => {
       ["[1234abcd/48h/1h/0h/2h]tpubExampleOne", "[abcd1234/48h/1h/0h/2h]tpubExampleTwo"],
       2,
       2,
-      1,
+      "LEGACY",
     );
 
     expect(result).toContain("Derivation: m/48h/1h/0h/2h");
@@ -46,7 +52,7 @@ describe("buildMultisigConfig", () => {
   });
 
   it("supports taproot label parity with libnunchuk", () => {
-    const result = buildMultisigConfig("Taproot", TEST_SIGNERS, 2, 2, 4);
+    const result = buildMultisigConfig("Taproot", TEST_SIGNERS, 2, 2, "TAPROOT");
     expect(result).toContain("Format: P2TR");
   });
 
@@ -56,14 +62,14 @@ describe("buildMultisigConfig", () => {
       [`[534a4a82]${TEST_SIGNERS[0].slice(TEST_SIGNERS[0].indexOf("]") + 1)}`],
       1,
       1,
-      3,
+      "NATIVE_SEGWIT",
     );
 
     expect(result).toContain("Derivation: m");
   });
 
   it("rejects unsupported address types", () => {
-    expect(() => buildMultisigConfig("Bad", TEST_SIGNERS, 2, 2, 0)).toThrow(
+    expect(() => buildMultisigConfig("Bad", TEST_SIGNERS, 2, 2, "BAD" as never)).toThrow(
       "Unsupported address type",
     );
   });
@@ -71,13 +77,15 @@ describe("buildMultisigConfig", () => {
 
 describe("parseMultisigConfig", () => {
   it("parses config exported by buildMultisigConfig", () => {
-    const content = buildMultisigConfig("Test Wallet", TEST_SIGNERS, 2, 2, 3);
+    const content = buildMultisigConfig("Test Wallet", TEST_SIGNERS, 2, 2, "NATIVE_SEGWIT");
     const parsed = parseMultisigConfig(content, "testnet");
 
     expect(parsed).toEqual({
+      descriptor: buildWalletDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT"),
+      kind: "multisig",
       m: 2,
       n: 2,
-      addressType: 3,
+      addressType: "NATIVE_SEGWIT",
       signers: TEST_SIGNERS,
     });
   });
@@ -98,7 +106,7 @@ describe("parseMultisigConfig", () => {
     const parsed = parseMultisigConfig(content, "testnet");
 
     expect(parsed.m).toBe(2);
-    expect(parsed.addressType).toBe(2);
+    expect(parsed.addressType).toBe("NESTED_SEGWIT");
     expect(parsed.signers).toEqual([
       `[534a4a82]${TEST_SIGNERS[0].slice(TEST_SIGNERS[0].indexOf("]") + 1)}`,
       `[4bda0966]${TEST_SIGNERS[1].slice(TEST_SIGNERS[1].indexOf("]") + 1)}`,
@@ -136,7 +144,7 @@ describe("parseMultisigConfig", () => {
     ].join("\n");
 
     const parsed = parseMultisigConfig(content, "testnet");
-    expect(parsed.addressType).toBe(2);
+    expect(parsed.addressType).toBe("NESTED_SEGWIT");
   });
 
   it("rejects signer lines before derivation", () => {
