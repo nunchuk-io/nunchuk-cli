@@ -209,6 +209,10 @@ function printSandboxHuman(group: SandboxSummary): void {
     const descriptor = !Array.isArray(signers) && signers[key] ? signers[key] : null;
     const label = slotNames[i] && slotNames[i] !== key ? ` (${slotNames[i]})` : "";
     if (descriptor) {
+      if (descriptor === "ADDED") {
+        console.log(`  Slot ${i}${label}:  ADDED`);
+        continue;
+      }
       const match = descriptor.match(/^\[([0-9a-fA-F]{8})/);
       const xfp = match ? match[1] : "";
       console.log(`  Slot ${i}${label}:  ${xfp}  ${descriptor}`);

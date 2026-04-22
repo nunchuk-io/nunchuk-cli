@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { generateKeypair } from "../crypto.js";
+import { generateKeypair, publicOpen } from "../crypto.js";
 import { buildMiniscriptDescriptor, miniscriptTemplateToMiniscript } from "../miniscript.js";
 import {
   buildCreateGroupBody,
   buildJoinGroupEvent,
   buildAddKeyBody,
+  buildGroupStateBroadcastBodyIfNeeded,
   buildSignerDescriptor,
   getGroupDisplayState,
   isGroupFinalized,
@@ -393,6 +394,25 @@ describe("getGroupDisplayState", () => {
     expect(display.added).toEqual([0]);
   });
 
+  it("shows ADDED placeholders when this device has no synced state yet", () => {
+    let group = createGroup(2, 2);
+    const body = buildAddKeyBody(
+      "g1",
+      clone(group),
+      0,
+      "[aaaa0000/48']xpub1",
+      creator.pub,
+      creator.priv,
+    );
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    const other = generateKeypair();
+    const display = getGroupDisplayState(group, other.pub, other.priv);
+    expect(display.signers[0]).toBe("ADDED");
+    expect(display.signers[1]).toBe("[]");
+    expect(display.added).toEqual([0]);
+  });
+
   it("merges modified signers from multiple participants", () => {
     let group = createGroup(2, 3);
 
@@ -497,9 +517,23 @@ describe("decryptSigners", () => {
   });
 
   it("throws when no state entry for ephemeral key", () => {
-    const group = createGroup();
+    let group = createGroup(2, 2);
+    let body = buildAddKeyBody(
+      "g1",
+      clone(group),
+      0,
+      "[aaaa0000/48']xpub1",
+      creator.pub,
+      creator.priv,
+    );
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+    body = buildAddKeyBody("g1", clone(group), 1, "[bbbb0000/48']xpub2", creator.pub, creator.priv);
+    group = { init: JSON.parse(body).data, status: "PENDING" };
+
     const other = generateKeypair();
-    expect(() => decryptSigners(group, other.pub, other.priv)).toThrow("no state entry");
+    expect(() => decryptSigners(group, other.pub, other.priv)).toThrow(
+      "Other devices in the group need to come online briefly to securely share their keys with this one",
+    );
   });
 });
 
@@ -531,6 +565,57 @@ describe("buildFinalizeBody", () => {
     expect(result.m).toBe(0);
     expect(result.n).toBe(2);
     expect(result.signers).toEqual([signerA, signerB]);
+  });
+});
+
+describe("buildGroupStateBroadcastBodyIfNeeded", () => {
+  it("rebroadcasts state when another participant has an empty state entry", () => {
+    let group = createGroup(2, 2);
+    const joinBody = buildJoinGroupEvent("g1", clone(group), joiner.pub);
+    group = { id: "g1", init: JSON.parse(joinBody).data, status: "PENDING" };
+
+    const body = buildGroupStateBroadcastBodyIfNeeded("g1", group, creator.pub, creator.priv);
+    expect(body).not.toBeNull();
+
+    const parsed = JSON.parse(body!);
+    expect(parsed.type).toBe("init");
+    expect(parsed.data.stateId).toBe(
+      ((group.init as Record<string, unknown>).stateId as number) + 1,
+    );
+    expect(parsed.data.modified).toEqual({});
+    expect(typeof parsed.data.state[joiner.pub]).toBe("string");
+    expect(parsed.data.state[joiner.pub]).not.toBe("");
+
+    const plaintext = JSON.parse(publicOpen(parsed.data.state[joiner.pub], joiner.priv)) as {
+      signers: string[];
+    };
+    expect(plaintext.signers).toEqual(["[]", "[]"]);
+  });
+
+  it("rebroadcasts merged signer state from modified payloads", () => {
+    let group = createGroup(2, 2);
+    let body = buildJoinGroupEvent("g1", clone(group), joiner.pub);
+    group = { id: "g1", init: JSON.parse(body).data, status: "PENDING" };
+
+    body = buildAddKeyBody("g1", clone(group), 0, "[aaaa0000/48']xpub1", joiner.pub, joiner.priv);
+    group = { id: "g1", init: JSON.parse(body).data, status: "PENDING" };
+
+    const syncBody = buildGroupStateBroadcastBodyIfNeeded("g1", group, creator.pub, creator.priv);
+    expect(syncBody).not.toBeNull();
+
+    const parsed = JSON.parse(syncBody!);
+    expect(parsed.data.modified).toEqual({});
+    expect(parsed.data.pubstate.added).toEqual([0]);
+
+    const joinerPlaintext = JSON.parse(publicOpen(parsed.data.state[joiner.pub], joiner.priv)) as {
+      signers: string[];
+    };
+    expect(joinerPlaintext.signers).toEqual(["[aaaa0000/48']xpub1", "[]"]);
+  });
+
+  it("does nothing when no broadcast is needed", () => {
+    const group = createGroup(2, 2);
+    expect(buildGroupStateBroadcastBodyIfNeeded("g1", group, creator.pub, creator.priv)).toBeNull();
   });
 });
 

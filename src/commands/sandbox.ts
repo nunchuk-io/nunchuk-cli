@@ -14,6 +14,7 @@ import {
   buildJoinGroupEvent,
   buildAddKeyBody,
   buildFinalizeBody,
+  buildGroupStateBroadcastBodyIfNeeded,
   buildSignerDescriptor,
   getGroupDisplayState,
   isGroupFinalized,
@@ -258,8 +259,26 @@ sandboxCommand
   .action(async (sandboxId, _options, cmd) => {
     try {
       const client = createClient(cmd);
+      const globals = cmd.optsWithGlobals();
+      const network = getNetwork(globals.network);
+      let result = await client.get<{ group: Record<string, unknown> }>(
+        `/v1.1/shared-wallets/groups/${sandboxId}`,
+      );
 
-      const result = await client.get(`/v1.1/shared-wallets/groups/${sandboxId}`);
+      const keys = getEphemeralKeypair(loadConfig(), network);
+      if (keys?.pub && keys?.priv) {
+        const syncBody = buildGroupStateBroadcastBodyIfNeeded(
+          sandboxId,
+          result.group,
+          keys.pub,
+          keys.priv,
+        );
+        if (syncBody) {
+          await client.post("/v1.1/shared-wallets/events/send", syncBody);
+          result = await client.get(`/v1.1/shared-wallets/groups/${sandboxId}`);
+        }
+      }
+
       printSandboxResult(result, cmd);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);

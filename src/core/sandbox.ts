@@ -195,6 +195,8 @@ export interface GroupDisplayState {
   url: string;
 }
 
+const ADDED_SIGNER_NAME = "ADDED";
+
 interface GroupDescriptorMetadata {
   kind: "miniscript" | "multisig";
   m: number;
@@ -336,6 +338,9 @@ export function getGroupDisplayState(
 
   let signers = Array.from({ length: n }, () => "[]");
   const stateSigners = decryptSignerSet(state[ephemeralPub], ephemeralPriv);
+  const fallbackAdded = Array.isArray(pubstate.added)
+    ? pubstate.added.filter((item): item is number => typeof item === "number")
+    : [];
   if (stateSigners) {
     signers = stateSigners;
   } else {
@@ -345,6 +350,14 @@ export function getGroupDisplayState(
       : null;
     if (modifiedSigners) {
       signers = modifiedSigners.map((signer) => (isEmptySigner(signer) ? "[]" : signer));
+    }
+
+    // Match libnunchuk's ParseGroupData: when this device has no state entry yet,
+    // slots already recorded in pubstate.added are shown as ADDED placeholders.
+    for (const index of fallbackAdded) {
+      if (index >= 0 && index < n && isEmptySigner(signers[index])) {
+        signers[index] = ADDED_SIGNER_NAME;
+      }
     }
   }
 
@@ -359,9 +372,6 @@ export function getGroupDisplayState(
   const derivedAdded = signers
     .map((signer, index) => (!isEmptySigner(signer) ? index : -1))
     .filter((index) => index >= 0);
-  const fallbackAdded = Array.isArray(pubstate.added)
-    ? pubstate.added.filter((item): item is number => typeof item === "number")
-    : [];
   const occupied = Array.isArray(pubstate.occupied)
     ? pubstate.occupied.flatMap((item) => {
         if (typeof item !== "object" || item === null) {
@@ -395,6 +405,91 @@ export function getGroupDisplayState(
     typeLabel: metadata.typeLabel,
     url: String(groupJson.url ?? ""),
   };
+}
+
+// Match libnunchuk's ParseGroupData need_broadcast path:
+// when this device has decrypted init state and notices either empty participant
+// state entries or signer data that can be merged from modified payloads, it
+// re-encrypts the merged state for all participants and clears modified.
+export function buildGroupStateBroadcastBodyIfNeeded(
+  groupId: string,
+  groupJson: Record<string, unknown>,
+  ephemeralPub: string,
+  ephemeralPriv: string,
+): string | null {
+  const { phase, data } = getGroupPhaseData(groupJson);
+  if (phase !== "init") {
+    return null;
+  }
+
+  const pubstate = data.pubstate as Record<string, unknown>;
+  const state = data.state as Record<string, string>;
+  const modified = data.modified as Record<string, Record<string, string>>;
+  const n = Number(pubstate.n ?? 0);
+  const ciphertext = state[ephemeralPub];
+  if (!ciphertext) {
+    return null;
+  }
+
+  const plaintext = JSON.parse(publicOpen(ciphertext, ephemeralPriv)) as {
+    signers?: string[];
+    [key: string]: unknown;
+  };
+  const signers = Array.isArray(plaintext.signers)
+    ? plaintext.signers.map((signer) => (isEmptySigner(signer) ? "[]" : signer))
+    : Array.from({ length: n }, () => "[]");
+
+  let needBroadcast = false;
+  for (const [key, value] of Object.entries(state)) {
+    if (key !== ephemeralPub && value === "") {
+      needBroadcast = true;
+    }
+  }
+
+  for (const participantModified of Object.values(modified)) {
+    const modifiedSigners = getModifiedSigners(
+      participantModified as Record<string, string>,
+      ephemeralPub,
+      ephemeralPriv,
+      n,
+    );
+    for (let i = 0; i < n; i++) {
+      if (isEmptySigner(signers[i]) && !isEmptySigner(modifiedSigners[i])) {
+        signers[i] = modifiedSigners[i];
+        needBroadcast = true;
+      }
+    }
+  }
+
+  if (!needBroadcast) {
+    return null;
+  }
+
+  plaintext.signers = signers;
+  const encodedPlaintext = JSON.stringify(plaintext);
+  const newState: Record<string, string> = {};
+  for (const key of Object.keys(state)) {
+    newState[key] = publicBox(encodedPlaintext, ephemeralPub, ephemeralPriv, key);
+  }
+
+  const nextPubstate = {
+    ...pubstate,
+    added: signers
+      .map((signer, index) => (!isEmptySigner(signer) ? index : -1))
+      .filter((i) => i >= 0),
+  };
+
+  return JSON.stringify({
+    group_id: groupId,
+    type: "init",
+    data: {
+      version: VERSION,
+      stateId: Number(data.stateId ?? 0) + 1,
+      state: newState,
+      pubstate: nextPubstate,
+      modified: {},
+    },
+  });
 }
 
 // Matches libnunchuk's GroupService::GetModifiedSigners
@@ -545,7 +640,7 @@ export function decryptSigners(
   const ciphertext = state[ephemeralPub];
   if (!ciphertext) {
     throw new Error(
-      "Cannot finalize: no state entry for your ephemeral key. You must be the sandbox creator to finalize.",
+      "Cannot finalize yet: this device has not received the encrypted sandbox state yet. Other devices in the group need to come online briefly to securely share their keys with this one. Once ready, run finalize again.",
     );
   }
 
