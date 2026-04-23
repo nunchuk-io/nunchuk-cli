@@ -322,7 +322,7 @@ txCommand
         printMiniscriptPathSummary(detail?.miniscriptPath ?? result.miniscriptPath);
         printTimelockSummary(detail?.timelockedUntil);
         console.log(
-          `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId} --xprv <your-xprv>`,
+          `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId}`,
         );
       } finally {
         electrum.close();
