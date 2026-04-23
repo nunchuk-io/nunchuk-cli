@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { HDKey } from "@scure/bip32";
 import { print, printError, printTable } from "../output.js";
-import { requireEmail, getNetwork } from "../core/config.js";
+import { requireEmail, getNetwork, getAuthProfile, loadConfig } from "../core/config.js";
 import { ADDRESS_TYPES, parseAddressTypeInput, type AddressType } from "../core/address-type.js";
 import {
   generateMnemonic24,
@@ -13,7 +13,9 @@ import {
   getXpubAtPath,
 } from "../core/keygen.js";
 import { MAINNET_VERSIONS, TESTNET_VERSIONS } from "../core/address.js";
-import { saveKey, listKeys } from "../core/storage.js";
+import { saveKey, listKeys, loadKey } from "../core/storage.js";
+import { ApiClient } from "../core/api-client.js";
+import { promptSecret } from "../core/prompt.js";
 
 export const keyCommand = new Command("key").description("Key generation and derivation");
 
@@ -49,11 +51,20 @@ keyCommand
       print({ mnemonic, name, fingerprint }, cmd);
     } else {
       console.log("");
-      console.log("MNEMONIC (back up these words securely!):");
-      console.log(`  ${mnemonic}`);
-      console.log("");
       console.log(`Name:          ${name}`);
       console.log(`Fingerprint:   ${fingerprint}`);
+      console.log("");
+      console.log("MNEMONIC (back up these words securely — anyone with them controls the key!):");
+      console.log(`  ${mnemonic}`);
+      console.log("");
+      console.log("Reminder:");
+      console.log(
+        "  - Write the words down on paper or a metal backup; do not store them digitally.",
+      );
+      console.log(
+        "  - Clear your terminal scrollback after copying (e.g. `clear && printf '\\e[3J'`).",
+      );
+      console.log("  - Never share the mnemonic with anyone, including Nunchuk support.");
       console.log("");
     }
   });
@@ -182,6 +193,78 @@ keyCommand
         console.log(`Descriptor:    ${info.descriptor}`);
         console.log("");
       }
+    }
+  });
+
+// key reveal — reveal the mnemonic of a stored key, gated by API-key re-entry.
+//
+// The mnemonic is already encrypted at rest; this gate is a human-confirmation
+// step, not a cryptographic protection. Re-validating the API key via getMe()
+// ensures the caller is the current authenticated user.
+keyCommand
+  .command("reveal")
+  .description("Reveal the mnemonic of a stored key (requires API key re-entry)")
+  .requiredOption("--fingerprint <xfp>", "Fingerprint of the stored key to reveal")
+  .action(async (options, cmd) => {
+    try {
+      const globals = cmd.optsWithGlobals();
+      const network = getNetwork(globals.network);
+      const email = requireEmail();
+
+      const stored = loadKey(email, network, options.fingerprint);
+      if (!stored) {
+        printError({ error: "NOT_FOUND", message: `Key ${options.fingerprint} not found` }, cmd);
+        return;
+      }
+
+      const apiKey =
+        globals.apiKey || (await promptSecret("For security, please enter your API secret key: "));
+      if (!apiKey) {
+        printError({ error: "INVALID_KEY", message: "API key cannot be empty" }, cmd);
+        return;
+      }
+
+      let me: { id: string; email: string; name: string };
+      try {
+        me = await new ApiClient(apiKey, network).getMe();
+      } catch {
+        printError({ error: "INVALID_KEY", message: "Invalid API key" }, cmd);
+        return;
+      }
+
+      const profile = getAuthProfile(loadConfig(), network);
+      if (!profile?.email || me.email !== profile.email) {
+        printError({ error: "KEY_MISMATCH", message: "API key does not match current user" }, cmd);
+        return;
+      }
+
+      if (globals.json) {
+        print(
+          { fingerprint: stored.fingerprint, name: stored.name, mnemonic: stored.mnemonic },
+          cmd,
+        );
+      } else {
+        console.log("");
+        console.log(`Name:          ${stored.name}`);
+        console.log(`Fingerprint:   ${stored.fingerprint}`);
+        console.log("");
+        console.log(
+          "MNEMONIC (back up these words securely — anyone with them controls the key!):",
+        );
+        console.log(`  ${stored.mnemonic}`);
+        console.log("");
+        console.log("Reminder:");
+        console.log(
+          "  - Write the words down on paper or a metal backup; do not store them digitally.",
+        );
+        console.log(
+          "  - Clear your terminal scrollback after copying (e.g. `clear && printf '\\e[3J'`).",
+        );
+        console.log("  - Never share the mnemonic with anyone, including Nunchuk support.");
+        console.log("");
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
     }
   });
 

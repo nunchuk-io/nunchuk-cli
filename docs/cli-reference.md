@@ -959,6 +959,32 @@ Alice          73c5da0a      2026-04-03T01:00:00.000Z
 Bob            a1b2c3d4      2026-04-03T02:00:00.000Z
 ```
 
+### `nunchuk key reveal`
+
+Reveal the BIP39 mnemonic of a stored key. As a confirmation step the CLI prompts for the API secret key and validates it against the Nunchuk API; the key must belong to the currently authenticated user.
+
+```bash
+nunchuk key reveal --fingerprint 73c5da0a
+# For security, please enter your API secret key: ********
+
+# Non-interactive (scripting) — uses the global --api-key flag:
+nunchuk --api-key <key> key reveal --fingerprint 73c5da0a
+```
+
+Output:
+```
+Name:          Alice
+Fingerprint:   73c5da0a
+
+MNEMONIC:
+  word1 word2 word3 ... word24
+```
+
+Errors:
+- `NOT_FOUND` — no stored key with that fingerprint
+- `INVALID_KEY` — API key empty or rejected by the server
+- `KEY_MISMATCH` — API key belongs to a different user than the current session
+
 ---
 
 ## Config Commands

@@ -46,6 +46,9 @@ nunchuk key info --fingerprint <xfp>
 # List stored keys
 nunchuk key list
 
+# Reveal the mnemonic of a stored key (prompts for API key)
+nunchuk key reveal --fingerprint <xfp>
+
 # Authenticate separately on another network when needed
 nunchuk --network mainnet auth login
 nunchuk --network testnet auth login
@@ -186,11 +189,12 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 
 ### `key`
 
-| Command        | Description                                             |
-| -------------- | ------------------------------------------------------- |
-| `key generate` | Generate a new BIP39 mnemonic and save locally          |
-| `key info`     | Derive signer info from a stored key, mnemonic, or xprv |
-| `key list`     | List locally stored keys                                |
+| Command | Description |
+|---------|-------------|
+| `key generate` | Generate a new BIP39 mnemonic and save locally |
+| `key info` | Derive signer info from a stored key, mnemonic, or xprv |
+| `key list` | List locally stored keys |
+| `key reveal` | Reveal the mnemonic of a stored key (requires API key re-entry) |
 
 ### `sandbox`
 
