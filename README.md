@@ -9,7 +9,7 @@ Built for integration with AI agent frameworks. See [agent-skills](https://githu
 
 ## Prerequisites
 
-- Node.js >= 18
+- Node.js >= 20
 - Nunchuk API key — generate one at the [Developer Portal](https://developer.nunchuk.io)
 
 ## Installation
