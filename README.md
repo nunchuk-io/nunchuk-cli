@@ -37,6 +37,9 @@ nunchuk auth login
 # Set network (mainnet or testnet)
 nunchuk network set testnet
 
+# Show the current chain tip height and block time
+nunchuk network tip
+
 # Generate a software signing key
 nunchuk key generate --name "Alice"
 
@@ -183,6 +186,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | ----------------------- | ------------------------------------ |
 | `network set <network>` | Set network (`mainnet` or `testnet`) |
 | `network get`           | Show current network                 |
+| `network tip`           | Show current chain tip height/time   |
 
 ### `key`
 
