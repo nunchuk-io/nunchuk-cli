@@ -160,6 +160,23 @@ Output:
   network: testnet
 ```
 
+### `nunchuk network tip`
+
+Show the current chain tip height and block time from the configured Electrum server.
+
+```bash
+nunchuk network tip
+```
+
+Output:
+
+```
+  network: testnet
+  height: 900000
+  blocktime: 1735689600
+  datetime: 2025-01-01 00:00:00 UTC
+```
+
 ---
 
 ## Sandbox Commands

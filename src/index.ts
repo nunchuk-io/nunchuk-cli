@@ -11,13 +11,14 @@ import { txCommand } from "./commands/tx.js";
 import { configCommand } from "./commands/config.js";
 import { currencyCommand } from "./commands/currency.js";
 import { keyCommand } from "./commands/key.js";
+import { getCliVersion } from "./version.js";
 
 const program = new Command();
 
 program
   .name("nunchuk")
   .description("Nunchuk CLI for group wallet management")
-  .version("0.1.0")
+  .version(getCliVersion())
   .option("--json", "Output in JSON format")
   .option("--api-key <key>", "Override stored API key for this command")
   .option("--network <network>", "Override network (mainnet or testnet)");
