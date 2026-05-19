@@ -596,6 +596,38 @@ If the wallet already exists locally, the command returns without overwriting:
 { "status": "already_exists", "wallet": { ... } }
 ```
 
+### `nunchuk wallet replace create <wallet-id>`
+
+Create a replacement sandbox for an existing finalized wallet. The new sandbox starts with the wallet's current signer set, matching libnunchuk's replacement flow. If the wallet has a platform key, the platform-key signer slot is cleared for replacement and the platform key policy is carried into the sandbox.
+
+```bash
+nunchuk wallet replace create w123
+```
+
+### `nunchuk wallet replace list <wallet-id>`
+
+List replacement sandboxes reported by the server for a wallet. Locally accepted groups are shown as `accepted`; undecided groups are shown as `pending`; locally declined groups are hidden.
+
+```bash
+nunchuk wallet replace list w123
+```
+
+### `nunchuk wallet replace accept <wallet-id> <group-id>`
+
+Accept and join a replacement sandbox. The CLI submits the local wallet signers in the join event so the replacement sandbox can be finalized without re-entering unchanged keys.
+
+```bash
+nunchuk wallet replace accept w123 replacement-group-id
+```
+
+### `nunchuk wallet replace decline <wallet-id> <group-id>`
+
+Decline a replacement sandbox locally.
+
+```bash
+nunchuk wallet replace decline w123 replacement-group-id
+```
+
 ### `nunchuk wallet platform-key get <wallet-id>`
 
 Get current platform key policies for a finalized wallet.

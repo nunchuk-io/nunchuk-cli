@@ -232,6 +232,10 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | `wallet delete <id>`              | Delete a wallet                                        |
 | `wallet rename <id>`              | Rename a wallet locally                                |
 | `wallet recover`                  | Recover a wallet from a descriptor or BSMS backup file |
+| `wallet replace create <id>`      | Create a replacement sandbox for a wallet              |
+| `wallet replace list <id>`        | List replacement sandboxes for a wallet                |
+| `wallet replace accept <id> <gid>`  | Accept and join a replacement sandbox                  |
+| `wallet replace decline <id> <gid>` | Decline a replacement sandbox locally                  |
 | `wallet platform-key get <id>`    | Get platform key policies for a wallet                 |
 | `wallet platform-key update <id>` | Request a platform key policy update                   |
 | `wallet dummy-tx list <id>`       | List pending dummy transactions                        |

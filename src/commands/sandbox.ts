@@ -6,6 +6,7 @@ import {
   getEphemeralKeypair,
   getNetwork,
   loadConfig,
+  type Network,
 } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
 import { ADDRESS_TYPES, numberToAddressType, type AddressType } from "../core/address-type.js";
@@ -29,7 +30,10 @@ import {
   removeSandboxId,
   getSandboxIds,
   saveWallet,
+  listWallets,
   loadKey,
+  getReplaceGroupStatuses,
+  ReplaceGroupStatus,
   type WalletData,
 } from "../core/storage.js";
 import { print, printError, printSandboxResult } from "../output.js";
@@ -48,6 +52,7 @@ import {
   type PlatformKeyPolicies,
   type PolicyFlagOptions,
 } from "../core/platform-key.js";
+import { getDeprecatedWalletName, getGroupReplaceWalletId } from "../core/wallet-replacement.js";
 import { readFileSync } from "node:fs";
 
 function requireEphemeralKeys(flagNetwork?: string): { pub: string; priv: string } {
@@ -115,6 +120,53 @@ function parseSlotListOption(value: string, previous: string[]): string[] {
     .map((slot) => slot.trim())
     .filter((slot) => slot.length > 0);
   return [...previous, ...next];
+}
+
+function isDifferentWallet(candidate: WalletData, finalized: WalletData): boolean {
+  return candidate.walletId !== finalized.walletId && candidate.gid !== finalized.gid;
+}
+
+function findReplacedWalletById(
+  wallets: WalletData[],
+  replaceWalletId: unknown,
+  finalized: WalletData,
+): WalletData | undefined {
+  if (typeof replaceWalletId !== "string" || replaceWalletId.length === 0) {
+    return undefined;
+  }
+
+  return wallets.find(
+    (wallet) =>
+      isDifferentWallet(wallet, finalized) &&
+      (wallet.walletId === replaceWalletId || wallet.gid === replaceWalletId),
+  );
+}
+
+function deprecateReplacedWallet(
+  email: string,
+  network: Network,
+  sandboxId: string,
+  group: Record<string, unknown>,
+  finalized: WalletData,
+): void {
+  const wallets = listWallets(email, network);
+  const replacedWallet =
+    findReplacedWalletById(wallets, getGroupReplaceWalletId(group), finalized) ??
+    wallets.find(
+      (wallet) =>
+        isDifferentWallet(wallet, finalized) &&
+        getReplaceGroupStatuses(email, network, wallet.walletId)[sandboxId] ===
+          ReplaceGroupStatus.Accepted,
+    );
+
+  if (!replacedWallet) {
+    return;
+  }
+
+  const name = getDeprecatedWalletName(replacedWallet.name);
+  if (name !== replacedWallet.name) {
+    saveWallet(email, network, { ...replacedWallet, name });
+  }
 }
 
 async function resolveSandboxId(client: ApiClient, input: string): Promise<string> {
@@ -548,6 +600,7 @@ sandboxCommand
         createdAt: new Date().toISOString(),
       };
       saveWallet(email, network, wallet);
+      deprecateReplacedWallet(email, network, sandboxId, groupData.group, wallet);
 
       print(
         {

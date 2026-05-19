@@ -14,7 +14,7 @@ import {
 } from "./paths.js";
 
 const ENCRYPTION_VERSION = 0x01;
-const STORAGE_SCHEMA_VERSION = 2;
+const STORAGE_SCHEMA_VERSION = 3;
 const STORAGE_SCHEMA_VERSION_KEY = "schema_version";
 const PROFILE_META_KEY = "profile";
 const HKDF_INFO = "nunchuk-cli/storage/v1";
@@ -224,6 +224,13 @@ function createSchemaTables(db: Database.Database): void {
       fingerprint TEXT NOT NULL,
       encrypted BLOB NOT NULL,
       PRIMARY KEY (fingerprint)
+    );
+
+    CREATE TABLE IF NOT EXISTS replace_groups (
+      wallet_id TEXT NOT NULL,
+      group_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      PRIMARY KEY (wallet_id, group_id)
     );
   `);
 }
@@ -438,6 +445,69 @@ export function getSandboxIds(email: string, network: Network): string[] {
       .filter((sandboxId): sandboxId is string => sandboxId !== null);
   } catch {
     return [];
+  }
+}
+
+// ── Wallet replacement storage ───────────────────────────────────────
+
+export enum ReplaceGroupStatus {
+  Accepted = "accepted",
+  Declined = "declined",
+}
+
+export function setReplaceGroupStatus(
+  email: string,
+  network: Network,
+  walletId: string,
+  groupId: string,
+  accepted: boolean,
+): void {
+  const db = getDatabase(email, network, { create: true });
+  db?.prepare(
+    `
+      INSERT INTO replace_groups (wallet_id, group_id, status)
+      VALUES (?, ?, ?)
+      ON CONFLICT(wallet_id, group_id) DO UPDATE SET status = excluded.status
+    `,
+  ).run(walletId, groupId, accepted ? ReplaceGroupStatus.Accepted : ReplaceGroupStatus.Declined);
+}
+
+export function getReplaceGroupStatuses(
+  email: string,
+  network: Network,
+  walletId: string,
+): Record<string, ReplaceGroupStatus> {
+  try {
+    const db = getDatabase(email, network, { create: false });
+    if (!db) return {};
+
+    const rows = db
+      .prepare(
+        `
+        SELECT group_id, status
+        FROM replace_groups
+        WHERE wallet_id = ?
+        ORDER BY rowid
+      `,
+      )
+      .all(walletId) as Record<string, unknown>[];
+
+    return Object.fromEntries(
+      rows.flatMap((row) => {
+        if (typeof row.group_id !== "string") {
+          return [];
+        }
+        if (
+          row.status === ReplaceGroupStatus.Accepted ||
+          row.status === ReplaceGroupStatus.Declined
+        ) {
+          return [[row.group_id, row.status]];
+        }
+        return [];
+      }),
+    );
+  } catch {
+    return {};
   }
 }
 

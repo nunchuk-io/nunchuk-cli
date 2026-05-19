@@ -25,6 +25,9 @@ import {
   addSandboxId,
   removeSandboxId,
   getSandboxIds,
+  ReplaceGroupStatus,
+  setReplaceGroupStatus,
+  getReplaceGroupStatuses,
 } from "../storage.js";
 import type { Profile, WalletData, StoredKey } from "../storage.js";
 import { buildWalletDescriptor } from "../descriptor.js";
@@ -394,7 +397,7 @@ describe("wallet storage", () => {
     const stored = JSON.parse(
       decrypt(Buffer.from(row.encrypted), getOrCreateMasterKey()),
     ) as Record<string, unknown>;
-    expect(version.value).toBe("2");
+    expect(version.value).toBe("3");
     expect(stored.descriptor).toBe(wallet.descriptor);
     expect(stored.m).toBeUndefined();
     expect(stored.n).toBeUndefined();
@@ -523,6 +526,46 @@ describe("sandbox storage", () => {
   });
 });
 
+// ── Wallet replacement storage ───────────────────────────────────────
+
+describe("wallet replacement storage", () => {
+  const network = "testnet" as const;
+
+  it("stores accepted and declined replacement statuses", () => {
+    const email = trackEmail(uniqueEmail("replace"));
+    setReplaceGroupStatus(email, network, "wallet-1", "group-1", true);
+    setReplaceGroupStatus(email, network, "wallet-1", "group-2", false);
+
+    expect(getReplaceGroupStatuses(email, network, "wallet-1")).toEqual({
+      "group-1": ReplaceGroupStatus.Accepted,
+      "group-2": ReplaceGroupStatus.Declined,
+    });
+  });
+
+  it("overwrites replacement status for a group", () => {
+    const email = trackEmail(uniqueEmail("replace"));
+    setReplaceGroupStatus(email, network, "wallet-1", "group-1", false);
+    setReplaceGroupStatus(email, network, "wallet-1", "group-1", true);
+
+    expect(getReplaceGroupStatuses(email, network, "wallet-1")).toEqual({
+      "group-1": ReplaceGroupStatus.Accepted,
+    });
+  });
+
+  it("scopes replacement statuses by wallet", () => {
+    const email = trackEmail(uniqueEmail("replace"));
+    setReplaceGroupStatus(email, network, "wallet-1", "group-1", true);
+    setReplaceGroupStatus(email, network, "wallet-2", "group-1", false);
+
+    expect(getReplaceGroupStatuses(email, network, "wallet-1")).toEqual({
+      "group-1": ReplaceGroupStatus.Accepted,
+    });
+    expect(getReplaceGroupStatuses(email, network, "wallet-2")).toEqual({
+      "group-1": ReplaceGroupStatus.Declined,
+    });
+  });
+});
+
 // ── Storage-level properties ─────────────────────────────────────────
 
 describe("encrypted storage properties", () => {
@@ -545,7 +588,7 @@ describe("encrypted storage properties", () => {
       | undefined;
     db.close();
 
-    expect(row?.value).toBe("2");
+    expect(row?.value).toBe("3");
   });
 
   it("stores encrypted profile blobs in meta", () => {

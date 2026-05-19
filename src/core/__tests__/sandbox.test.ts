@@ -3,6 +3,7 @@ import { generateKeypair, publicOpen } from "../crypto.js";
 import { buildMiniscriptDescriptor, miniscriptTemplateToMiniscript } from "../miniscript.js";
 import {
   buildCreateGroupBody,
+  buildCreateReplaceGroupBody,
   buildJoinGroupEvent,
   buildAddKeyBody,
   buildGroupStateBroadcastBodyIfNeeded,
@@ -157,6 +158,53 @@ describe("buildCreateGroupBody", () => {
   });
 });
 
+// ─── buildCreateReplaceGroupBody ────────────────────────────────────
+
+describe("buildCreateReplaceGroupBody", () => {
+  it("creates a replacement group with existing signers preloaded", () => {
+    const body = buildCreateReplaceGroupBody({
+      name: "Replacement",
+      m: 2,
+      n: 3,
+      addressType: "NATIVE_SEGWIT",
+      signers: ["[aaaa0000/48']xpub1", "[bbbb0000/48']xpub2", "[cccc0000/48']xpub3"],
+      ephemeralPub: creator.pub,
+      ephemeralPriv: creator.priv,
+    });
+    const parsed = JSON.parse(body);
+    const group = { init: parsed.data, status: "PENDING" };
+
+    expect(parsed.type).toBe("init");
+    expect(parsed.group_id).toBe("");
+    expect(getGroupDisplayState(group, creator.pub, creator.priv).signers).toEqual([
+      "[aaaa0000/48']xpub1",
+      "[bbbb0000/48']xpub2",
+      "[cccc0000/48']xpub3",
+    ]);
+    expect(parsed.data.pubstate.added).toEqual([0, 1, 2]);
+  });
+
+  it("includes platform key plaintext and backend state for replacements", () => {
+    const body = buildCreateReplaceGroupBody({
+      name: "Replacement",
+      m: 2,
+      n: 3,
+      addressType: "NATIVE_SEGWIT",
+      signers: ["[aaaa0000/48']xpub1", "[bbbb0000/48']xpub2", "[]"],
+      ephemeralPub: creator.pub,
+      ephemeralPriv: creator.priv,
+      platformKey: { policies: {} },
+      backendPubkey: backend.pub,
+    });
+    const parsed = JSON.parse(body);
+    const group = { init: parsed.data, status: "PENDING" };
+
+    expect(parsed.data.state[backend.pub]).toBeDefined();
+    expect(getGroupPlatformKeyState(group, creator.pub, creator.priv)).toEqual({ policies: {} });
+    expect(parsed.data.pubstate.added).toEqual([0, 1]);
+  });
+});
+
 // ─── buildSignerDescriptor ──────────────────────────────────────────
 
 describe("buildSignerDescriptor", () => {
@@ -209,6 +257,18 @@ describe("buildJoinGroupEvent", () => {
     expect(parsed.data).toBeDefined();
     expect(parsed.data.state).toBeDefined();
     expect(parsed.data.pubstate).toBeDefined();
+  });
+
+  it("can join with local replacement signers in modified state", () => {
+    const group = createGroup();
+    const signers = ["[aaaa0000/48']xpub1", "[bbbb0000/48']xpub2", "[]"];
+    const body = buildJoinGroupEvent("g1", clone(group), joiner.pub, signers, joiner.priv);
+    const parsed = JSON.parse(body);
+    const updated = { init: parsed.data, status: "PENDING" };
+
+    expect(parsed.data.state[joiner.pub]).toBe("");
+    expect(parsed.data.modified[joiner.pub][creator.pub]).toBeDefined();
+    expect(getGroupDisplayState(updated, joiner.pub, joiner.priv).signers).toEqual(signers);
   });
 
   it("throws if group is already finalized", () => {

@@ -4,7 +4,9 @@ import { getGroupDisplayState, getGroupPlatformKeyState } from "./core/sandbox.j
 import { formatAddressType } from "./core/address-type.js";
 import type { AddressType } from "./core/address-type.js";
 import { loadConfig, getEphemeralKeypair, getNetwork } from "./core/config.js";
+import { listWallets } from "./core/storage.js";
 import { isRecord } from "./core/utils.js";
+import { getGroupReplaceWalletId } from "./core/wallet-replacement.js";
 
 export function print(data: unknown, cmd: Command): void {
   if (cmd.optsWithGlobals().json) {
@@ -110,6 +112,7 @@ function displaySignerDescriptor(value: string): string {
 
 export interface SandboxSummary {
   id: unknown;
+  replaceWalletId?: unknown;
   url: string;
   status: string;
   name: string;
@@ -126,9 +129,25 @@ export interface SandboxSummary {
   platformKey: { status: string; policies?: PlatformKeyPolicies; slots?: string[] };
 }
 
+function resolveLocalReplaceWalletId(
+  replaceWalletId: unknown,
+  email: string | undefined,
+  network: ReturnType<typeof getNetwork>,
+): unknown {
+  if (typeof replaceWalletId !== "string" || !email) {
+    return replaceWalletId;
+  }
+
+  const wallet = listWallets(email, network).find(
+    (candidate) => candidate.gid === replaceWalletId || candidate.walletId === replaceWalletId,
+  );
+  return wallet?.walletId ?? replaceWalletId;
+}
+
 export function summarizeGroup(
   group: Record<string, unknown>,
   ephemeralKeys?: { pub: string; priv: string },
+  replaceWalletIdResolver?: (replaceWalletId: unknown) => unknown,
 ): SandboxSummary | Record<string, unknown> {
   if (!ephemeralKeys) {
     return group;
@@ -136,6 +155,10 @@ export function summarizeGroup(
 
   const display = getGroupDisplayState(group, ephemeralKeys.pub, ephemeralKeys.priv);
   const platformKey = getGroupPlatformKeyState(group, ephemeralKeys.pub, ephemeralKeys.priv);
+  const replaceWalletId = getGroupReplaceWalletId(group);
+  const resolvedReplaceWalletId = replaceWalletIdResolver
+    ? replaceWalletIdResolver(replaceWalletId)
+    : replaceWalletId;
   const visibleSigners = Object.fromEntries(
     display.signers
       .map((signer, index) => [String(index), displaySignerDescriptor(signer)] as const)
@@ -144,6 +167,7 @@ export function summarizeGroup(
 
   return {
     id: group.id ?? "",
+    replaceWalletId: resolvedReplaceWalletId,
     url: display.url,
     status: display.status,
     name: display.name,
@@ -168,9 +192,12 @@ export function printSandboxResult(data: unknown, cmd: Command): void {
     const config = loadConfig();
     const globals = cmd.optsWithGlobals();
     const network = getNetwork(globals.network);
+    const email = config[network]?.email;
     const keys = getEphemeralKeypair(config, network);
     const ephemeralKeys = keys?.pub && keys?.priv ? { pub: keys.pub, priv: keys.priv } : undefined;
-    const summary = summarizeGroup(data.group, ephemeralKeys);
+    const summary = summarizeGroup(data.group, ephemeralKeys, (replaceWalletId) =>
+      resolveLocalReplaceWalletId(replaceWalletId, email, network),
+    );
 
     if (cmd.optsWithGlobals().json) {
       console.log(JSON.stringify({ group: summary }, null, 2));
@@ -190,6 +217,9 @@ function printSandboxHuman(group: SandboxSummary): void {
   console.log(`Sandbox: ${name}`);
   console.log(separator);
   console.log(`ID:            ${group.id}`);
+  if (group.replaceWalletId != null) {
+    console.log(`Replaces:      ${group.replaceWalletId}`);
+  }
   console.log(`Link:          ${group.url}`);
   console.log(`Status:        ${group.status}`);
   console.log(`Type:          ${group.typeLabel}`);
@@ -284,13 +314,11 @@ function printWalletHuman(wallet: WalletView): void {
     console.log(`  ${i}:  ${xfp}  ${descriptor}`);
   }
 
-  console.log();
   if (wallet.platformKey) {
+    console.log();
     console.log("Platform Key:  Enabled");
     for (const line of formatPoliciesText(wallet.platformKey.policies)) {
       console.log(`  ${line}`);
     }
-  } else {
-    console.log("Platform Key:  Not configured");
   }
 }

@@ -19,6 +19,28 @@ import { isRecord } from "./utils.js";
 
 const VERSION = 1;
 
+function normalizeGroupSigners(signers: string[], n: number): string[] {
+  const normalized = signers.slice(0, n).map((signer) => (isEmptySigner(signer) ? "[]" : signer));
+  while (normalized.length < n) {
+    normalized.push("[]");
+  }
+  return normalized;
+}
+
+interface BuildGroupInitEventBodyParams {
+  name: string;
+  m: number;
+  n: number;
+  addressType: AddressType;
+  ephemeralPub: string;
+  ephemeralPriv: string;
+  miniscriptTemplate?: string;
+  signers?: string[];
+  platformKey?: PlatformKeyConfig | null;
+  platformKeySlots?: string[];
+  extraEphemeralKeys?: string[];
+}
+
 // Matches libnunchuk's FormalizePath: strip leading "m", replace "h" with "'", ensure leading "/"
 function formalizePath(path: string): string {
   let rs = path;
@@ -37,35 +59,39 @@ export function buildSignerDescriptor(
   return `[${masterFingerprint}${formalizePath(derivationPath)}]${xpub}`;
 }
 
-export function buildCreateGroupBody(
-  name: string,
-  m: number,
-  n: number,
-  addressType: AddressType,
-  ephemeralPub: string,
-  ephemeralPriv: string,
-  miniscriptTemplate = "",
-): string {
-  const resolvedAddressType = ADDRESS_TYPE_TO_NUMBER[addressType];
-  const normalizedTemplate = normalizeMiniscriptTemplate(miniscriptTemplate);
-  let resolvedM = m;
-  let resolvedN = n;
+function buildGroupInitEventBody(params: BuildGroupInitEventBodyParams): string {
+  const resolvedAddressType = ADDRESS_TYPE_TO_NUMBER[params.addressType];
+  const normalizedTemplate = normalizeMiniscriptTemplate(params.miniscriptTemplate ?? "");
+  let resolvedM = params.m;
+  let resolvedN = params.n;
   if (normalizedTemplate) {
     const metadata = getMiniscriptTemplateMetadata(normalizedTemplate, resolvedAddressType);
     resolvedM = metadata.keypathM;
     resolvedN = metadata.slotNames.length;
   }
 
-  // Build signers array — "[]" is the empty placeholder matching C++ SingleSigner::get_descriptor()
-  const signers: string[] = [];
-  for (let i = 0; i < resolvedN; i++) {
-    signers.push("[]");
+  const signers = normalizeGroupSigners(params.signers ?? [], resolvedN);
+  const plaintext: Record<string, unknown> = { signers };
+  if (params.platformKey != null) {
+    plaintext.platformKey = params.platformKey;
+  }
+  const platformKeySlots = normalizePlatformKeySlots(params.platformKeySlots ?? []);
+  if (platformKeySlots.length > 0) {
+    plaintext.platformKeySlots = platformKeySlots;
   }
 
-  // Encrypt state for our own ephemeral key
-  const plaintext = JSON.stringify({ signers });
+  const encodedPlaintext = JSON.stringify(plaintext);
+  const ephemeralKeys = [params.ephemeralPub];
+  for (const key of params.extraEphemeralKeys ?? []) {
+    if (key.length > 0 && !ephemeralKeys.includes(key)) {
+      ephemeralKeys.push(key);
+    }
+  }
+
   const state: Record<string, string> = {};
-  state[ephemeralPub] = publicBox(plaintext, ephemeralPub, ephemeralPriv, ephemeralPub);
+  for (const key of ephemeralKeys) {
+    state[key] = publicBox(encodedPlaintext, params.ephemeralPub, params.ephemeralPriv, key);
+  }
 
   const pubstate = {
     m: resolvedM,
@@ -73,9 +99,11 @@ export function buildCreateGroupBody(
     addressType: resolvedAddressType,
     walletTemplate: 0,
     miniscriptTemplate: normalizedTemplate,
-    name,
+    name: params.name,
     occupied: [] as unknown[],
-    added: [] as number[],
+    added: signers
+      .map((signer, index) => (!isEmptySigner(signer) ? index : -1))
+      .filter((i) => i >= 0),
   };
 
   const data = {
@@ -93,6 +121,56 @@ export function buildCreateGroupBody(
   };
 
   return JSON.stringify(body);
+}
+
+export function buildCreateGroupBody(
+  name: string,
+  m: number,
+  n: number,
+  addressType: AddressType,
+  ephemeralPub: string,
+  ephemeralPriv: string,
+  miniscriptTemplate = "",
+): string {
+  return buildGroupInitEventBody({
+    name,
+    m,
+    n,
+    addressType,
+    ephemeralPub,
+    ephemeralPriv,
+    miniscriptTemplate,
+  });
+}
+
+export interface CreateReplaceGroupBodyParams {
+  name: string;
+  m: number;
+  n: number;
+  addressType: AddressType;
+  signers: string[];
+  ephemeralPub: string;
+  ephemeralPriv: string;
+  miniscriptTemplate?: string;
+  platformKey?: PlatformKeyConfig | null;
+  platformKeySlots?: string[];
+  backendPubkey?: string | null;
+}
+
+export function buildCreateReplaceGroupBody(params: CreateReplaceGroupBodyParams): string {
+  return buildGroupInitEventBody({
+    name: params.name,
+    m: params.m,
+    n: params.n,
+    addressType: params.addressType,
+    signers: params.signers,
+    ephemeralPub: params.ephemeralPub,
+    ephemeralPriv: params.ephemeralPriv,
+    miniscriptTemplate: params.miniscriptTemplate,
+    platformKey: params.platformKey,
+    platformKeySlots: params.platformKeySlots,
+    extraEphemeralKeys: params.backendPubkey ? [params.backendPubkey] : [],
+  });
 }
 
 // Matches libnunchuk's SendGroupEvent: increment stateId, wrap as event JSON.
@@ -133,12 +211,13 @@ export function isGroupFinalized(groupJson: Record<string, unknown>): boolean {
   return getGroupPhaseData(groupJson).phase === "finalize";
 }
 
-// Matches libnunchuk's GroupService::JoinGroup (groupservice.cpp:579-598).
-// Join-specific logic is just adding ephemeral key to state; rest is shared via buildGroupEvent.
+// Matches libnunchuk's GroupService::JoinGroup.
 export function buildJoinGroupEvent(
   groupId: string,
   groupJson: Record<string, unknown>,
   ephemeralPub: string,
+  initialSigners: string[] = [],
+  ephemeralPriv?: string,
 ): string {
   const { phase, data: init } = getGroupPhaseData(groupJson);
   if (phase !== "init") {
@@ -149,6 +228,23 @@ export function buildJoinGroupEvent(
     throw new Error("Already joined this sandbox");
   }
   state[ephemeralPub] = "";
+
+  if (initialSigners.length > 0) {
+    if (!ephemeralPriv) {
+      throw new Error("Initial signers require an ephemeral private key");
+    }
+    const pubstate = init.pubstate as Record<string, unknown>;
+    const n = Number(pubstate.n ?? 0);
+    const signers = normalizeGroupSigners(initialSigners, n);
+    const plaintext = JSON.stringify({ signers });
+    const encryptedForParticipants: Record<string, string> = {};
+    for (const key of Object.keys(state)) {
+      encryptedForParticipants[key] = publicBox(plaintext, ephemeralPub, ephemeralPriv, key);
+    }
+    const modified = init.modified as Record<string, Record<string, string>>;
+    modified[ephemeralPub] = encryptedForParticipants;
+  }
+
   return buildGroupEvent(groupId, init, init.stateId as number);
 }
 
