@@ -949,6 +949,33 @@ Fingerprint:   73c5da0a
 Key saved to local storage.
 ```
 
+### `nunchuk key import`
+
+Import an existing BIP39 mnemonic and save it to local encrypted storage. The mnemonic is not printed after import.
+
+| Argument        | Required | Description                                           |
+| --------------- | -------- | ----------------------------------------------------- |
+| `<bip39 words>` | Yes      | BIP39 mnemonic words, quoted or space-separated       |
+
+| Option          | Required | Default     | Description      |
+| --------------- | -------- | ----------- | ---------------- |
+| `--name <name>` | No       | `My key #N` | Name for the key |
+
+```bash
+nunchuk key import --name "Alice Backup" "abandon abandon abandon ... about"
+nunchuk key import abandon abandon abandon ... about
+```
+
+If the imported mnemonic derives to a fingerprint that already exists locally, the command fails with `ALREADY_EXISTS` and leaves the stored key unchanged. Stored imports use the standard empty BIP39 passphrase; passphrase-protected derivation remains available through `nunchuk key info --mnemonic ... --passphrase ...`.
+
+Output:
+
+```
+Key imported to local storage.
+Name:          Alice Backup
+Fingerprint:   73c5da0a
+```
+
 ### `nunchuk key info`
 
 Derive signer info (fingerprint, path, xpub, descriptor) from a stored key, mnemonic, or master xprv. Derivation is done on demand — the stored mnemonic can produce info for any address type.
@@ -977,8 +1004,9 @@ nunchuk key info --mnemonic "abandon abandon abandon ... about"
 # Derive from a mnemonic with passphrase
 nunchuk key info --mnemonic "abandon ..." --passphrase "secret"
 
-# Derive at a custom path
+# Derive at a custom path (h hardened suffixes are accepted)
 nunchuk key info --fingerprint 73c5da0a --path "m/48'/0'/1'/2'"
+nunchuk key info --fingerprint 73c5da0a --path "m/48h/0h/1h/2h"
 ```
 
 Output:
@@ -1095,6 +1123,9 @@ nunchuk network set testnet
 
 # 3. Generate a software signing key
 nunchuk key generate --name "Alice"
+
+# Or import an existing BIP39 mnemonic
+nunchuk key import --name "Alice Backup" <bip39 words>
 
 # 4. Create a 2-of-3 multisig sandbox
 nunchuk sandbox create --name "Team Vault" --m 2 --n 3

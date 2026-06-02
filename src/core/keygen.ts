@@ -15,6 +15,15 @@ function getVersions(network: Network) {
   return network === "mainnet" ? MAINNET_VERSIONS : TESTNET_VERSIONS;
 }
 
+export function normalizeDerivationPath(path: string): string {
+  let normalized = path.trim().replace(/[hH]/g, "'");
+  if (normalized.startsWith("M")) normalized = `m${normalized.slice(1)}`;
+  if (normalized === "m") return normalized;
+  if (normalized.startsWith("m/")) return normalized;
+  if (normalized.startsWith("/")) return `m${normalized}`;
+  return `m/${normalized}`;
+}
+
 // -- Mnemonic generation --
 
 /** Generate a 24-word BIP39 mnemonic (256 bits entropy). */
@@ -53,17 +62,19 @@ export function getMasterFingerprint(rootKey: HDKey): string {
 /** Get xpub at a derivation path.
  *  Reference: SoftwareSigner::GetXpubAtPath (softwaresigner.cpp:173-176) */
 export function getXpubAtPath(rootKey: HDKey, path: string): string {
-  const derived = rootKey.derive(path);
+  const normalizedPath = normalizeDerivationPath(path);
+  const derived = rootKey.derive(normalizedPath);
   const xpub = derived.publicExtendedKey;
-  if (!xpub) throw new Error(`Failed to derive xpub at ${path}`);
+  if (!xpub) throw new Error(`Failed to derive xpub at ${normalizedPath}`);
   return xpub;
 }
 
 /** Get xprv at a derivation path. */
 export function getXprvAtPath(rootKey: HDKey, path: string): string {
-  const derived = rootKey.derive(path);
+  const normalizedPath = normalizeDerivationPath(path);
+  const derived = rootKey.derive(normalizedPath);
   const xprv = derived.privateExtendedKey;
-  if (!xprv) throw new Error(`Failed to derive xprv at ${path}`);
+  if (!xprv) throw new Error(`Failed to derive xprv at ${normalizedPath}`);
   return xprv;
 }
 

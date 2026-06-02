@@ -43,6 +43,9 @@ nunchuk network tip
 # Generate a software signing key
 nunchuk key generate --name "Alice"
 
+# Import an existing BIP39 mnemonic
+nunchuk key import --name "Alice Backup" <bip39 words>
+
 # Derive signer info for a stored key
 nunchuk key info --fingerprint <xfp>
 
@@ -193,6 +196,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | Command        | Description                                             |
 | -------------- | ------------------------------------------------------- |
 | `key generate` | Generate a new BIP39 mnemonic and save locally          |
+| `key import`   | Import an existing BIP39 mnemonic and save locally      |
 | `key info`     | Derive signer info from a stored key, mnemonic, or xprv |
 | `key list`     | List locally stored keys                                |
 
