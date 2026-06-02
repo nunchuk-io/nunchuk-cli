@@ -88,6 +88,18 @@ describe("wallet replacement helpers", () => {
     expect(details.signers).toEqual(SIGNERS);
   });
 
+  it("derives Taproot multisig replacement details", () => {
+    const wallet = makeWallet({
+      addressType: "TAPROOT",
+      descriptor: buildWalletDescriptor(SIGNERS, 2, "TAPROOT", "DEFAULT"),
+    });
+
+    const details = getReplacementGroupDetails(wallet);
+
+    expect(details.addressType).toBe("TAPROOT");
+    expect(details.signers).toEqual(SIGNERS);
+  });
+
   it("clears the last multisig signer when replacing a platform-key wallet", () => {
     const details = getReplacementGroupDetails(makeWallet(), {
       platformKey: { policies: {} },
