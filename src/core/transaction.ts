@@ -2,7 +2,7 @@
 // Reference: libnunchuk nunchukimpl.cpp, groupservice.cpp
 
 import { Transaction, bip32Path, selectUTXO, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
-import { RawPSBTV0 } from "@scure/btc-signer/psbt.js";
+import { RawPSBTV0, TaprootControlBlock } from "@scure/btc-signer/psbt.js";
 import { base58 } from "@scure/base";
 import { getElectrumServer } from "./config.js";
 import type { Network } from "./config.js";
@@ -25,6 +25,7 @@ import {
 } from "./wallet-keys.js";
 import {
   buildAnyDescriptorForParsed,
+  descriptorHasTaprootScriptPath,
   parseDescriptor,
   parseSignerDescriptor,
 } from "./descriptor.js";
@@ -40,12 +41,459 @@ import {
   miniscriptPreimageRequirementKey,
   type MiniscriptPreimageRequirement,
 } from "./miniscript-preimage.js";
+import {
+  descriptorHasMusig2Path,
+  PSBT_IN_MUSIG2_PARTIAL_SIG,
+  PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+  PSBT_IN_MUSIG2_PUB_NONCE,
+} from "./musig.js";
+import { combinationIndices } from "./utils.js";
 import { formatBtc, formatSats, getOutputAddress } from "./format.js";
 import { estimateFeeRate } from "./fees.js";
 import { timelockFromK, type TimelockBased } from "./miniscript.js";
+import { toXOnlyPubkey } from "./taproot.js";
 
 const GAP_LIMIT = 20;
 const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
+// Metadata gives exact output paths when available; fallback scans should match wallet discovery.
+const OUTPUT_CLASSIFICATION_SCAN_LIMIT = GAP_LIMIT;
+const OUTPUT_DERIVATION_CANDIDATE_LIMIT = GAP_LIMIT;
+
+type PsbtUnknownEntry = [{ type: number; key: Uint8Array }, Uint8Array];
+type PsbtBip32Derivation = Array<[Uint8Array, { fingerprint: number; path: number[] }]>;
+type PsbtTapBip32Derivation = Array<
+  [Uint8Array, { hashes: Uint8Array[]; der: { fingerprint: number; path: number[] } }]
+>;
+type PsbtOutput = ReturnType<Transaction["getOutput"]>;
+
+export interface WalletOutputClassification {
+  isWalletOutput: boolean;
+  isChange: boolean;
+}
+
+export interface WalletOutputClassifier {
+  addKnownAddress(address: string, chain: 0 | 1): void;
+  classify(address: string | null, output?: PsbtOutput | null): WalletOutputClassification;
+}
+
+export type PendingTransactionStatus =
+  | "PENDING_NONCE"
+  | "PENDING_SIGNATURES"
+  | "READY_TO_BROADCAST";
+export type TaprootMusig2KeysetType = "key-path" | "script-path";
+
+interface ExpectedTaprootMusig2Keyset {
+  index: number;
+  type: TaprootMusig2KeysetType;
+  signers: string[];
+}
+
+interface InputMusig2Progress {
+  participantsByAggregate: Map<string, string[]>;
+  noncesByKeyset: Map<string, Set<string>>;
+  partialSigsByKeyset: Map<string, Set<string>>;
+  keysetIds: Set<string>;
+}
+
+interface InputMusig2KeysetProgress {
+  nonceSigners: Set<string>;
+  signatureSigners: Set<string>;
+}
+
+function bytesHex(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("hex");
+}
+
+function xfpHex(fingerprint: number): string {
+  return fingerprint.toString(16).padStart(8, "0");
+}
+
+function sortedXfps(xfps: Iterable<string>): string[] {
+  return [...xfps].map((xfp) => xfp.toLowerCase()).sort();
+}
+
+function sameXfpSet(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((xfp, index) => xfp === b[index]);
+}
+
+function recordFromSigners(signers: string[], completed: Set<string>): Record<string, boolean> {
+  const progress: Record<string, boolean> = {};
+  for (const xfp of signers) {
+    progress[xfp] = completed.has(xfp);
+  }
+  return progress;
+}
+
+function getInputMusig2PartialSignerPubkeys(
+  input: ReturnType<Transaction["getInput"]>,
+): Uint8Array[] {
+  const unknown = (input.unknown as PsbtUnknownEntry[] | undefined) ?? [];
+  const pubkeys = new Map<string, Uint8Array>();
+  for (const [key, value] of unknown) {
+    if (key.type !== PSBT_IN_MUSIG2_PARTIAL_SIG || value.length !== 32) {
+      continue;
+    }
+    if (key.key.length !== 66 && key.key.length !== 98) {
+      continue;
+    }
+    const pubkey = key.key.subarray(0, 33);
+    pubkeys.set(bytesHex(pubkey), pubkey);
+  }
+  return [...pubkeys.values()];
+}
+
+function getInputMusig2Progress(input: ReturnType<Transaction["getInput"]>): InputMusig2Progress {
+  const unknown = (input.unknown as PsbtUnknownEntry[] | undefined) ?? [];
+  const tapBip32Derivation = input.tapBip32Derivation as PsbtTapBip32Derivation | undefined;
+  const fingerprintByXOnlyPubkey = new Map<string, string>();
+  for (const [pubkey, { der }] of tapBip32Derivation ?? []) {
+    fingerprintByXOnlyPubkey.set(
+      bytesHex(pubkey.length === 32 ? pubkey : toXOnlyPubkey(pubkey)),
+      xfpHex(der.fingerprint),
+    );
+  }
+
+  const participantsByAggregate = new Map<string, string[]>();
+  const noncesByKeyset = new Map<string, Set<string>>();
+  const partialSigsByKeyset = new Map<string, Set<string>>();
+  const keysetIds = new Set<string>();
+
+  const addSigner = (target: Map<string, Set<string>>, keysetId: string, signerXfp: string) => {
+    const signers = target.get(keysetId) ?? new Set<string>();
+    signers.add(signerXfp);
+    target.set(keysetId, signers);
+    keysetIds.add(keysetId);
+  };
+
+  for (const [key, value] of unknown) {
+    if (key.type !== PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS) {
+      continue;
+    }
+    if (key.key.length !== 33 || value.length === 0 || value.length % 33 !== 0) {
+      continue;
+    }
+
+    const aggregateKeysetId = bytesHex(key.key);
+    const participantXfps = new Set<string>();
+    let fullyMapped = true;
+    for (let offset = 0; offset < value.length; offset += 33) {
+      const pubkey = value.subarray(offset, offset + 33);
+      const xfp = fingerprintByXOnlyPubkey.get(bytesHex(toXOnlyPubkey(pubkey)));
+      if (xfp === undefined) {
+        fullyMapped = false;
+        break;
+      }
+      participantXfps.add(xfp);
+    }
+
+    if (fullyMapped && participantXfps.size > 0) {
+      participantsByAggregate.set(aggregateKeysetId, sortedXfps(participantXfps));
+      keysetIds.add(aggregateKeysetId);
+    }
+  }
+
+  for (const [key] of unknown) {
+    if (key.type !== PSBT_IN_MUSIG2_PUB_NONCE) {
+      continue;
+    }
+    const parsed = parseMusig2SignerFieldKey(key.key);
+    if (!parsed) {
+      continue;
+    }
+    const fingerprint = fingerprintByXOnlyPubkey.get(
+      bytesHex(toXOnlyPubkey(key.key.subarray(0, 33))),
+    );
+    if (fingerprint !== undefined) {
+      addSigner(noncesByKeyset, parsed.keysetId, fingerprint);
+    }
+  }
+
+  for (const [key] of unknown) {
+    if (key.type !== PSBT_IN_MUSIG2_PARTIAL_SIG) {
+      continue;
+    }
+    const parsed = parseMusig2SignerFieldKey(key.key);
+    if (!parsed) {
+      continue;
+    }
+    const fingerprint = fingerprintByXOnlyPubkey.get(
+      bytesHex(toXOnlyPubkey(key.key.subarray(0, 33))),
+    );
+    if (fingerprint !== undefined) {
+      addSigner(partialSigsByKeyset, parsed.keysetId, fingerprint);
+    }
+  }
+
+  return {
+    participantsByAggregate,
+    noncesByKeyset,
+    partialSigsByKeyset,
+    keysetIds,
+  };
+}
+
+function getInputMusig2NonceSignerFingerprints(
+  input: ReturnType<Transaction["getInput"]>,
+): Set<number> {
+  const progress = getInputMusig2Progress(input);
+  const fingerprints = new Set<number>();
+  for (const nonces of progress.noncesByKeyset.values()) {
+    for (const xfp of nonces) {
+      fingerprints.add(parseInt(xfp, 16));
+    }
+  }
+  return fingerprints;
+}
+
+function getTaprootMusig2NonceFingerprints(
+  tx: Transaction,
+  parsedDescriptor: ReturnType<typeof parseDescriptor> | null,
+): Set<number> {
+  const fingerprints = new Set<number>();
+  if (!parsedDescriptor || !descriptorHasMusig2Path(parsedDescriptor)) {
+    return fingerprints;
+  }
+
+  for (let inputIndex = 0; inputIndex < tx.inputsLength; inputIndex++) {
+    for (const fingerprint of getInputMusig2NonceSignerFingerprints(tx.getInput(inputIndex))) {
+      fingerprints.add(fingerprint);
+    }
+  }
+  return fingerprints;
+}
+
+function parseMusig2SignerFieldKey(key: Uint8Array): {
+  keysetId: string;
+} | null {
+  if (key.length !== 66 && key.length !== 98) {
+    return null;
+  }
+
+  return {
+    keysetId: bytesHex(key.subarray(33)),
+  };
+}
+
+function taprootOutputKeyFromScriptHex(script: Uint8Array | undefined): string | null {
+  if (!script || script.length !== 34 || script[0] !== 0x51 || script[1] !== 0x20) {
+    return null;
+  }
+  return bytesHex(script.subarray(2));
+}
+
+function compressedKeyXOnlyHex(compressedKeyHex: string): string | null {
+  return compressedKeyHex.length === 66 ? compressedKeyHex.slice(2) : null;
+}
+
+function getInputMusig2NonceStatus(
+  input: ReturnType<Transaction["getInput"]>,
+): Extract<PendingTransactionStatus, "PENDING_NONCE" | "PENDING_SIGNATURES"> | null {
+  const progress = getInputMusig2Progress(input);
+
+  let hasKnownKeyset = false;
+  let hasNonceCompleteKeyset = false;
+  let hasNonceIncompleteKeyset = false;
+
+  for (const keysetId of progress.keysetIds) {
+    const aggregateKeysetId = keysetId.slice(0, 66);
+    const participants = progress.participantsByAggregate.get(aggregateKeysetId);
+    if (!participants || participants.length === 0) {
+      continue;
+    }
+
+    hasKnownKeyset = true;
+
+    const partialSigCount = progress.partialSigsByKeyset.get(keysetId)?.size ?? 0;
+    if (partialSigCount >= participants.length) {
+      hasNonceCompleteKeyset = true;
+      continue;
+    }
+
+    const nonceCount = progress.noncesByKeyset.get(keysetId)?.size ?? 0;
+    if (nonceCount >= participants.length) {
+      hasNonceCompleteKeyset = true;
+    } else {
+      hasNonceIncompleteKeyset = true;
+    }
+  }
+
+  if (hasNonceCompleteKeyset) {
+    return "PENDING_SIGNATURES";
+  }
+  if (hasNonceIncompleteKeyset || hasKnownKeyset) {
+    return "PENDING_NONCE";
+  }
+  return null;
+}
+
+function getTaprootMusig2Status(
+  tx: Transaction,
+  parsedDescriptor: ReturnType<typeof parseDescriptor> | null,
+  keysets: PendingTxKeysetDetail[] = [],
+): Extract<PendingTransactionStatus, "PENDING_NONCE" | "PENDING_SIGNATURES"> | null {
+  if (!parsedDescriptor || !descriptorHasMusig2Path(parsedDescriptor)) {
+    return null;
+  }
+
+  if (keysets.length > 0) {
+    return keysets.some((keyset) => keyset.status !== "PENDING_NONCE")
+      ? "PENDING_SIGNATURES"
+      : "PENDING_NONCE";
+  }
+
+  let hasNonceCompleteInputs = tx.inputsLength > 0;
+  let hasNonceIncompleteInput = false;
+  for (let inputIndex = 0; inputIndex < tx.inputsLength; inputIndex++) {
+    const status = getInputMusig2NonceStatus(tx.getInput(inputIndex));
+    if (status !== "PENDING_SIGNATURES") {
+      hasNonceCompleteInputs = false;
+      hasNonceIncompleteInput = true;
+    }
+  }
+
+  if (hasNonceCompleteInputs) {
+    return "PENDING_SIGNATURES";
+  }
+  return hasNonceIncompleteInput || tx.inputsLength > 0 ? "PENDING_NONCE" : null;
+}
+
+function getExpectedTaprootMusig2Keysets(
+  parsedDescriptor: ReturnType<typeof parseDescriptor> | null,
+): ExpectedTaprootMusig2Keyset[] {
+  if (
+    !parsedDescriptor ||
+    parsedDescriptor.kind !== "multisig" ||
+    parsedDescriptor.addressType !== "TAPROOT" ||
+    !descriptorHasMusig2Path(parsedDescriptor)
+  ) {
+    return [];
+  }
+
+  const signerXfps = parsedDescriptor.signers.map((signer) =>
+    parseSignerDescriptor(signer).masterFingerprint.toLowerCase(),
+  );
+  const combinations = combinationIndices(signerXfps.length, parsedDescriptor.m);
+  const disableKeyPath = parsedDescriptor.taprootWalletTemplate === "DISABLE_KEY_PATH";
+  const hasScriptPathMusig = parsedDescriptor.n <= 5 || parsedDescriptor.n === parsedDescriptor.m;
+  const keysets = disableKeyPath || hasScriptPathMusig ? combinations : combinations.slice(0, 1);
+
+  return keysets.map((indices, index) => ({
+    index,
+    type: !disableKeyPath && index === 0 ? "key-path" : "script-path",
+    signers: sortedXfps(indices.map((signerIndex) => signerXfps[signerIndex])),
+  }));
+}
+
+function keysetIdMatchesType(keysetId: string, type: TaprootMusig2KeysetType): boolean {
+  return type === "key-path" ? keysetId.length === 66 : keysetId.length > 66;
+}
+
+function addProgressForMatchingKeysets(
+  target: Set<string>,
+  progressByKeyset: Map<string, Set<string>>,
+  aggregateId: string,
+  expected: ExpectedTaprootMusig2Keyset,
+  input: ReturnType<Transaction["getInput"]>,
+): void {
+  const taprootOutputKey = taprootOutputKeyFromScriptHex(input.witnessUtxo?.script);
+  for (const [keysetId, signers] of progressByKeyset) {
+    if (!keysetIdMatchesType(keysetId, expected.type)) {
+      continue;
+    }
+
+    const matchesInternalAggregate = keysetId.startsWith(aggregateId);
+    const matchesTaprootOutputKey =
+      expected.type === "key-path" &&
+      taprootOutputKey !== null &&
+      compressedKeyXOnlyHex(keysetId) === taprootOutputKey;
+    if (!matchesInternalAggregate && !matchesTaprootOutputKey) {
+      continue;
+    }
+
+    for (const signer of signers) {
+      if (expected.signers.includes(signer)) {
+        target.add(signer);
+      }
+    }
+  }
+}
+
+function getInputMusig2KeysetProgress(
+  input: ReturnType<Transaction["getInput"]>,
+  inputProgress: InputMusig2Progress,
+  expected: ExpectedTaprootMusig2Keyset,
+): InputMusig2KeysetProgress {
+  const nonceSigners = new Set<string>();
+  const signatureSigners = new Set<string>();
+
+  for (const [aggregateId, signers] of inputProgress.participantsByAggregate) {
+    if (!sameXfpSet(signers, expected.signers)) {
+      continue;
+    }
+    addProgressForMatchingKeysets(
+      nonceSigners,
+      inputProgress.noncesByKeyset,
+      aggregateId,
+      expected,
+      input,
+    );
+    addProgressForMatchingKeysets(
+      signatureSigners,
+      inputProgress.partialSigsByKeyset,
+      aggregateId,
+      expected,
+      input,
+    );
+  }
+
+  return { nonceSigners, signatureSigners };
+}
+
+function getTaprootMusig2KeysetStatuses(
+  tx: Transaction,
+  parsedDescriptor: ReturnType<typeof parseDescriptor> | null,
+): PendingTxKeysetDetail[] {
+  const expectedKeysets = getExpectedTaprootMusig2Keysets(parsedDescriptor);
+  if (expectedKeysets.length === 0 || tx.inputsLength === 0) {
+    return [];
+  }
+
+  const inputProgresses = Array.from({ length: tx.inputsLength }, (_, inputIndex) => ({
+    input: tx.getInput(inputIndex),
+    progress: getInputMusig2Progress(tx.getInput(inputIndex)),
+  }));
+
+  return expectedKeysets.map((expected) => {
+    const perInputProgress = inputProgresses.map((inputProgress) =>
+      getInputMusig2KeysetProgress(inputProgress.input, inputProgress.progress, expected),
+    );
+    const nonceCompleteSigners = new Set(
+      expected.signers.filter((xfp) =>
+        perInputProgress.every((progress) => progress.nonceSigners.has(xfp)),
+      ),
+    );
+    const signatureCompleteSigners = new Set(
+      expected.signers.filter((xfp) =>
+        perInputProgress.every((progress) => progress.signatureSigners.has(xfp)),
+      ),
+    );
+
+    const status = expected.signers.every((xfp) => signatureCompleteSigners.has(xfp))
+      ? "READY_TO_BROADCAST"
+      : expected.signers.every((xfp) => nonceCompleteSigners.has(xfp))
+        ? "PENDING_SIGNATURES"
+        : "PENDING_NONCE";
+
+    return {
+      index: expected.index,
+      type: expected.type,
+      status,
+      signers: expected.signers,
+      nonces: recordFromSigners(expected.signers, nonceCompleteSigners),
+      signatures: recordFromSigners(expected.signers, signatureCompleteSigners),
+    };
+  });
+}
 
 function deriveWalletAddresses(
   wallet: WalletData,
@@ -55,6 +503,166 @@ function deriveWalletAddresses(
   count: number,
 ): string[] {
   return deriveDescriptorAddresses(wallet.descriptor, network, chain, startIndex, count);
+}
+
+function outputPathCandidate(path: number[] | undefined): { chain: 0 | 1; index: number } | null {
+  if (!path || path.length < 2) {
+    return null;
+  }
+
+  const chain = path[path.length - 2];
+  const index = path[path.length - 1];
+  if (chain !== 0 && chain !== 1) {
+    return null;
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= 0x80000000) {
+    return null;
+  }
+  return { chain, index };
+}
+
+function outputDerivationCandidates(output: PsbtOutput): Array<{ chain: 0 | 1; index: number }> {
+  const candidates: Array<{ chain: 0 | 1; index: number }> = [];
+  const seen = new Set<string>();
+  const addCandidate = (candidate: { chain: 0 | 1; index: number } | null) => {
+    if (!candidate) {
+      return;
+    }
+    const key = `${candidate.chain}:${candidate.index}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    candidates.push(candidate);
+  };
+
+  const bip32 = output.bip32Derivation as PsbtBip32Derivation | undefined;
+  for (const [, { path }] of bip32 ?? []) {
+    addCandidate(outputPathCandidate(path));
+  }
+
+  const tapBip32 = output.tapBip32Derivation as PsbtTapBip32Derivation | undefined;
+  for (const [, { der }] of tapBip32 ?? []) {
+    addCandidate(outputPathCandidate(der.path));
+  }
+
+  return candidates;
+}
+
+export function createWalletOutputClassifier(
+  network: Network,
+  walletDescriptor?: string,
+  scanLimit = OUTPUT_CLASSIFICATION_SCAN_LIMIT,
+): WalletOutputClassifier {
+  const byAddress = new Map<string, WalletOutputClassification>();
+  const derivedCandidateAddresses = new Map<string, string>();
+  const scannedAddresses = new Map<0 | 1, Set<string>>();
+
+  const nonWallet = (): WalletOutputClassification => ({
+    isWalletOutput: false,
+    isChange: false,
+  });
+  const walletOutput = (chain: 0 | 1): WalletOutputClassification => ({
+    isWalletOutput: true,
+    isChange: chain === 1,
+  });
+  const pathKey = (chain: 0 | 1, index: number): string => `${chain}:${index}`;
+
+  const deriveCandidateAddress = (chain: 0 | 1, index: number): string => {
+    const key = pathKey(chain, index);
+    const existing = derivedCandidateAddresses.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const address = deriveDescriptorPayment(walletDescriptor!, network, chain, index).address;
+    derivedCandidateAddresses.set(key, address);
+    return address;
+  };
+
+  const scanChain = (chain: 0 | 1): Set<string> => {
+    const existing = scannedAddresses.get(chain);
+    if (existing) {
+      return existing;
+    }
+
+    const addresses = new Set(
+      deriveDescriptorAddresses(walletDescriptor!, network, chain, 0, scanLimit),
+    );
+    scannedAddresses.set(chain, addresses);
+    for (const address of addresses) {
+      byAddress.set(address, walletOutput(chain));
+    }
+    return addresses;
+  };
+
+  const addKnownAddress = (address: string, chain: 0 | 1): void => {
+    byAddress.set(address, walletOutput(chain));
+  };
+
+  return {
+    addKnownAddress,
+    classify(address: string | null, output?: PsbtOutput | null): WalletOutputClassification {
+      if (!address) {
+        return nonWallet();
+      }
+
+      const cached = byAddress.get(address);
+      if (cached) {
+        return cached;
+      }
+      if (!walletDescriptor) {
+        return nonWallet();
+      }
+
+      try {
+        if (output) {
+          const candidates = outputDerivationCandidates(output);
+          // Older libnunchuk builds can attach hundreds of unrelated taproot derivations.
+          // Treat those as polluted metadata and use the bounded address scan instead.
+          if (candidates.length > 0 && candidates.length <= OUTPUT_DERIVATION_CANDIDATE_LIMIT) {
+            for (const { chain, index } of candidates) {
+              if (deriveCandidateAddress(chain, index) === address) {
+                const classification = walletOutput(chain);
+                byAddress.set(address, classification);
+                return classification;
+              }
+            }
+            const classification = nonWallet();
+            byAddress.set(address, classification);
+            return classification;
+          }
+        }
+
+        for (const chain of [0, 1] as const) {
+          if (scanChain(chain).has(address)) {
+            const classification = walletOutput(chain);
+            byAddress.set(address, classification);
+            return classification;
+          }
+        }
+      } catch {
+        return nonWallet();
+      }
+
+      const classification = nonWallet();
+      byAddress.set(address, classification);
+      return classification;
+    },
+  };
+}
+
+export function classifyWalletOutput(
+  address: string | null,
+  output: PsbtOutput | null,
+  network: Network,
+  walletDescriptor?: string,
+  scanLimit = OUTPUT_CLASSIFICATION_SCAN_LIMIT,
+): WalletOutputClassification {
+  return createWalletOutputClassifier(network, walletDescriptor, scanLimit).classify(
+    address,
+    output,
+  );
 }
 
 // -- Interfaces --
@@ -95,19 +703,36 @@ export interface ServerTxResponse {
   transaction: ServerTxEvent;
 }
 
+export interface PendingTxKeysetDetail {
+  index: number;
+  type: TaprootMusig2KeysetType;
+  status: PendingTransactionStatus;
+  signers: string[];
+  nonces: Record<string, boolean>;
+  signatures: Record<string, boolean>;
+}
+
+export interface MiniscriptPathSummary {
+  index: number;
+  lockTime: number;
+  preimageRequirements: MiniscriptPreimageRequirement[];
+  requiredSignatures: number;
+  sequence: number;
+  signerNames: string[];
+}
+
+export interface PendingTxMiniscriptPathDetail extends MiniscriptPathSummary {
+  signedCount: number;
+  status: "compatible" | "satisfied";
+}
+
 export interface PendingTxDetail {
   txId: string;
-  status: string;
+  status: PendingTransactionStatus;
   signedCount: number;
   requiredCount: number;
-  miniscriptPath?: {
-    index: number;
-    lockTime: number;
-    preimageRequirements: MiniscriptPreimageRequirement[];
-    requiredSignatures: number;
-    sequence: number;
-    signerNames: string[];
-  };
+  miniscriptPath?: MiniscriptPathSummary;
+  miniscriptPaths?: PendingTxMiniscriptPathDetail[];
   timelockedUntil?: {
     based: TimelockBased;
     mature: boolean | null;
@@ -118,6 +743,8 @@ export interface PendingTxDetail {
   outputs: Array<{ address: string | null; amount: string; amountBtc: string; isChange: boolean }>;
   subAmount: string;
   subAmountBtc: string;
+  keysets?: PendingTxKeysetDetail[];
+  nonces?: Record<string, boolean>;
   signers: Record<string, boolean>;
 }
 
@@ -125,6 +752,7 @@ export interface PendingTxDecodeOptions {
   currentHeight?: number;
   currentUnixTime?: number;
   inputUtxos?: PendingTxInputTimelockMetadata[];
+  outputClassifier?: WalletOutputClassifier;
 }
 
 export interface ConfirmedTx {
@@ -172,6 +800,8 @@ export interface CreateTransactionParams {
   toAddress: string;
   amount: bigint;
   miniscriptPath?: number;
+  taprootKeyPath?: boolean;
+  taprootScriptPath?: boolean;
   preimages?: string[];
 }
 
@@ -181,14 +811,7 @@ export interface CreateTransactionResult {
   fee: bigint;
   feePerByte: bigint;
   changeAddress: string | null;
-  miniscriptPath?: {
-    index: number;
-    lockTime: number;
-    preimageRequirements: MiniscriptPreimageRequirement[];
-    requiredSignatures: number;
-    sequence: number;
-    signerNames: string[];
-  };
+  miniscriptPath?: MiniscriptPathSummary;
 }
 
 type WalletInputUpdate = Parameters<Transaction["addInput"]>[0];
@@ -203,6 +826,15 @@ interface PendingTxPayload {
   psbt: string;
   txId?: string;
   tx_id?: string;
+}
+
+function normalizePendingTxPayload(parsed: PendingTxPayload): PendingTx | null {
+  const txId = parsed.txId || parsed.tx_id || "";
+  const psbt = parsed.psbt || "";
+  if (!txId || !psbt) {
+    return null;
+  }
+  return { txId, psbt };
 }
 
 interface MiniscriptInputSignatureState {
@@ -220,11 +852,42 @@ interface PendingTxInputOutpoint extends PendingTxInputTimelockMetadata {
   inputIndex: number;
 }
 
+function buildPaymentPsbtMetadata(
+  payment: ReturnType<typeof deriveDescriptorPayment>,
+  target: "input" | "output",
+  options: { taprootKeyPath?: boolean } = {},
+): Record<string, unknown> {
+  const update: Record<string, unknown> = {};
+  if (payment.bip32Derivation.length > 0) update.bip32Derivation = payment.bip32Derivation;
+  if (payment.witnessScript) update.witnessScript = payment.witnessScript;
+  if (payment.redeemScript) update.redeemScript = payment.redeemScript;
+  if (payment.tapInternalKey) update.tapInternalKey = payment.tapInternalKey;
+  if (payment.tapBip32Derivation) {
+    update.tapBip32Derivation = options.taprootKeyPath
+      ? (payment.tapKeyBip32Derivation ??
+        payment.tapBip32Derivation
+          .filter(([, { hashes }]) => hashes.length === 0)
+          .map(([pubkey, { der }]) => [pubkey, { hashes: [], der }]))
+      : payment.tapBip32Derivation;
+  }
+  if (target === "input") {
+    if (payment.tapMerkleRoot) {
+      update.tapMerkleRoot = payment.tapMerkleRoot;
+    }
+    if (!options.taprootKeyPath && payment.tapLeafScript) {
+      update.tapLeafScript = payment.tapLeafScript;
+    }
+  }
+  return update;
+}
+
 function buildMiniscriptDummyWitness(
   plan: MiniscriptSpendingPlan,
   witnessScript: Uint8Array,
+  controlBlock?: Uint8Array,
 ): Uint8Array[] {
   const stack: Uint8Array[] = [];
+  const isTaproot = controlBlock != null;
   const multisigLeafCount = plan.leafNodes.filter((leaf) => leaf.type === "MULTI").length;
   const placeholderLeaves =
     plan.leafNodes.length > 0 ? plan.leafNodes : [{ type: "NONE" as const }];
@@ -246,14 +909,17 @@ function buildMiniscriptDummyWitness(
     stack.push(new Uint8Array());
   }
   for (let i = 0; i < plan.requiredSignatures; i++) {
-    stack.push(new Uint8Array(72));
+    stack.push(new Uint8Array(isTaproot ? 64 : 72));
   }
 
   stack.push(witnessScript);
+  if (controlBlock) {
+    stack.push(controlBlock);
+  }
   return stack;
 }
 
-function buildMiniscriptPathSummary(plan: MiniscriptSpendingPlan) {
+function buildMiniscriptPathSummary(plan: MiniscriptSpendingPlan): MiniscriptPathSummary {
   return {
     index: plan.index,
     lockTime: plan.lockTime,
@@ -262,6 +928,108 @@ function buildMiniscriptPathSummary(plan: MiniscriptSpendingPlan) {
     sequence: plan.sequence,
     signerNames: plan.signerNames,
   };
+}
+
+function signerFingerprints(signers: string[]): Set<number> {
+  const fingerprints = new Set<number>();
+  for (const signer of signers) {
+    try {
+      fingerprints.add(parseInt(parseSignerDescriptor(signer).masterFingerprint, 16));
+    } catch {
+      // Bare miniscript placeholders cannot be mapped to wallet fingerprints.
+    }
+  }
+  return fingerprints;
+}
+
+function taprootKeyPathDerivationFingerprints(tx: Transaction): Set<number> {
+  const fingerprints = new Set<number>();
+  for (let inputIndex = 0; inputIndex < tx.inputsLength; inputIndex++) {
+    const tapBip32Derivation = tx.getInput(inputIndex).tapBip32Derivation as
+      | Array<[Uint8Array, { hashes: Uint8Array[]; der: { fingerprint: number; path: number[] } }]>
+      | undefined;
+    for (const [, { hashes, der }] of tapBip32Derivation ?? []) {
+      if (hashes.length === 0) {
+        fingerprints.add(der.fingerprint);
+      }
+    }
+  }
+  return fingerprints;
+}
+
+function filterSignerDescriptorsByFingerprint(
+  signers: string[],
+  fingerprints: Set<number>,
+): string[] {
+  if (fingerprints.size === 0) {
+    return [];
+  }
+  return signers.filter((signer) =>
+    fingerprints.has(parseInt(parseSignerDescriptor(signer).masterFingerprint, 16)),
+  );
+}
+
+function getDisplaySignerDescriptors(
+  tx: Transaction,
+  parsedDescriptor: ReturnType<typeof parseDescriptor> | null,
+  walletSigners: string[] | undefined,
+  miniscriptPlan: MiniscriptSpendingPlan | null,
+): string[] | undefined {
+  if (!walletSigners || parsedDescriptor?.kind !== "miniscript") {
+    return walletSigners;
+  }
+
+  if (parsedDescriptor.addressType !== "TAPROOT") {
+    return walletSigners;
+  }
+
+  if (miniscriptPlan) {
+    const filtered = filterSignerDescriptorsByFingerprint(
+      walletSigners,
+      signerFingerprints(miniscriptPlan.signerNames),
+    );
+    return filtered.length > 0 ? filtered : walletSigners;
+  }
+
+  const psbtKeyPathSigners = filterSignerDescriptorsByFingerprint(
+    walletSigners,
+    taprootKeyPathDerivationFingerprints(tx),
+  );
+  if (psbtKeyPathSigners.length > 0) {
+    return psbtKeyPathSigners;
+  }
+
+  const descriptorKeyPathSigners = filterSignerDescriptorsByFingerprint(
+    walletSigners,
+    signerFingerprints(parsedDescriptor.signers.slice(0, parsedDescriptor.m)),
+  );
+  return descriptorKeyPathSigners.length > 0 ? descriptorKeyPathSigners : walletSigners;
+}
+
+function buildTaprootKeyPathPlan(
+  parsed: ReturnType<typeof parseDescriptor>,
+): MiniscriptSpendingPlan {
+  return {
+    index: -1,
+    leafNodes: [],
+    lockTime: 0,
+    path: [],
+    preimageRequirements: [],
+    requiredSignatures: parsed.m,
+    sequence: 0,
+    signerNames: parsed.signers.slice(0, parsed.m),
+    supported: true,
+  };
+}
+
+function canSpendTaprootKeyPath(parsed: ReturnType<typeof parseDescriptor>): boolean {
+  if (parsed.addressType !== "TAPROOT" || parsed.m <= 0) {
+    return false;
+  }
+  if (parsed.kind === "miniscript") {
+    return true;
+  }
+  return parsed.kind === "multisig" && parsed.taprootWalletTemplate === "DEFAULT";
 }
 
 function hasActiveLockTime(tx: Transaction): boolean {
@@ -371,11 +1139,13 @@ function getInputMiniscriptSignatureState(
     const bip32Derivation = input.bip32Derivation as
       | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
       | undefined;
-    if (!bip32Derivation || bip32Derivation.length === 0) {
+    const tapBip32Derivation = input.tapBip32Derivation as
+      | Array<[Uint8Array, { hashes: Uint8Array[]; der: { fingerprint: number; path: number[] } }]>
+      | undefined;
+    const path = bip32Derivation?.[0]?.[1].path ?? tapBip32Derivation?.[0]?.[1].der.path;
+    if (!path) {
       return { chain: 0 as const, index: 0 };
     }
-
-    const [, { path }] = bip32Derivation[0];
     if (path.length < 2) {
       return { chain: 0 as const, index: path[path.length - 1] ?? 0 };
     }
@@ -396,6 +1166,10 @@ function getInputMiniscriptSignatureState(
       fingerprint: info.bip32.fingerprint,
       keyExpression: info.keyExpression,
     });
+    byPubkey.set(Buffer.from(toXOnlyPubkey(info.pubkey)).toString("hex"), {
+      fingerprint: info.bip32.fingerprint,
+      keyExpression: info.keyExpression,
+    });
   }
 
   const signedFingerprints = new Set<number>();
@@ -409,21 +1183,64 @@ function getInputMiniscriptSignatureState(
     signedFingerprints.add(match.fingerprint);
     signedKeyExpressions.add(match.keyExpression);
   }
+  const tapScriptSig = input.tapScriptSig as
+    | Array<[{ pubKey: Uint8Array; leafHash: Uint8Array }, Uint8Array]>
+    | undefined;
+  for (const [{ pubKey }] of tapScriptSig ?? []) {
+    const match = byPubkey.get(Buffer.from(pubKey).toString("hex"));
+    if (!match) {
+      continue;
+    }
+    signedFingerprints.add(match.fingerprint);
+    signedKeyExpressions.add(match.keyExpression);
+  }
 
   return { signedFingerprints, signedKeyExpressions };
 }
 
-function inferMiniscriptSpendingPlan(
+function canInferMiniscriptSpendingPlan(
+  parsed: ReturnType<typeof parseDescriptor>,
+  tx: Transaction,
+): boolean {
+  return !(
+    parsed.addressType === "TAPROOT" &&
+    !Array.from({ length: tx.inputsLength }, (_, index) => tx.getInput(index)).some(
+      (input) => (input.tapLeafScript as unknown[] | undefined)?.length,
+    )
+  );
+}
+
+function getCompatibleMiniscriptSpendingPlans(
   descriptor: string,
   tx: Transaction,
   txState: { inputs: Array<{ nSequence: number }>; lockTime: number },
-): MiniscriptSpendingPlan | null {
+): MiniscriptSpendingPlan[] {
   const parsed = parseDescriptor(descriptor);
   if (parsed.kind !== "miniscript" || !parsed.miniscript) {
-    return null;
+    return [];
+  }
+  if (!canInferMiniscriptSpendingPlan(parsed, tx)) {
+    return [];
   }
 
-  const plans = getMiniscriptSpendingPlans(parsed.miniscript).filter((plan) => plan.supported);
+  return getMiniscriptSpendingPlans(parsed.miniscript)
+    .filter((plan) => plan.supported && isMiniscriptPlanSatisfied(plan, txState))
+    .sort((left, right) => left.index - right.index);
+}
+
+function chooseMiniscriptSpendingPlan(
+  plans: MiniscriptSpendingPlan[],
+  progressByIndex: Map<number, MiniscriptPlanProgress>,
+  tx: Transaction,
+  txState: { inputs: Array<{ nSequence: number }>; lockTime: number },
+): MiniscriptSpendingPlan | null {
+  const satisfied = plans
+    .filter((plan) => progressByIndex.get(plan.index)?.ready)
+    .sort((left, right) => left.index - right.index);
+  if (satisfied.length > 0) {
+    return satisfied[0];
+  }
+
   if (tx.lockTime > 0) {
     const exactLockTime = plans
       .filter((plan) => plan.lockTime === tx.lockTime)
@@ -445,11 +1262,7 @@ function inferMiniscriptSpendingPlan(
     return exactSequence[0];
   }
 
-  try {
-    return selectMiniscriptSpendingPlan(parsed.miniscript, txState);
-  } catch {
-    return null;
-  }
+  return plans[0] ?? null;
 }
 
 function getMiniscriptPlanProgress(
@@ -561,6 +1374,7 @@ function estimateMiniscriptFee(
   txLockTime: number,
   plan: MiniscriptSpendingPlan,
   feePerByte: bigint,
+  taprootKeyPath = false,
 ): bigint {
   const tx = new Transaction({
     lockTime: txLockTime,
@@ -581,13 +1395,35 @@ function estimateMiniscriptFee(
   for (let i = 0; i < inputs.length; i++) {
     const prepared = inputs[i];
     const index = inputIndexes[i];
-    if (!prepared.payment.witnessScript) {
-      throw new Error("Miniscript wallet input is missing witnessScript");
+    if (taprootKeyPath) {
+      tx.updateInput(index, { finalScriptWitness: [new Uint8Array(64)] }, true);
+      continue;
     }
+
+    if (prepared.payment.witnessScript) {
+      tx.updateInput(
+        index,
+        {
+          finalScriptWitness: buildMiniscriptDummyWitness(plan, prepared.payment.witnessScript),
+        },
+        true,
+      );
+      continue;
+    }
+
+    const tapLeaf = prepared.payment.tapLeafScript?.[0];
+    if (!tapLeaf) {
+      throw new Error("Miniscript wallet input is missing witnessScript or tapLeafScript");
+    }
+    const [controlBlock, scriptWithVersion] = tapLeaf;
     tx.updateInput(
       index,
       {
-        finalScriptWitness: buildMiniscriptDummyWitness(plan, prepared.payment.witnessScript),
+        finalScriptWitness: buildMiniscriptDummyWitness(
+          plan,
+          scriptWithVersion.slice(0, -1),
+          TaprootControlBlock.encode(controlBlock),
+        ),
       },
       true,
     );
@@ -607,6 +1443,7 @@ function buildMiniscriptTransaction(
   changeAmount: bigint,
   nextChangeIndex: number,
   txLockTime: number,
+  taprootKeyPath = false,
 ): Transaction {
   const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
   const tx = new Transaction({
@@ -625,11 +1462,7 @@ function buildMiniscriptTransaction(
     tx.addOutputAddress(changeAddress, changeAmount, btcNet);
 
     const changePayment = deriveDescriptorPayment(wallet.descriptor, network, 1, nextChangeIndex);
-    const outputUpdate: Record<string, unknown> = {
-      bip32Derivation: changePayment.bip32Derivation,
-    };
-    if (changePayment.witnessScript) outputUpdate.witnessScript = changePayment.witnessScript;
-    if (changePayment.redeemScript) outputUpdate.redeemScript = changePayment.redeemScript;
+    const outputUpdate = buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath });
     tx.updateOutput(tx.outputsLength - 1, outputUpdate);
   }
 
@@ -642,7 +1475,17 @@ function buildMiniscriptTransaction(
 export async function createTransaction(
   params: CreateTransactionParams,
 ): Promise<CreateTransactionResult> {
-  const { wallet, network, electrum, toAddress, amount, miniscriptPath, preimages = [] } = params;
+  const {
+    wallet,
+    network,
+    electrum,
+    toAddress,
+    amount,
+    miniscriptPath,
+    taprootKeyPath: requestedTaprootKeyPath,
+    taprootScriptPath = false,
+    preimages = [],
+  } = params;
   const parsed = parseDescriptor(wallet.descriptor);
   if (parsed.kind !== "miniscript" && miniscriptPath != null) {
     throw new Error("Miniscript signing path selection is only supported for miniscript wallets");
@@ -650,11 +1493,40 @@ export async function createTransaction(
   if (parsed.kind !== "miniscript" && preimages.length > 0) {
     throw new Error("Miniscript preimages are only supported for miniscript wallets");
   }
+  if (requestedTaprootKeyPath && taprootScriptPath) {
+    throw new Error("Taproot key-path and script-path spending options cannot be combined");
+  }
+  if (taprootScriptPath && parsed.addressType !== "TAPROOT") {
+    throw new Error("Taproot script-path spending requires a taproot wallet");
+  }
+  if (taprootScriptPath && !descriptorHasTaprootScriptPath(wallet.descriptor)) {
+    throw new Error(
+      "Taproot script-path spending requires a taproot wallet with script-path spending enabled",
+    );
+  }
+  const taprootKeyPath =
+    requestedTaprootKeyPath ??
+    (!taprootScriptPath &&
+      miniscriptPath == null &&
+      preimages.length === 0 &&
+      canSpendTaprootKeyPath(parsed));
+  if (taprootKeyPath && miniscriptPath != null) {
+    throw new Error("Taproot key-path spending cannot be combined with miniscript path selection");
+  }
+  if (taprootKeyPath && preimages.length > 0) {
+    throw new Error("Taproot key-path spending cannot use miniscript preimages");
+  }
+  if (taprootKeyPath && !canSpendTaprootKeyPath(parsed)) {
+    throw new Error(
+      "Taproot key-path spending requires a taproot wallet with key-path spending enabled",
+    );
+  }
   const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
   const miniscriptPlan =
-    parsed.kind === "miniscript"
+    parsed.kind === "miniscript" && !taprootKeyPath
       ? selectMiniscriptSpendingPlan(parsed.miniscript!, undefined, miniscriptPath)
       : null;
+  const taprootKeyPathPlan = taprootKeyPath ? buildTaprootKeyPathPlan(parsed) : null;
   const inputSequence = miniscriptPlan?.sequence || MAX_BIP125_RBF_SEQUENCE;
   const txLockTime = miniscriptPlan?.lockTime || 0;
 
@@ -679,12 +1551,13 @@ export async function createTransaction(
     const payment =
       parsed.kind === "multisig"
         ? deriveMultisigPayment(
-            wallet.signers,
-            wallet.m,
-            wallet.addressType,
+            parsed.signers,
+            parsed.m,
+            parsed.addressType,
             network,
             utxo.chain,
             utxo.index,
+            parsed.taprootWalletTemplate,
           )
         : deriveDescriptorPayment(wallet.descriptor, network, utxo.chain, utxo.index);
     const input: Record<string, unknown> = {
@@ -692,11 +1565,9 @@ export async function createTransaction(
       index: utxo.txPos,
       nonWitnessUtxo: prevTxCache.get(utxo.txHash),
       witnessUtxo: { script: payment.script, amount: utxo.value },
-      bip32Derivation: payment.bip32Derivation,
       sequence: inputSequence,
+      ...buildPaymentPsbtMetadata(payment, "input", { taprootKeyPath }),
     };
-    if (payment.witnessScript) input.witnessScript = payment.witnessScript;
-    if (payment.redeemScript) input.redeemScript = payment.redeemScript;
     return { input, payment, utxo };
   });
 
@@ -705,13 +1576,14 @@ export async function createTransaction(
   const changeAddrs =
     parsed.kind === "multisig"
       ? deriveAddresses(
-          wallet.signers,
-          wallet.m,
-          wallet.addressType,
+          parsed.signers,
+          parsed.m,
+          parsed.addressType,
           network,
           1,
           nextChangeIndex,
           1,
+          parsed.taprootWalletTemplate,
         )
       : deriveDescriptorAddresses(wallet.descriptor, network, 1, nextChangeIndex, 1);
   const changeAddress = changeAddrs[0];
@@ -727,7 +1599,7 @@ export async function createTransaction(
   let tx: Transaction | null = null;
   let txChangeAddress: string | null = null;
 
-  if (parsed.kind === "multisig") {
+  if (parsed.kind !== "miniscript") {
     const result = selectUTXO(
       preparedInputs.map((prepared) => prepared.input),
       [{ address: toAddress, amount }],
@@ -753,29 +1625,18 @@ export async function createTransaction(
     // Reference: FillPsbt calls UpdatePSBTOutput for ALL outputs (walletdb.cpp:1096-1099)
     // BIP-174: outputs should include redeemScript (0x00), witnessScript (0x01), bip32Derivation (0x02)
     if (result.change) {
-      const changePayment = deriveMultisigPayment(
-        wallet.signers,
-        wallet.m,
-        wallet.addressType,
-        network,
-        1,
-        nextChangeIndex,
-      );
+      const changePayment = deriveDescriptorPayment(wallet.descriptor, network, 1, nextChangeIndex);
       for (let i = 0; i < tx.outputsLength; i++) {
         const out = tx.getOutput(i);
         if (out.script && getOutputAddress(out.script, network) === changeAddress) {
-          const outputUpdate: Record<string, unknown> = {
-            bip32Derivation: changePayment.bip32Derivation,
-          };
-          if (changePayment.witnessScript) outputUpdate.witnessScript = changePayment.witnessScript;
-          if (changePayment.redeemScript) outputUpdate.redeemScript = changePayment.redeemScript;
-          tx.updateOutput(i, outputUpdate);
+          tx.updateOutput(i, buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath }));
           break;
         }
       }
     }
   } else {
-    if (!miniscriptPlan) {
+    const selectedPlan = miniscriptPlan ?? taprootKeyPathPlan;
+    if (!selectedPlan) {
       throw new Error("Unable to select a miniscript signing path");
     }
 
@@ -794,8 +1655,9 @@ export async function createTransaction(
         changeAddress,
         true,
         txLockTime,
-        miniscriptPlan,
+        selectedPlan,
         feePerByte,
+        taprootKeyPath,
       );
       const candidateChange = totalSelected - amount - feeWithChange;
       if (candidateChange >= 546n) {
@@ -811,6 +1673,7 @@ export async function createTransaction(
           candidateChange,
           nextChangeIndex,
           txLockTime,
+          taprootKeyPath,
         );
         break;
       }
@@ -823,8 +1686,9 @@ export async function createTransaction(
         changeAddress,
         false,
         txLockTime,
-        miniscriptPlan,
+        selectedPlan,
         feePerByte,
+        taprootKeyPath,
       );
       if (totalSelected >= amount + feeWithoutChange) {
         fee = feeWithoutChange;
@@ -839,6 +1703,7 @@ export async function createTransaction(
           0n,
           nextChangeIndex,
           txLockTime,
+          taprootKeyPath,
         );
         break;
       }
@@ -1055,11 +1920,11 @@ export async function fetchPendingTransaction(
     throw new Error("Transaction not found on server");
   }
 
-  const parsed = decryptWalletPayload<PendingTxPayload>(wallet, event);
-  return {
-    txId: parsed.txId || parsed.tx_id || "",
-    psbt: parsed.psbt,
-  };
+  const pending = normalizePendingTxPayload(decryptWalletPayload<PendingTxPayload>(wallet, event));
+  if (!pending) {
+    throw new Error("Transaction not found on server");
+  }
+  return pending;
 }
 
 // Fetch all pending transactions
@@ -1073,20 +1938,29 @@ export async function fetchPendingTransactions(
     );
 
     const events = Array.isArray(data) ? data : (data?.transactions ?? data ?? []);
-    const pending: PendingTx[] = [];
+    const pending = new Map<string, PendingTx>();
+    const deletedTxIds = new Set<string>();
 
     for (const event of events as ServerTxEvent[]) {
       try {
         const parsed = decryptWalletPayload<PendingTxPayload>(wallet, event);
-        pending.push({
-          txId: parsed.txId || parsed.tx_id || "",
-          psbt: parsed.psbt,
-        });
+        const txId = parsed.txId || parsed.tx_id || "";
+        if (!txId) {
+          continue;
+        }
+        if (!parsed.psbt) {
+          deletedTxIds.add(txId);
+          pending.delete(txId);
+          continue;
+        }
+        if (!deletedTxIds.has(txId) && !pending.has(txId)) {
+          pending.set(txId, { txId, psbt: parsed.psbt });
+        }
       } catch {
         // skip events we can't decrypt
       }
     }
-    return pending;
+    return [...pending.values()];
   } catch {
     return [];
   }
@@ -1125,11 +1999,17 @@ export function combinePendingPsbt(
   currentPsbtB64: string,
   nextPsbtB64: string,
 ): CombinePendingPsbtResult {
-  const currentTx = Transaction.fromPSBT(Buffer.from(currentPsbtB64, "base64"));
+  const currentTx = Transaction.fromPSBT(Buffer.from(currentPsbtB64, "base64"), {
+    allowUnknown: true,
+  });
   const currentCanonical = Buffer.from(currentTx.toPSBT());
 
   try {
-    currentTx.combine(Transaction.fromPSBT(Buffer.from(nextPsbtB64, "base64")));
+    currentTx.combine(
+      Transaction.fromPSBT(Buffer.from(nextPsbtB64, "base64"), {
+        allowUnknown: true,
+      }),
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message.startsWith("Transaction/combine:")) {
@@ -1159,39 +2039,32 @@ export function decodePsbtDetail(
   options?: PendingTxDecodeOptions,
 ): PendingTxDetail | null {
   try {
-    const tx = Transaction.fromPSBT(Buffer.from(psbtB64, "base64"));
+    const tx = Transaction.fromPSBT(Buffer.from(psbtB64, "base64"), { allowUnknown: true });
     const parsedDescriptor = walletDescriptor ? parseDescriptor(walletDescriptor) : null;
+    const outputClassifier =
+      options?.outputClassifier ?? createWalletOutputClassifier(network, walletDescriptor);
+    const musig2Keysets = getTaprootMusig2KeysetStatuses(tx, parsedDescriptor);
+    const musig2Status = getTaprootMusig2Status(tx, parsedDescriptor, musig2Keysets);
+    const nonceXfps = getTaprootMusig2NonceFingerprints(tx, parsedDescriptor);
 
-    // -- Change output detection via bip32Derivation --
-    // Reference: libnunchuk FillSendReceiveData checks isMyChange(addr)
-    // PSBT outputs with bip32Derivation belong to the wallet;
-    // path second-to-last element: 1 = change, 0 = receive-to-self
+    // Reference: libnunchuk FillSendReceiveData checks wallet ownership by address.
+    // Taproot PSBT output metadata from older libnunchuk builds can contain extra
+    // derivations, so verify metadata against the descriptor before trusting it.
     const outputs: PendingTxDetail["outputs"] = [];
     let subAmount = 0n;
     for (let i = 0; i < tx.outputsLength; i++) {
       const out = tx.getOutput(i);
       const addr = out.script ? getOutputAddress(out.script, network) : null;
       const amt = out.amount ?? 0n;
-      let isChange = false;
-      const bip32 = out.bip32Derivation as
-        | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
-        | undefined;
-      if (bip32 && bip32.length > 0) {
-        const path = bip32[0][1].path;
-        const chain = path[path.length - 2];
-        isChange = chain === 1;
-      }
-      if (!isChange) {
-        // External recipient or receive-to-self — counts toward subAmount
-        if (!bip32 || bip32.length === 0) {
-          subAmount += amt;
-        }
+      const classification = outputClassifier.classify(addr, out);
+      if (!classification.isWalletOutput) {
+        subAmount += amt;
       }
       outputs.push({
         address: addr,
         amount: formatSats(amt),
         amountBtc: formatBtc(amt),
-        isChange,
+        isChange: classification.isChange,
       });
     }
 
@@ -1201,9 +2074,27 @@ export function decodePsbtDetail(
       })),
       lockTime: tx.lockTime,
     };
+    const compatibleMiniscriptPlans =
+      parsedDescriptor?.kind === "miniscript" && walletDescriptor
+        ? getCompatibleMiniscriptSpendingPlans(walletDescriptor, tx, txState)
+        : [];
+    const miniscriptProgressByIndex = new Map<number, MiniscriptPlanProgress>();
+    if (parsedDescriptor?.kind === "miniscript" && walletDescriptor && !tx.isFinal) {
+      for (const plan of compatibleMiniscriptPlans) {
+        miniscriptProgressByIndex.set(
+          plan.index,
+          getMiniscriptPlanProgress(tx, walletDescriptor, network, plan),
+        );
+      }
+    }
     const miniscriptPlan =
       parsedDescriptor?.kind === "miniscript"
-        ? inferMiniscriptSpendingPlan(walletDescriptor!, tx, txState)
+        ? chooseMiniscriptSpendingPlan(
+            compatibleMiniscriptPlans,
+            miniscriptProgressByIndex,
+            tx,
+            txState,
+          )
         : null;
     const timelockedUntil = getTimelockedUntil(tx, miniscriptPlan, options);
     let requiredCount = miniscriptPlan?.requiredSignatures ?? walletM ?? 0;
@@ -1216,20 +2107,22 @@ export function decodePsbtDetail(
       !tx.getInput(0).partialSig?.length
     );
 
-    let status: string;
+    let status: PendingTransactionStatus;
     if (parsedDescriptor?.kind === "miniscript" && walletDescriptor && miniscriptPlan) {
       requiredCount = miniscriptPlan.requiredSignatures;
       if (tx.isFinal) {
         signedCount = requiredCount;
         status = "READY_TO_BROADCAST";
       } else {
-        const progress = getMiniscriptPlanProgress(tx, walletDescriptor, network, miniscriptPlan);
+        const progress =
+          miniscriptProgressByIndex.get(miniscriptPlan.index) ??
+          getMiniscriptPlanProgress(tx, walletDescriptor, network, miniscriptPlan);
         signedCount = progress.signedCount;
         for (const fingerprint of progress.signedFingerprints) {
           signedXfps.add(fingerprint);
         }
         if (!progress.ready) {
-          status = "PENDING_SIGNATURES";
+          status = musig2Status ?? "PENDING_SIGNATURES";
         } else {
           status = "READY_TO_BROADCAST";
         }
@@ -1238,20 +2131,74 @@ export function decodePsbtDetail(
       signedCount = requiredCount;
       status = "READY_TO_BROADCAST";
     } else {
-      try {
-        const clone = tx.clone();
-        clone.finalize();
-        status = "READY_TO_BROADCAST";
-      } catch {
-        status = "PENDING_SIGNATURES";
-      }
+      status = "PENDING_SIGNATURES";
       if (tx.inputsLength > 0) {
         const inp = tx.getInput(0);
+        const tapKeySig = inp.tapKeySig as Uint8Array | undefined;
+        const tapBip32Derivation = inp.tapBip32Derivation as
+          | Array<
+              [Uint8Array, { hashes: Uint8Array[]; der: { fingerprint: number; path: number[] } }]
+            >
+          | undefined;
+        if (tapKeySig) {
+          signedCount = Math.max(signedCount, requiredCount || 1);
+          if (tapBip32Derivation && tapBip32Derivation.length > 0) {
+            for (const [, { der }] of tapBip32Derivation.slice(0, requiredCount || 1)) {
+              signedXfps.add(der.fingerprint);
+            }
+          }
+        }
+
+        const tapScriptSig = inp.tapScriptSig as
+          | Array<[{ pubKey: Uint8Array; leafHash: Uint8Array }, Uint8Array]>
+          | undefined;
+        if (tapScriptSig && tapBip32Derivation) {
+          const xfpByPubkey = new Map<string, number>();
+          for (const [pubkey, { der }] of tapBip32Derivation) {
+            xfpByPubkey.set(bytesHex(pubkey), der.fingerprint);
+          }
+
+          const signedTaprootPubkeys = new Set<string>();
+          for (const [{ pubKey }] of tapScriptSig) {
+            const pubkeyHex = bytesHex(pubKey);
+            const fingerprint = xfpByPubkey.get(pubkeyHex);
+            if (fingerprint === undefined || signedTaprootPubkeys.has(pubkeyHex)) {
+              continue;
+            }
+            signedTaprootPubkeys.add(pubkeyHex);
+            signedXfps.add(fingerprint);
+          }
+          signedCount = Math.max(signedCount, signedTaprootPubkeys.size);
+        }
+
+        const musig2PartialSignerPubkeys = getInputMusig2PartialSignerPubkeys(inp);
+        if (musig2PartialSignerPubkeys.length > 0) {
+          signedCount = Math.max(
+            signedCount,
+            Math.min(
+              musig2PartialSignerPubkeys.length,
+              requiredCount || musig2PartialSignerPubkeys.length,
+            ),
+          );
+          if (tapBip32Derivation) {
+            const xfpByXonlyPubkey = new Map<string, number>();
+            for (const [pubkey, { der }] of tapBip32Derivation) {
+              xfpByXonlyPubkey.set(bytesHex(pubkey), der.fingerprint);
+            }
+            for (const pubkey of musig2PartialSignerPubkeys) {
+              const fingerprint = xfpByXonlyPubkey.get(bytesHex(toXOnlyPubkey(pubkey)));
+              if (fingerprint !== undefined) {
+                signedXfps.add(fingerprint);
+              }
+            }
+          }
+        }
+
         const partialSig = inp.partialSig as Array<[Uint8Array, Uint8Array]> | undefined;
         const bip32Derivation = inp.bip32Derivation as
           | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
           | undefined;
-        signedCount = partialSig?.length ?? 0;
+        signedCount = Math.max(signedCount, partialSig?.length ?? 0);
         if (partialSig && bip32Derivation) {
           for (const [pubkey] of partialSig) {
             for (const [bip32Pub, { fingerprint }] of bip32Derivation) {
@@ -1261,20 +2208,60 @@ export function decodePsbtDetail(
               }
             }
           }
-        } else if (status === "READY_TO_BROADCAST") {
-          signedCount = requiredCount;
         }
+      }
+
+      if (requiredCount > 0 && signedCount >= requiredCount) {
+        try {
+          const clone = tx.clone();
+          clone.finalize();
+          status = "READY_TO_BROADCAST";
+        } catch {
+          status = "PENDING_SIGNATURES";
+        }
+      } else if (musig2Status) {
+        status = musig2Status;
       }
     }
 
-    // Build signers map from wallet signers descriptors
+    const displaySignerDescriptors = getDisplaySignerDescriptors(
+      tx,
+      parsedDescriptor,
+      walletSigners,
+      miniscriptPlan,
+    );
+
+    // Build signers map from descriptors relevant to the selected PSBT spend path.
     const signers: Record<string, boolean> = {};
-    if (walletSigners && canAttributeSigners) {
-      for (const desc of walletSigners) {
+    const nonces: Record<string, boolean> = {};
+    if (displaySignerDescriptors && canAttributeSigners) {
+      for (const desc of displaySignerDescriptors) {
         const xfp = parseSignerDescriptor(desc).masterFingerprint;
         signers[xfp] = signedXfps.has(parseInt(xfp, 16));
       }
     }
+    if (displaySignerDescriptors && parsedDescriptor && descriptorHasMusig2Path(parsedDescriptor)) {
+      for (const desc of displaySignerDescriptors) {
+        const xfp = parseSignerDescriptor(desc).masterFingerprint;
+        nonces[xfp] = nonceXfps.has(parseInt(xfp, 16));
+      }
+    }
+
+    const miniscriptPaths =
+      compatibleMiniscriptPlans.length > 0
+        ? compatibleMiniscriptPlans.map((plan): PendingTxMiniscriptPathDetail => {
+            const progress = miniscriptProgressByIndex.get(plan.index);
+            const satisfied = tx.isFinal
+              ? miniscriptPlan?.index === plan.index
+              : Boolean(progress?.ready);
+            return {
+              ...buildMiniscriptPathSummary(plan),
+              signedCount:
+                tx.isFinal && satisfied ? plan.requiredSignatures : (progress?.signedCount ?? 0),
+              status: satisfied ? "satisfied" : "compatible",
+            };
+          })
+        : undefined;
 
     return {
       txId: "",
@@ -1282,12 +2269,15 @@ export function decodePsbtDetail(
       signedCount,
       requiredCount,
       miniscriptPath: miniscriptPlan ? buildMiniscriptPathSummary(miniscriptPlan) : undefined,
+      miniscriptPaths,
       timelockedUntil,
       fee: formatSats(tx.fee),
       feeBtc: formatBtc(tx.fee),
       outputs,
       subAmount: formatSats(subAmount),
       subAmountBtc: formatBtc(subAmount),
+      keysets: musig2Keysets.length > 0 ? musig2Keysets : undefined,
+      nonces: Object.keys(nonces).length > 0 ? nonces : undefined,
       signers,
     };
   } catch {
@@ -1417,7 +2407,9 @@ export async function fetchPendingTxInputTimelockMetadataBatch(
   for (const pendingTx of pending) {
     let tx: Transaction;
     try {
-      tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
+      tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"), {
+        allowUnknown: true,
+      });
     } catch {
       continue;
     }
@@ -1529,6 +2521,7 @@ export async function fetchPendingTxInputTimelockMetadataBatch(
 export async function fetchConfirmedTransactions(
   wallet: WalletData,
   network: Network,
+  outputClassifier?: WalletOutputClassifier,
 ): Promise<ConfirmedTx[]> {
   const server = getElectrumServer(network);
   const electrum = new ElectrumClient();
@@ -1553,6 +2546,7 @@ export async function fetchConfirmedTransactions(
         for (let offset = 0; offset < addresses.length; offset++) {
           const addr = addresses[offset];
           walletAddresses.add(addr);
+          outputClassifier?.addKnownAddress(addr, chain);
           const history = histories[offset];
           if (history.length > 0) {
             allHistory.push(...history);

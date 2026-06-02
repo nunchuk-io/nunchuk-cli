@@ -4,22 +4,39 @@ import { hex } from "@scure/base";
 import { Transaction, TEST_NETWORK } from "@scure/btc-signer";
 import { ripemd160 } from "@noble/hashes/legacy.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { deriveDescriptorAddresses, TESTNET_VERSIONS } from "../address.js";
+import {
+  deriveDescriptorAddresses,
+  deriveDescriptorPayment,
+  TESTNET_VERSIONS,
+} from "../address.js";
 import { addressToScripthash } from "../electrum.js";
 import { buildMiniscriptDescriptor } from "../miniscript.js";
 import { finalizeMiniscriptPsbt } from "../miniscript-finalize.js";
 import { signWalletPsbtWithKey } from "../psbt-sign.js";
+import { encryptWalletPayload } from "../wallet-keys.js";
 import {
+  classifyWalletOutput,
   combinePendingPsbt,
+  createWalletOutputClassifier,
   createTransaction,
   decodePsbtDetail,
+  fetchPendingTransaction,
+  fetchPendingTransactions,
   fetchPendingTxInputTimelockMetadataBatch,
   fetchPsbtInputTimelockMetadata,
 } from "../transaction.js";
 import { createDummyPsbt } from "../platform-key.js";
-import { buildWalletDescriptor } from "../descriptor.js";
+import {
+  buildWalletDescriptor,
+  descriptorChecksum,
+  getUnspendableXpub,
+  parseSignerDescriptor,
+} from "../descriptor.js";
+import { PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, PSBT_IN_MUSIG2_PUB_NONCE } from "../musig.js";
+import { aggregateMusigCompressedPubkey, toXOnlyPubkey } from "../taproot.js";
 import type { WalletData } from "../storage.js";
 import type { ElectrumClient } from "../electrum.js";
+import type { ApiClient } from "../api-client.js";
 
 const TEST_WALLET: WalletData = {
   walletId: "207u9ts4",
@@ -45,6 +62,9 @@ TEST_WALLET.descriptor = buildWalletDescriptor(
   TEST_WALLET.addressType,
 );
 const TEST_RECIPIENT = deriveDescriptorAddresses(TEST_WALLET.descriptor, "testnet", 0, 10, 1)[0];
+
+const REPORTED_TAPROOT_DESCRIPTOR =
+  "tr(musig([249fdf68/87'/0'/1']xpub6CtyrbfeG1bS5TgK5k67RpFscZLd7Kkn2wj2kb3kgy39ydU87sUutSCGU4YHHnz4FA79Fz4Jo7H7Jqfqz3AoqDGXNCzo4TnZ1KeXcuyMsfh/<0;1>/*,[86d82f57/87'/0'/0']xpub6CCsMJnVGqX6hU2Eyztx4rvdcCvY9kp9z44ANBGGVcc6zbCtEC24JZLzaem9SHYosC6n6Mympsv2BzcW3FBxHmu5R1yPtwMr74TQK46oSkt/<0;1>/*),{pk(musig([249fdf68/87'/0'/1']xpub6CtyrbfeG1bS5TgK5k67RpFscZLd7Kkn2wj2kb3kgy39ydU87sUutSCGU4YHHnz4FA79Fz4Jo7H7Jqfqz3AoqDGXNCzo4TnZ1KeXcuyMsfh/<0;1>/*,[480101ce/87'/0'/2']xpub6CFYMcJmguCwDe1g4SFgfpZjoNXaeU7LTtfx4MMKPiSnfxmsuXVKCRKDukYjq7jN6Y121GiuR6iaH2hPbYTNY8Dzp9AEzwMCJgLqFVNYH1L/<0;1>/*)),pk(musig([86d82f57/87'/0'/0']xpub6CCsMJnVGqX6hU2Eyztx4rvdcCvY9kp9z44ANBGGVcc6zbCtEC24JZLzaem9SHYosC6n6Mympsv2BzcW3FBxHmu5R1yPtwMr74TQK46oSkt/<0;1>/*,[480101ce/87'/0'/2']xpub6CFYMcJmguCwDe1g4SFgfpZjoNXaeU7LTtfx4MMKPiSnfxmsuXVKCRKDukYjq7jN6Y121GiuR6iaH2hPbYTNY8Dzp9AEzwMCJgLqFVNYH1L/<0;1>/*))})#xrde05jr";
 
 const TEST_XPRV =
   "tprv8indigs9s1wXrGCnzFR8m65FU1BmZ7UMR8TqVArSk3KegTFipNCWQJenF45BjmrcPXXfNjyx5NrsU1gEd5BKYog9dEHuu7YqWB7HUt7AuzM";
@@ -158,6 +178,13 @@ function createSignedPsbtB64(requestBody = "testing"): string {
   return Buffer.from(psbt.toPSBT()).toString("base64");
 }
 
+async function createServerTxEvent(txId: string, psbt: string) {
+  return {
+    id: txId,
+    data: await encryptWalletPayload(TEST_WALLET, { psbt, txId }),
+  };
+}
+
 describe("combinePendingPsbt", () => {
   it("marks changed when the provided PSBT adds a new signature", () => {
     const currentPsbtB64 = createPsbtB64();
@@ -204,6 +231,84 @@ describe("combinePendingPsbt", () => {
   });
 });
 
+describe("fetchPendingTransactions", () => {
+  it("skips deleted empty-PSBT transaction events", async () => {
+    const deletedTxId = "deleted-tx";
+    const activeTxId = "active-tx";
+    const deletedEvent = await createServerTxEvent(deletedTxId, "");
+    const olderDeletedEvent = await createServerTxEvent(deletedTxId, createPsbtB64("deleted"));
+    const activeEvent = await createServerTxEvent(activeTxId, createPsbtB64("active"));
+    const client = {
+      get: vi.fn(async () => ({
+        transactions: [deletedEvent, olderDeletedEvent, activeEvent],
+      })),
+    } as unknown as ApiClient;
+
+    await expect(fetchPendingTransactions(client, TEST_WALLET)).resolves.toEqual([
+      { txId: activeTxId, psbt: createPsbtB64("active") },
+    ]);
+  });
+
+  it("treats a single empty-PSBT transaction event as not found", async () => {
+    const client = {
+      get: vi.fn(async () => ({
+        transaction: await createServerTxEvent("deleted-tx", ""),
+      })),
+    } as unknown as ApiClient;
+
+    await expect(fetchPendingTransaction(client, TEST_WALLET, "deleted-tx")).rejects.toThrow(
+      "Transaction not found on server",
+    );
+  });
+});
+
+describe("classifyWalletOutput", () => {
+  it("uses discovered wallet addresses beyond the first fallback gap batch", () => {
+    const highIndexChangeAddress = deriveDescriptorAddresses(
+      TEST_WALLET.descriptor,
+      "testnet",
+      1,
+      25,
+      1,
+    )[0];
+    const classifier = createWalletOutputClassifier("testnet", TEST_WALLET.descriptor, 3);
+
+    expect(classifier.classify(highIndexChangeAddress, null)).toEqual({
+      isWalletOutput: false,
+      isChange: false,
+    });
+
+    classifier.addKnownAddress(highIndexChangeAddress, 1);
+
+    expect(classifier.classify(highIndexChangeAddress, null)).toEqual({
+      isWalletOutput: true,
+      isChange: true,
+    });
+  });
+
+  it("classifies the reported libnunchuk taproot change output by descriptor address", () => {
+    expect(
+      classifyWalletOutput(
+        "bc1p5xh697m2tyqvnaxz2kf6c64dp4jexemslvdx8cmedfasf00dq0dqavlpft",
+        null,
+        "mainnet",
+        REPORTED_TAPROOT_DESCRIPTOR,
+        3,
+      ),
+    ).toEqual({ isWalletOutput: true, isChange: true });
+
+    expect(
+      classifyWalletOutput(
+        "bc1pv4kkj7nqdqu3t0mnawfcq4ufwn88ka7p9flvhddt5uea5wf25g6swjufvs",
+        null,
+        "mainnet",
+        REPORTED_TAPROOT_DESCRIPTOR,
+        3,
+      ),
+    ).toEqual({ isWalletOutput: false, isChange: false });
+  });
+});
+
 function createFundingHex(address: string, amount: bigint): { rawHex: string; txid: string } {
   const tx = new Transaction();
   tx.addInput({ txid: "00".repeat(32), index: 0, sequence: 0xfffffffd });
@@ -212,6 +317,82 @@ function createFundingHex(address: string, amount: bigint): { rawHex: string; tx
     rawHex: Buffer.from(tx.unsignedTx).toString("hex"),
     txid: tx.id,
   };
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const result = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.length;
+  }
+  return result;
+}
+
+function deriveSignerChildPubkey(desc: string): Uint8Array {
+  const parsed = parseSignerDescriptor(desc);
+  const child = HDKey.fromExtendedKey(parsed.xpub, TESTNET_VERSIONS).deriveChild(0).deriveChild(0);
+  if (!child.publicKey) {
+    throw new Error("Failed to derive signer child pubkey");
+  }
+  return child.publicKey;
+}
+
+function addMusigNonceForSigner(
+  tx: Transaction,
+  signerDescriptors: string[],
+  signerIndex: number,
+  participantIndexes = signerDescriptors.map((_, index) => index),
+): string {
+  if (!participantIndexes.includes(signerIndex)) {
+    throw new Error("Nonce signer is not in the requested MuSig2 keyset");
+  }
+
+  const participants = participantIndexes.map((index) =>
+    deriveSignerChildPubkey(signerDescriptors[index]),
+  );
+  const signerPubkey = deriveSignerChildPubkey(signerDescriptors[signerIndex]);
+  const aggregatePubkey = aggregateMusigCompressedPubkey(participants);
+  const inputs = (
+    tx as unknown as {
+      inputs?: Array<
+        ReturnType<Transaction["getInput"]> & {
+          unknown?: Array<[{ type: number; key: Uint8Array }, Uint8Array]>;
+        }
+      >;
+    }
+  ).inputs;
+  const input = inputs?.[0];
+  if (!input) {
+    throw new Error("Missing PSBT input");
+  }
+  const mutableInput = input as ReturnType<Transaction["getInput"]> & {
+    unknown?: Array<[{ type: number; key: Uint8Array }, Uint8Array]>;
+  };
+  const tapBip32 = mutableInput.tapBip32Derivation as
+    | Array<[Uint8Array, { der: { fingerprint: number } }]>
+    | undefined;
+  const signerXOnlyPubkey = hex.encode(toXOnlyPubkey(signerPubkey));
+  const nonceFingerprint = tapBip32?.find(
+    ([pubkey]) => hex.encode(pubkey) === signerXOnlyPubkey,
+  )?.[1].der.fingerprint;
+
+  mutableInput.unknown = [
+    ...(mutableInput.unknown ?? []),
+    [{ type: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, key: aggregatePubkey }, concatBytes(participants)],
+    [
+      {
+        type: PSBT_IN_MUSIG2_PUB_NONCE,
+        key: concatBytes([signerPubkey, aggregatePubkey]),
+      },
+      new Uint8Array(66).fill(1),
+    ],
+  ];
+
+  if (nonceFingerprint === undefined) {
+    throw new Error("Failed to map nonce signer fingerprint");
+  }
+  return nonceFingerprint.toString(16).padStart(8, "0");
 }
 
 function createBlockHeaderHex(blocktime: number): string {
@@ -302,9 +483,839 @@ describe("createTransaction multisig", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("creates taproot multisig disable-key-path PSBT metadata", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 2);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 2,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+      const changeOutput = tx.getOutput(1);
+
+      expect(tx.inputsLength).toBe(1);
+      expect(tx.outputsLength).toBe(2);
+      expect(input.bip32Derivation ?? []).toEqual([]);
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toHaveLength(32);
+      expect(input.tapLeafScript).toHaveLength(1);
+      expect(input.tapBip32Derivation).toHaveLength(signers.length);
+      expect(changeOutput.bip32Derivation ?? []).toEqual([]);
+      expect(changeOutput.tapInternalKey).toHaveLength(32);
+      expect(changeOutput.tapBip32Derivation).toHaveLength(signers.length);
+      expect(result.changeAddress).toMatch(/^tb1p/);
+      expect(result.fee).toBeGreaterThan(0n);
+
+      const signerXfps = signers.map((signer) => parseSignerDescriptor(signer).masterFingerprint);
+      const detail = decodePsbtDetail(
+        result.psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+      expect(detail?.keysets).toEqual([
+        {
+          index: 0,
+          type: "script-path",
+          status: "PENDING_NONCE",
+          signers: [signerXfps[0], signerXfps[1]].sort(),
+          nonces: {
+            [signerXfps[0]]: false,
+            [signerXfps[1]]: false,
+          },
+          signatures: {
+            [signerXfps[0]]: false,
+            [signerXfps[1]]: false,
+          },
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("creates taproot multisig key-path MuSig2 PSBT metadata", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 2);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 2,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+
+      expect(input.bip32Derivation ?? []).toEqual([]);
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toBeUndefined();
+      expect(input.tapLeafScript).toBeUndefined();
+      expect(input.tapBip32Derivation).toHaveLength(signers.length);
+      expect(input.tapBip32Derivation?.every(([, { hashes }]) => hashes.length === 0)).toBe(true);
+      expect(result.changeAddress).toMatch(/^tb1p/);
+      expect(result.fee).toBeGreaterThan(0n);
+
+      const outputClassifier = createWalletOutputClassifier("testnet", wallet.descriptor);
+      const detail = decodePsbtDetail(
+        result.psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { outputClassifier },
+      );
+      expect(detail?.status).toBe("PENDING_NONCE");
+      expect(detail?.nonces).toEqual({
+        [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+        [parseSignerDescriptor(signers[1]).masterFingerprint]: false,
+      });
+      expect(detail?.keysets).toHaveLength(1);
+      expect(detail?.keysets?.[0]).toMatchObject({
+        index: 0,
+        type: "key-path",
+        status: "PENDING_NONCE",
+        signers: signers.map((signer) => parseSignerDescriptor(signer).masterFingerprint).sort(),
+        nonces: {
+          [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+          [parseSignerDescriptor(signers[1]).masterFingerprint]: false,
+        },
+        signatures: {
+          [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+          [parseSignerDescriptor(signers[1]).masterFingerprint]: false,
+        },
+      });
+
+      const nonceFingerprint = addMusigNonceForSigner(tx, signers, 0);
+      const detailWithNonce = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { outputClassifier },
+      );
+      expect(detailWithNonce?.status).toBe("PENDING_NONCE");
+      expect(detailWithNonce?.nonces).toEqual({
+        [parseSignerDescriptor(signers[0]).masterFingerprint]:
+          nonceFingerprint === parseSignerDescriptor(signers[0]).masterFingerprint,
+        [parseSignerDescriptor(signers[1]).masterFingerprint]:
+          nonceFingerprint === parseSignerDescriptor(signers[1]).masterFingerprint,
+      });
+      expect(detailWithNonce?.keysets?.[0]).toMatchObject({
+        status: "PENDING_NONCE",
+        nonces: {
+          [parseSignerDescriptor(signers[0]).masterFingerprint]:
+            nonceFingerprint === parseSignerDescriptor(signers[0]).masterFingerprint,
+          [parseSignerDescriptor(signers[1]).masterFingerprint]:
+            nonceFingerprint === parseSignerDescriptor(signers[1]).masterFingerprint,
+        },
+      });
+
+      addMusigNonceForSigner(tx, signers, 1);
+      const detailWithCompleteNonce = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+        { outputClassifier },
+      );
+      expect(detailWithCompleteNonce?.status).toBe("PENDING_SIGNATURES");
+      expect(detailWithCompleteNonce?.keysets?.[0]).toMatchObject({
+        status: "PENDING_SIGNATURES",
+        nonces: {
+          [parseSignerDescriptor(signers[0]).masterFingerprint]: true,
+          [parseSignerDescriptor(signers[1]).masterFingerprint]: true,
+        },
+        signatures: {
+          [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+          [parseSignerDescriptor(signers[1]).masterFingerprint]: false,
+        },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("creates taproot multisig key-path PSBT metadata for DEFAULT wallets with script leaves", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+      const changeOutput = tx.getOutput(1);
+
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toHaveLength(32);
+      expect(input.tapLeafScript).toBeUndefined();
+      expect(input.tapBip32Derivation).toHaveLength(2);
+      expect(input.tapBip32Derivation?.every(([, { hashes }]) => hashes.length === 0)).toBe(true);
+      expect(changeOutput.tapInternalKey).toHaveLength(32);
+      expect(changeOutput.tapBip32Derivation).toHaveLength(2);
+      expect(changeOutput.tapBip32Derivation?.every(([, { hashes }]) => hashes.length === 0)).toBe(
+        true,
+      );
+      expect(result.changeAddress).toMatch(/^tb1p/);
+      expect(result.fee).toBeGreaterThan(0n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }, 10_000);
+
+  it("creates taproot multisig script-path PSBT metadata when requested", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        taprootScriptPath: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+      const changeOutput = tx.getOutput(1);
+
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toHaveLength(32);
+      expect(input.tapLeafScript).toHaveLength(2);
+      expect(input.tapBip32Derivation?.length).toBeGreaterThan(2);
+      expect(input.tapBip32Derivation?.some(([, { hashes }]) => hashes.length > 0)).toBe(true);
+      expect(changeOutput.tapInternalKey).toHaveLength(32);
+      expect(changeOutput.tapBip32Derivation?.length).toBeGreaterThan(2);
+      expect(result.changeAddress).toMatch(/^tb1p/);
+      expect(result.fee).toBeGreaterThan(0n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }, 10_000);
+
+  it("rejects taproot script-path spending for key-path-only multisig wallets", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 2);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 2,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+
+    await expect(
+      createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        taprootScriptPath: true,
+      }),
+    ).rejects.toThrow("script-path spending enabled");
+  });
+
+  it("reports taproot multisig keysets for DEFAULT wallets with script leaves", () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const signerXfps = signers.map((signer) => parseSignerDescriptor(signer).masterFingerprint);
+    const detail = decodePsbtDetail(createPsbtB64(), "testnet", 2, signers, descriptor, {
+      outputClassifier: {
+        addKnownAddress: vi.fn(),
+        classify: () => ({ isWalletOutput: false, isChange: false }),
+      },
+    });
+
+    expect(detail?.keysets).toEqual([
+      {
+        index: 0,
+        type: "key-path",
+        status: "PENDING_NONCE",
+        signers: [signerXfps[0], signerXfps[1]].sort(),
+        nonces: {
+          [signerXfps[0]]: false,
+          [signerXfps[1]]: false,
+        },
+        signatures: {
+          [signerXfps[0]]: false,
+          [signerXfps[1]]: false,
+        },
+      },
+      {
+        index: 1,
+        type: "script-path",
+        status: "PENDING_NONCE",
+        signers: [signerXfps[0], signerXfps[2]].sort(),
+        nonces: {
+          [signerXfps[0]]: false,
+          [signerXfps[2]]: false,
+        },
+        signatures: {
+          [signerXfps[0]]: false,
+          [signerXfps[2]]: false,
+        },
+      },
+      {
+        index: 2,
+        type: "script-path",
+        status: "PENDING_NONCE",
+        signers: [signerXfps[1], signerXfps[2]].sort(),
+        nonces: {
+          [signerXfps[1]]: false,
+          [signerXfps[2]]: false,
+        },
+        signatures: {
+          [signerXfps[1]]: false,
+          [signerXfps[2]]: false,
+        },
+      },
+    ]);
+  });
+
+  it("recognizes libnunchuk-style output-keyed MuSig2 key-path nonces", () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const payment = deriveDescriptorPayment(descriptor, "testnet", 0, 0);
+    const tx = new Transaction();
+    tx.addInput({
+      txid: "11".repeat(32),
+      index: 0,
+      sequence: 0xfffffffd,
+      witnessUtxo: {
+        amount: 50_000n,
+        script: payment.script,
+      },
+      tapInternalKey: payment.tapInternalKey,
+      tapMerkleRoot: payment.tapMerkleRoot,
+      tapLeafScript: payment.tapLeafScript,
+      tapBip32Derivation: payment.tapBip32Derivation,
+    });
+    tx.addOutputAddress(payment.address, 49_000n, TEST_NETWORK);
+
+    const participants = [deriveSignerChildPubkey(signers[0]), deriveSignerChildPubkey(signers[1])];
+    const signerXfps = signers.map((signer) => parseSignerDescriptor(signer).masterFingerprint);
+    const aggregatePubkey = aggregateMusigCompressedPubkey(participants);
+    const outputKey = payment.script.subarray(2);
+    const outputCompressedPubkey = concatBytes([new Uint8Array([0x02]), outputKey]);
+    const inputs = tx as unknown as {
+      inputs: Array<
+        ReturnType<Transaction["getInput"]> & {
+          unknown?: Array<[{ type: number; key: Uint8Array }, Uint8Array]>;
+        }
+      >;
+    };
+    inputs.inputs[0].unknown = [
+      [
+        { type: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, key: aggregatePubkey },
+        concatBytes(participants),
+      ],
+      [
+        {
+          type: PSBT_IN_MUSIG2_PUB_NONCE,
+          key: concatBytes([participants[0], outputCompressedPubkey]),
+        },
+        new Uint8Array(66).fill(1),
+      ],
+      [
+        {
+          type: PSBT_IN_MUSIG2_PUB_NONCE,
+          key: concatBytes([participants[1], outputCompressedPubkey]),
+        },
+        new Uint8Array(66).fill(2),
+      ],
+    ];
+
+    const detail = decodePsbtDetail(
+      Buffer.from(tx.toPSBT()).toString("base64"),
+      "testnet",
+      2,
+      signers,
+      descriptor,
+    );
+
+    expect(detail?.status).toBe("PENDING_SIGNATURES");
+    expect(detail?.keysets?.[0]).toMatchObject({
+      type: "key-path",
+      status: "PENDING_SIGNATURES",
+      nonces: {
+        [signerXfps[0]]: true,
+        [signerXfps[1]]: true,
+      },
+    });
+  });
+
+  it("counts external taproot outputs even when PSBT output metadata is polluted", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const changeOutput = tx.getOutput(1);
+      tx.updateOutput(0, {
+        tapInternalKey: changeOutput.tapInternalKey,
+        tapBip32Derivation: changeOutput.tapBip32Derivation,
+      });
+
+      const detail = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+
+      expect(detail?.subAmount).toBe("10000 sat");
+      expect(detail?.subAmountBtc).toBe("0.00010000 BTC");
+      expect(detail?.outputs[0].isChange).toBe(false);
+      expect(detail?.outputs[1].isChange).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }, 10_000);
+
+  it("rejects taproot key-path spending for disable-key-path multisig wallets", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+
+    await expect(
+      createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        taprootKeyPath: true,
+      }),
+    ).rejects.toThrow("key-path spending enabled");
+  });
 });
 
 describe("createTransaction miniscript", () => {
+  it("creates taproot miniscript PSBT metadata", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 2);
+    const unspendableXpub = getUnspendableXpub(signers);
+    const body = `tr(${unspendableXpub}/<0;1>/*,and_v(v:pk(${signers[0]}/<0;1>/*),pk(${signers[1]}/<0;1>/*)))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      n: 2,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+      const changeOutput = tx.getOutput(1);
+
+      expect(tx.inputsLength).toBe(1);
+      expect(tx.outputsLength).toBe(2);
+      expect(input.witnessScript).toBeUndefined();
+      expect(input.bip32Derivation ?? []).toEqual([]);
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toHaveLength(32);
+      expect(input.tapLeafScript).toHaveLength(1);
+      expect(input.tapBip32Derivation).toHaveLength(signers.length);
+      expect(changeOutput.bip32Derivation ?? []).toEqual([]);
+      expect(changeOutput.tapInternalKey).toHaveLength(32);
+      expect(changeOutput.tapBip32Derivation).toHaveLength(signers.length);
+      expect(result.miniscriptPath).toMatchObject({
+        requiredSignatures: 2,
+      });
+      expect(result.changeAddress).toMatch(/^tb1p/);
+
+      const detail = decodePsbtDetail(
+        result.psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+      expect(detail?.status).toBe("PENDING_SIGNATURES");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("creates taproot miniscript key-path MuSig2 PSBT metadata", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const body = `tr(musig(${signers[0]},${signers[1]})/<0;1>/*,pk(${signers[2]}/<0;1>/*))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+      const changeOutput = tx.getOutput(1);
+
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toHaveLength(32);
+      expect(input.tapLeafScript).toBeUndefined();
+      expect(input.tapBip32Derivation).toHaveLength(2);
+      expect(input.tapBip32Derivation?.every(([, { hashes }]) => hashes.length === 0)).toBe(true);
+      expect(changeOutput.tapInternalKey).toHaveLength(32);
+      expect(changeOutput.tapBip32Derivation).toHaveLength(2);
+      expect(result.miniscriptPath).toBeUndefined();
+      const detail = decodePsbtDetail(
+        result.psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+      expect(detail?.miniscriptPath).toBeUndefined();
+      expect(detail?.signers).toEqual({
+        [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+        [parseSignerDescriptor(signers[1]).masterFingerprint]: false,
+      });
+      expect(detail?.nonces).toEqual({
+        [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+        [parseSignerDescriptor(signers[1]).masterFingerprint]: false,
+      });
+      expect(detail?.signers).not.toHaveProperty(
+        parseSignerDescriptor(signers[2]).masterFingerprint,
+      );
+      expect(result.changeAddress).toMatch(/^tb1p/);
+      expect(result.fee).toBeGreaterThan(0n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("does not report a script path for default single-key taproot miniscript key-path PSBTs", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 3);
+    const body = `tr(${signers[0]}/<0;1>/*,thresh(2,pk(${signers[1]}/<0;1>/*),s:pk(${signers[2]}/<0;1>/*),sln:older(1)))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 1,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      const input = tx.getInput(0);
+      const detail = decodePsbtDetail(
+        result.psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+
+      expect(input.tapInternalKey).toHaveLength(32);
+      expect(input.tapMerkleRoot).toHaveLength(32);
+      expect(input.tapLeafScript).toBeUndefined();
+      expect(input.tapBip32Derivation).toHaveLength(1);
+      expect(input.tapBip32Derivation?.every(([, { hashes }]) => hashes.length === 0)).toBe(true);
+      expect(result.miniscriptPath).toBeUndefined();
+      expect(detail?.miniscriptPath).toBeUndefined();
+      expect(detail?.signers).toEqual({
+        [parseSignerDescriptor(signers[0]).masterFingerprint]: false,
+      });
+      expect(detail?.signers).not.toHaveProperty(
+        parseSignerDescriptor(signers[1]).masterFingerprint,
+      );
+      expect(detail?.signers).not.toHaveProperty(
+        parseSignerDescriptor(signers[2]).masterFingerprint,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("finalizes taproot miniscript script-path leaves unknown to the default taproot finalizer", async () => {
+    const descriptors = VALID_MINISCRIPT_SIGNERS.map((signer) => signer.descriptor);
+    const body = `tr(${descriptors[0]}/<0;1>/*,thresh(3,pk(${descriptors[0]}/<0;1>/*),s:pk(${descriptors[1]}/<0;1>/*),s:pk(${descriptors[2]}/<0;1>/*),sln:older(1)))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 1,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers: descriptors,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        taprootScriptPath: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+
+      expect(result.miniscriptPath).toMatchObject({
+        index: 0,
+        requiredSignatures: 3,
+      });
+      expect(tx.getInput(0).tapLeafScript).toHaveLength(1);
+      expect(signWithValidMiniscriptSigner(tx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 1, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 2, wallet.descriptor)).toBe(1);
+
+      expect(finalizeMiniscriptPsbt(tx, wallet.descriptor, "testnet")).toMatchObject({
+        requiredPreimages: 0,
+      });
+      expect(tx.isFinal).toBe(true);
+      expect(() => tx.extract()).not.toThrow();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports all compatible taproot miniscript satisfaction paths and narrows by signatures", async () => {
+    const descriptors = VALID_MINISCRIPT_SIGNERS.map((signer) => signer.descriptor);
+    const unspendableXpub = getUnspendableXpub(descriptors);
+    const body = `tr(${unspendableXpub}/<0;1>/*,thresh(2,pk(${descriptors[0]}/<0;1>/*),s:pk(${descriptors[1]}/<0;1>/*),s:pk(${descriptors[2]}/<0;1>/*)))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers: descriptors,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        taprootScriptPath: true,
+        miniscriptPath: 1,
+      });
+      expect(result.miniscriptPath).toMatchObject({
+        index: 1,
+        requiredSignatures: 2,
+      });
+
+      const unsignedDetail = decodePsbtDetail(
+        result.psbtB64,
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+      expect(unsignedDetail?.miniscriptPaths?.map((path) => path.index)).toEqual([0, 1, 2]);
+      expect(unsignedDetail?.miniscriptPaths?.find((path) => path.index === 1)).toMatchObject({
+        requiredSignatures: 2,
+        signedCount: 0,
+        status: "compatible",
+      });
+
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      expect(signWithValidMiniscriptSigner(tx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 2, wallet.descriptor)).toBe(1);
+
+      const signedDetail = decodePsbtDetail(
+        Buffer.from(tx.toPSBT()).toString("base64"),
+        "testnet",
+        wallet.m,
+        wallet.signers,
+        wallet.descriptor,
+      );
+      expect(signedDetail?.status).toBe("READY_TO_BROADCAST");
+      expect(signedDetail?.miniscriptPath).toMatchObject({ index: 1 });
+      expect(signedDetail?.miniscriptPaths?.find((path) => path.index === 1)).toMatchObject({
+        signedCount: 2,
+        status: "satisfied",
+      });
+      expect(signedDetail?.miniscriptPaths?.find((path) => path.index === 0)).toMatchObject({
+        status: "compatible",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("uses absolute timelocks as transaction locktime", async () => {
     const descriptor = buildMiniscriptDescriptor(
       `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
