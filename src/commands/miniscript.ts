@@ -3,12 +3,20 @@ import { getNetwork, requireEmail } from "../core/config.js";
 import { parseAddressTypeInput, type AddressType } from "../core/address-type.js";
 import { loadWallet } from "../core/storage.js";
 import { buildWalletDescriptorForParsed, parseDescriptor } from "../core/descriptor.js";
-import { buildMiniscriptDescriptor, validateMiniscriptTemplate } from "../core/miniscript.js";
+import {
+  buildMiniscriptDescriptor,
+  parseTapscriptTemplate,
+  validateMiniscriptTemplate,
+  validateTapscriptTemplate,
+} from "../core/miniscript.js";
 import {
   formatMiniscriptPreimageRequirement,
   type MiniscriptPreimageRequirement,
 } from "../core/miniscript-preimage.js";
-import { describeMiniscriptSpendingPlans } from "../core/miniscript-spend.js";
+import {
+  describeMiniscriptSpendingPlans,
+  type MiniscriptSpendingPlanStatus,
+} from "../core/miniscript-spend.js";
 import { print, printError, printTable } from "../output.js";
 
 export const miniscriptCommand = new Command("miniscript").description(
@@ -17,17 +25,20 @@ export const miniscriptCommand = new Command("miniscript").description(
 
 function parseAddressTypeOption(value: string): AddressType {
   const addressType = parseAddressTypeInput(value);
-  if (addressType === "NATIVE_SEGWIT") {
+  if (addressType === "NATIVE_SEGWIT" || addressType === "TAPROOT") {
     return addressType;
   }
 
   throw new InvalidArgumentError(
-    `Invalid miniscript address type: ${value}. Miniscript currently supports NATIVE_SEGWIT only`,
+    `Invalid miniscript address type: ${value}. Miniscript currently supports NATIVE_SEGWIT and TAPROOT`,
   );
 }
 
 function miniscriptAddressTypeOption(): Option {
-  return new Option("--address-type <type>", "Address type for --miniscript (NATIVE_SEGWIT only)")
+  return new Option(
+    "--address-type <type>",
+    "Address type for --miniscript (NATIVE_SEGWIT or TAPROOT)",
+  )
     .argParser(parseAddressTypeOption)
     .default("NATIVE_SEGWIT" satisfies AddressType, "NATIVE_SEGWIT");
 }
@@ -55,7 +66,8 @@ function formatMiniscriptSignerName(value: string): string {
 
 function printMiniscriptPlanTable(
   plans: Array<{
-    index: number;
+    index: number | null;
+    path: number | string;
     supported: boolean;
     satisfiable: boolean;
     preimageRequirements: MiniscriptPreimageRequirement[];
@@ -68,7 +80,7 @@ function printMiniscriptPlanTable(
 ): void {
   printTable(
     plans.map((plan) => ({
-      path: plan.index,
+      path: plan.path,
       supported: plan.supported ? "yes" : "no",
       satisfiable: plan.satisfiable ? "yes" : "no",
       required: plan.requiredSignatures,
@@ -95,8 +107,8 @@ type MiniscriptSourceOptions = {
 };
 
 function requireMiniscriptAddressType(addressType: AddressType): AddressType {
-  if (addressType !== "NATIVE_SEGWIT") {
-    throw new Error("Only native segwit miniscript descriptors are supported");
+  if (addressType !== "NATIVE_SEGWIT" && addressType !== "TAPROOT") {
+    throw new Error("Only native segwit and taproot miniscript descriptors are supported");
   }
   return addressType;
 }
@@ -110,6 +122,7 @@ function getMiniscriptSource(
   miniscript: string;
   walletId?: string;
   walletName?: string;
+  taprootKeyPathSignerNames?: string[];
 } | null {
   const sources = [options.wallet, options.descriptor, options.miniscript].filter(
     (value) => typeof value === "string" && value.trim().length > 0,
@@ -154,6 +167,10 @@ function getMiniscriptSource(
       addressType: requireMiniscriptAddressType(parsed.addressType),
       descriptor: buildWalletDescriptorForParsed(parsed),
       miniscript: parsed.miniscript,
+      taprootKeyPathSignerNames:
+        parsed.addressType === "TAPROOT" && parsed.m > 0
+          ? parsed.signers.slice(0, parsed.m)
+          : undefined,
       walletId: wallet.walletId,
       walletName: wallet.name,
     };
@@ -176,12 +193,19 @@ function getMiniscriptSource(
       addressType: requireMiniscriptAddressType(parsed.addressType),
       descriptor: buildWalletDescriptorForParsed(parsed),
       miniscript: parsed.miniscript,
+      taprootKeyPathSignerNames:
+        parsed.addressType === "TAPROOT" && parsed.m > 0
+          ? parsed.signers.slice(0, parsed.m)
+          : undefined,
     };
   }
 
   const miniscript = String(options.miniscript).trim();
   const addressType = options.addressType;
-  const validation = validateMiniscriptTemplate(miniscript, addressType);
+  const validation =
+    addressType === "TAPROOT"
+      ? validateTapscriptTemplate(miniscript)
+      : validateMiniscriptTemplate(miniscript, addressType);
   if (!validation.ok) {
     printError(
       {
@@ -196,13 +220,71 @@ function getMiniscriptSource(
   return {
     addressType,
     descriptor:
-      addressType === undefined ? undefined : buildMiniscriptDescriptor(miniscript, addressType),
+      addressType === undefined || addressType === "TAPROOT"
+        ? undefined
+        : buildMiniscriptDescriptor(miniscript, addressType),
     miniscript,
+    taprootKeyPathSignerNames:
+      addressType === "TAPROOT" ? parseTapscriptTemplate(miniscript).keypath : undefined,
   };
 }
 
 function formatAddressTypeLabel(addressType: AddressType | undefined): string {
   return addressType ?? "NATIVE_SEGWIT";
+}
+
+type MiniscriptDisplayPlan = {
+  index: number | null;
+  path: number | string;
+  preimageRequirements: MiniscriptPreimageRequirement[];
+  requiredSignatures: number;
+  satisfiable: boolean;
+  sequence: number;
+  signerNames: string[];
+  spendType: "KEY_PATH" | "SCRIPT_PATH";
+  supported: boolean;
+  lockTime: number;
+  unsupportedReason?: string;
+};
+
+function buildMiniscriptDisplayPlans(
+  taprootKeyPathSignerNames: string[] | undefined,
+  scriptPlans: MiniscriptSpendingPlanStatus[],
+): MiniscriptDisplayPlan[] {
+  const keyPathPlan =
+    taprootKeyPathSignerNames && taprootKeyPathSignerNames.length > 0
+      ? [
+          {
+            index: null,
+            path: "key-path",
+            preimageRequirements: [],
+            requiredSignatures: taprootKeyPathSignerNames.length,
+            satisfiable: true,
+            sequence: 0,
+            signerNames: taprootKeyPathSignerNames,
+            spendType: "KEY_PATH" as const,
+            supported: true,
+            lockTime: 0,
+          },
+        ]
+      : [];
+
+  return [
+    ...keyPathPlan,
+    ...scriptPlans.map((plan) => ({
+      index: plan.index,
+      path: plan.index,
+      preimageRequirements: plan.preimageRequirements,
+      requiredSignatures: plan.requiredSignatures,
+      satisfiable: plan.satisfiable,
+      sequence: plan.sequence,
+      signerNames: plan.signerNames,
+      spendType: "SCRIPT_PATH" as const,
+      supported: plan.supported,
+      lockTime: plan.lockTime,
+      unsupportedReason: plan.unsupportedReason,
+    })),
+  ];
 }
 
 miniscriptCommand
@@ -235,6 +317,7 @@ miniscriptCommand
           }
         : undefined;
       const plans = describeMiniscriptSpendingPlans(source.miniscript, txState);
+      const displayPlans = buildMiniscriptDisplayPlans(source.taprootKeyPathSignerNames, plans);
       const result = {
         walletId: source.walletId,
         name: source.walletName,
@@ -244,8 +327,9 @@ miniscriptCommand
         txState: txState
           ? { lockTime: txState.lockTime, sequence: txState.inputs[0].nSequence }
           : undefined,
-        paths: plans.map((plan) => ({
+        paths: displayPlans.map((plan) => ({
           index: plan.index,
+          spendType: plan.spendType,
           supported: plan.supported,
           satisfiable: plan.satisfiable,
           preimageRequirements: plan.preimageRequirements,
@@ -277,7 +361,7 @@ miniscriptCommand
         );
       }
       console.log("");
-      printMiniscriptPlanTable(plans);
+      printMiniscriptPlanTable(displayPlans);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -296,16 +380,19 @@ miniscriptCommand
       if (!source) return;
 
       const plans = describeMiniscriptSpendingPlans(source.miniscript);
+      const displayPlans = buildMiniscriptDisplayPlans(source.taprootKeyPathSignerNames, plans);
       const result = {
         ok: true,
         walletId: source.walletId,
         addressType: formatAddressTypeLabel(source.addressType),
         miniscript: source.miniscript,
         descriptor: source.descriptor,
-        pathCount: plans.length,
-        paths: plans.map((plan) => ({
+        pathCount: displayPlans.length,
+        paths: displayPlans.map((plan) => ({
           index: plan.index,
+          spendType: plan.spendType,
           supported: plan.supported,
+          satisfiable: plan.satisfiable,
           preimageRequirements: plan.preimageRequirements,
           requiredSignatures: plan.requiredSignatures,
           lockTime: plan.lockTime,
@@ -330,9 +417,9 @@ miniscriptCommand
       if (source.descriptor) {
         console.log(`Descriptor: ${source.descriptor}`);
       }
-      console.log(`Paths: ${plans.length}`);
+      console.log(`Paths: ${displayPlans.length}`);
       console.log("");
-      printMiniscriptPlanTable(plans);
+      printMiniscriptPlanTable(displayPlans);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }

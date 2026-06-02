@@ -5,12 +5,12 @@ import type { Network } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/electrum.js";
 import { deriveDescriptorAddresses } from "../core/address.js";
-import { loadWallet } from "../core/storage.js";
+import { loadWallet, removeMusigNonce } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
-import { signWalletPsbtWithKey } from "../core/psbt-sign.js";
+import { hasWalletSignerSignedPsbt, signWalletPsbtWithKey } from "../core/psbt-sign.js";
 import { parseDescriptor } from "../core/descriptor.js";
 import { finalizeMiniscriptPsbt } from "../core/miniscript-finalize.js";
 import {
@@ -25,6 +25,7 @@ import {
   fetchPendingTransactions,
   deleteTransaction,
   combinePendingPsbt,
+  createWalletOutputClassifier,
   decodePsbtDetail,
   fetchConfirmedTransactions,
   fetchPendingTxInputTimelockMetadataBatch,
@@ -32,6 +33,7 @@ import {
   ServerTxResponse,
   type PendingTx,
   type PendingTxDetail,
+  type WalletOutputClassifier,
   type PendingTxInputTimelockMetadata,
 } from "../core/transaction.js";
 import {
@@ -91,6 +93,40 @@ function printMiniscriptPathSummary(
   );
 }
 
+function printMiniscriptPathsSummary(
+  miniscriptPaths: PendingTxDetail["miniscriptPaths"],
+  selectedIndex?: number,
+  indent = "  ",
+): void {
+  if (!miniscriptPaths || miniscriptPaths.length === 0) {
+    return;
+  }
+
+  console.log(`${indent}Miniscript satisfaction paths:`);
+  for (const path of miniscriptPaths) {
+    const labels: string[] = [path.status];
+    if (selectedIndex === path.index) {
+      labels.unshift("selected");
+    }
+    const lock =
+      path.lockTime > 0
+        ? ` locktime=${path.lockTime}`
+        : path.sequence > 0
+          ? ` sequence=${path.sequence}`
+          : "";
+    const preimages =
+      path.preimageRequirements.length > 0
+        ? ` preimages=${path.preimageRequirements.map(formatMiniscriptPreimageRequirement).join(",")}`
+        : "";
+    console.log(
+      `${indent}  #${path.index} ${labels.join(",")} signatures=${path.signedCount}/${path.requiredSignatures}${lock}${preimages}`,
+    );
+    console.log(
+      `${indent}     Signers: ${path.signerNames.length > 0 ? path.signerNames.join(", ") : "(none)"}`,
+    );
+  }
+}
+
 function printTimelockSummary(
   timelockedUntil:
     | {
@@ -114,6 +150,36 @@ function printTimelockSummary(
   const state =
     timelockedUntil.mature == null ? "undetermined" : timelockedUntil.mature ? "mature" : "pending";
   console.log(`${indent}Timelock: ${state} ${timelockedUntil.based} until ${target}`);
+}
+
+function printProgressMap(
+  label: string,
+  values: Record<string, boolean> | undefined,
+  indent = "  ",
+): void {
+  const entries = Object.entries(values ?? {});
+  if (entries.length === 0) {
+    return;
+  }
+
+  const formatted = entries.map(([xfp, done]) => `${xfp} ${done ? "✓" : "✗"}`).join("  ");
+  console.log(`${indent}${label}: ${formatted}`);
+}
+
+function printKeysets(keysets: PendingTxDetail["keysets"], indent = "  "): void {
+  if (!keysets || keysets.length === 0) {
+    return;
+  }
+
+  console.log(`${indent}Keysets:`);
+  for (const keyset of keysets) {
+    const label = keyset.type === "key-path" ? "key-path" : "script-path";
+    console.log(
+      `${indent}  ${keyset.index}: ${label} ${keyset.signers.join(" ")} -> ${keyset.status}`,
+    );
+    printProgressMap("Nonces", keyset.nonces, `${indent}     `);
+    printProgressMap("Signatures", keyset.signatures, `${indent}     `);
+  }
 }
 
 function getGlobals(cmd: Command): { apiKey: string; network: Network; email: string } {
@@ -145,10 +211,13 @@ function decodePendingTxWithoutMetadata(
   tx: PendingTx,
   network: Network,
   wallet: WalletData,
+  outputClassifier?: WalletOutputClassifier,
 ): DecodedPendingTx {
   return {
     tx,
-    detail: decodePsbtDetail(tx.psbt, network, wallet.m, wallet.signers, wallet.descriptor),
+    detail: decodePsbtDetail(tx.psbt, network, wallet.m, wallet.signers, wallet.descriptor, {
+      outputClassifier,
+    }),
   };
 }
 
@@ -156,11 +225,13 @@ async function decodePendingTxsWithTimelockMetadata(
   pending: PendingTx[],
   network: Network,
   wallet: WalletData,
+  classifier?: WalletOutputClassifier,
 ): Promise<DecodedPendingTx[]> {
   if (pending.length === 0) {
     return [];
   }
 
+  const outputClassifier = classifier ?? createWalletOutputClassifier(network, wallet.descriptor);
   const server = getElectrumServer(network);
   const electrum = new ElectrumClient();
   let currentHeight: number | undefined;
@@ -188,12 +259,15 @@ async function decodePendingTxsWithTimelockMetadata(
           currentHeight,
           currentUnixTime,
           inputUtxos: metadataByTxId.get(tx.txId),
+          outputClassifier,
         }),
       });
     }
     return decoded;
   } catch {
-    return pending.map((tx) => decodePendingTxWithoutMetadata(tx, network, wallet));
+    return pending.map((tx) =>
+      decodePendingTxWithoutMetadata(tx, network, wallet, outputClassifier),
+    );
   } finally {
     electrum.close();
   }
@@ -230,6 +304,24 @@ async function decodePsbtDetailWithTimelockMetadata(
   });
 }
 
+async function decodePsbtDetailBestEffort(
+  psbtB64: string,
+  network: Network,
+  wallet: WalletData,
+): Promise<PendingTxDetail | null> {
+  const server = getElectrumServer(network);
+  const electrum = new ElectrumClient();
+  try {
+    await electrum.connect(server.host, server.port, server.protocol);
+    await electrum.serverVersion("nunchuk-cli", "1.4");
+    return await decodePsbtDetailWithTimelockMetadata(psbtB64, network, wallet, electrum);
+  } catch {
+    return decodePsbtDetail(psbtB64, network, wallet.m, wallet.signers, wallet.descriptor);
+  } finally {
+    electrum.close();
+  }
+}
+
 export const txCommand = new Command("tx").description("Create, sign, and broadcast transactions");
 
 // tx create — Build PSBT locally, upload to group server
@@ -254,6 +346,10 @@ txCommand
     "--miniscript-path <index>",
     "Select a miniscript signing path by index",
     parseMiniscriptPathOption,
+  )
+  .option(
+    "--taproot-script-path",
+    "Spend a taproot wallet through its script path; key path is the default when available",
   )
   .action(async (options, cmd) => {
     try {
@@ -281,6 +377,7 @@ txCommand
           toAddress: options.to,
           amount: sendAmount,
           miniscriptPath: options.miniscriptPath,
+          taprootScriptPath: options.taprootScriptPath,
           preimages: options.preimage,
           // Fee rate always estimated from Nunchuk API (with Electrum fallback)
         });
@@ -302,7 +399,8 @@ txCommand
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
-              miniscriptPath: detail?.miniscriptPath ?? result.miniscriptPath,
+              miniscriptPath: result.miniscriptPath ?? detail?.miniscriptPath,
+              miniscriptPaths: detail?.miniscriptPaths,
               timelockedUntil: detail?.timelockedUntil,
             },
             cmd,
@@ -319,7 +417,9 @@ txCommand
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
         }
-        printMiniscriptPathSummary(detail?.miniscriptPath ?? result.miniscriptPath);
+        const selectedMiniscriptPath = result.miniscriptPath ?? detail?.miniscriptPath;
+        printMiniscriptPathSummary(selectedMiniscriptPath);
+        printMiniscriptPathsSummary(detail?.miniscriptPaths, selectedMiniscriptPath?.index);
         printTimelockSummary(detail?.timelockedUntil);
         console.log(
           `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId}`,
@@ -333,23 +433,13 @@ txCommand
   });
 
 /** Check if a signer (by xfp) already signed input 0 of the PSBT. */
-function hasSignerAlreadySigned(tx: Transaction, xfpInt: number): boolean {
-  if (tx.inputsLength === 0) return false;
-  const inp = tx.getInput(0);
-  const partialSig = inp.partialSig as Array<[Uint8Array, Uint8Array]> | undefined;
-  const bip32Derivation = inp.bip32Derivation as
-    | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
-    | undefined;
-  if (!partialSig || !bip32Derivation) return false;
-
-  for (const [pubkey] of partialSig) {
-    for (const [bip32Pub, { fingerprint }] of bip32Derivation) {
-      if (fingerprint === xfpInt && Buffer.from(pubkey).equals(Buffer.from(bip32Pub))) {
-        return true;
-      }
-    }
-  }
-  return false;
+function hasSignerAlreadySigned(
+  tx: Transaction,
+  xfpInt: number,
+  wallet: WalletData,
+  network: Network,
+): boolean {
+  return hasWalletSignerSignedPsbt(tx, xfpInt, wallet.descriptor, network);
 }
 
 // tx sign — Sign PSBT locally, re-upload to server
@@ -382,6 +472,7 @@ txCommand
       const wantsLocalSigning = !options.psbt && (hasExplicitSigner || !hasPreimages);
       let didAddPreimages = false;
       let didLocalSign = false;
+      const consumedMusigNonceIds: string[] = [];
 
       if (options.psbt) {
         if (options.xprv || options.fingerprint) {
@@ -394,14 +485,18 @@ txCommand
           );
           return;
         }
-        const tx = Transaction.fromPSBT(Buffer.from(String(options.psbt).trim(), "base64"));
+        const tx = Transaction.fromPSBT(Buffer.from(String(options.psbt).trim(), "base64"), {
+          allowUnknown: true,
+        });
         if (hasPreimages) {
           addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, options.preimage);
           didAddPreimages = true;
         }
         nextPsbtB64 = Buffer.from(tx.toPSBT()).toString("base64");
       } else {
-        const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
+        const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"), {
+          allowUnknown: true,
+        });
         if (wantsLocalSigning) {
           const resolved = resolveSignerKeys(options, email, network, wallet.signers);
           if ("error" in resolved) {
@@ -410,7 +505,7 @@ txCommand
           }
 
           const toSign = resolved.matched.filter(
-            (m) => !hasSignerAlreadySigned(tx, parseInt(m.signerXfp, 16)),
+            (m) => !hasSignerAlreadySigned(tx, parseInt(m.signerXfp, 16), wallet, network),
           );
 
           if (toSign.length === 0 && !hasPreimages) {
@@ -427,6 +522,13 @@ txCommand
               matched.signerKey,
               parseInt(matched.signerXfp, 16),
               wallet.descriptor,
+              {
+                email,
+                network,
+                walletId: wallet.walletId,
+                txId: options.txId,
+                consumedNonceIds: consumedMusigNonceIds,
+              },
             );
             didLocalSign = true;
           }
@@ -459,14 +561,11 @@ txCommand
       if (merged.changed) {
         await uploadTransaction(client, wallet, merged.psbtB64, options.txId);
       }
+      for (const nonceId of new Set(consumedMusigNonceIds)) {
+        removeMusigNonce(email, network, nonceId);
+      }
 
-      const detail = decodePsbtDetail(
-        merged.psbtB64,
-        network,
-        wallet.m,
-        wallet.signers,
-        wallet.descriptor,
-      );
+      const detail = await decodePsbtDetailBestEffort(merged.psbtB64, network, wallet);
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
@@ -476,6 +575,7 @@ txCommand
             status: detail?.status ?? "PENDING_SIGNATURES",
             signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
             miniscriptPath: detail?.miniscriptPath,
+            miniscriptPaths: detail?.miniscriptPaths,
             timelockedUntil: detail?.timelockedUntil,
           },
           cmd,
@@ -512,6 +612,7 @@ txCommand
       console.log(`  Transaction ID: ${options.txId}`);
       console.log(`  Status: ${detail?.status ?? "PENDING_SIGNATURES"}${sigInfo}`);
       printMiniscriptPathSummary(detail?.miniscriptPath);
+      printMiniscriptPathsSummary(detail?.miniscriptPaths, detail?.miniscriptPath?.index);
       printTimelockSummary(detail?.timelockedUntil);
       if (detail?.status === "READY_TO_BROADCAST") {
         console.log(
@@ -537,7 +638,9 @@ txCommand
       const client = new ApiClient(apiKey, network);
 
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
-      const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"));
+      const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"), {
+        allowUnknown: true,
+      });
       const parsedDescriptor = parseDescriptor(wallet.descriptor);
 
       // If PSBT is already finalized (e.g. by mobile app), skip finalize()
@@ -612,17 +715,23 @@ txCommand
       const { apiKey, network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
       const client = new ApiClient(apiKey, network);
+      const outputClassifier = createWalletOutputClassifier(network, wallet.descriptor);
 
       const [allPending, confirmed] = await Promise.all([
         fetchPendingTransactions(client, wallet),
-        fetchConfirmedTransactions(wallet, network),
+        fetchConfirmedTransactions(wallet, network, outputClassifier),
       ]);
 
       // Dedup: filter pending txs already confirmed on-chain
       // Reference: libnunchuk uses txid as primary key in SQLite — single entry per tx
       const confirmedTxIds = new Set(confirmed.map((c) => c.txHash));
       const pending = allPending.filter((p) => !confirmedTxIds.has(p.txId));
-      const decodedPending = await decodePendingTxsWithTimelockMetadata(pending, network, wallet);
+      const decodedPending = await decodePendingTxsWithTimelockMetadata(
+        pending,
+        network,
+        wallet,
+        outputClassifier,
+      );
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
@@ -637,8 +746,11 @@ txCommand
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
                 miniscriptPath: detail?.miniscriptPath,
+                miniscriptPaths: detail?.miniscriptPaths,
                 timelockedUntil: detail?.timelockedUntil,
                 outputs: detail?.outputs,
+                keysets: detail?.keysets,
+                nonces: detail?.nonces,
                 signers: detail?.signers,
               };
             }),
@@ -682,14 +794,15 @@ txCommand
                 `     Output ${j}: ${o.amountBtc} (${o.amount}) -> ${o.address ?? "unknown"}${changeLabel}`,
               );
             });
-            const signerEntries = Object.entries(detail.signers);
-            if (signerEntries.length > 0) {
-              const signerStr = signerEntries
-                .map(([xfp, signed]) => `${xfp} ${signed ? "✓" : "✗"}`)
-                .join("  ");
-              console.log(`     Signers: ${signerStr}`);
-            }
+            printProgressMap("Signers", detail.signers, "     ");
+            printProgressMap("Nonces", detail.nonces, "     ");
+            printKeysets(detail.keysets, "     ");
             printMiniscriptPathSummary(detail.miniscriptPath, "     ");
+            printMiniscriptPathsSummary(
+              detail.miniscriptPaths,
+              detail.miniscriptPath?.index,
+              "     ",
+            );
             printTimelockSummary(detail.timelockedUntil, "     ");
           }
         });
@@ -757,7 +870,7 @@ txCommand
             allowUnknownOutputs: true,
           });
 
-          // Derive change addresses to detect change outputs
+          const outputClassifier = createWalletOutputClassifier(network, wallet.descriptor);
           const changeAddrs = new Set(
             deriveDescriptorAddresses(wallet.descriptor, network, 1, 0, 20),
           );
@@ -773,12 +886,13 @@ txCommand
             const out = tx.getOutput(i);
             const addr = out.script ? getOutputAddress(out.script, network) : null;
             const amt = out.amount ?? 0n;
+            const classification = outputClassifier.classify(addr, null);
             totalOut += amt;
             outputs.push({
               index: i,
               address: addr,
               amount: amt,
-              isChange: !!addr && changeAddrs.has(addr),
+              isChange: classification.isChange,
             });
           }
 
@@ -952,8 +1066,11 @@ txCommand
                 subAmount: detail?.subAmount,
                 subAmountBtc: detail?.subAmountBtc,
                 miniscriptPath: detail?.miniscriptPath,
+                miniscriptPaths: detail?.miniscriptPaths,
                 timelockedUntil: detail?.timelockedUntil,
                 outputs: detail?.outputs,
+                keysets: detail?.keysets,
+                nonces: detail?.nonces,
                 signers: detail?.signers,
                 psbt: parsed.psbt,
               },
@@ -977,14 +1094,11 @@ txCommand
                 `  ${i}: ${o.amountBtc} (${o.amount}) -> ${o.address ?? "unknown"}${changeLabel}`,
               );
             });
-            const signerEntries = Object.entries(detail.signers);
-            if (signerEntries.length > 0) {
-              const signerStr = signerEntries
-                .map(([xfp, signed]) => `${xfp} ${signed ? "✓" : "✗"}`)
-                .join("  ");
-              console.log(`Signers: ${signerStr}`);
-            }
+            printProgressMap("Signers", detail.signers, "");
+            printProgressMap("Nonces", detail.nonces, "");
+            printKeysets(detail.keysets, "");
             printMiniscriptPathSummary(detail.miniscriptPath, "");
+            printMiniscriptPathsSummary(detail.miniscriptPaths, detail.miniscriptPath?.index, "");
             printTimelockSummary(detail.timelockedUntil, "");
           }
           if (parsed.psbt) {
