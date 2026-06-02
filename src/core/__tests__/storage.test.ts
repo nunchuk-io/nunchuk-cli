@@ -22,6 +22,9 @@ import {
   loadKey,
   listKeys,
   removeKey,
+  saveMusigNonce,
+  loadMusigNonce,
+  removeMusigNonce,
   addSandboxId,
   removeSandboxId,
   getSandboxIds,
@@ -397,7 +400,7 @@ describe("wallet storage", () => {
     const stored = JSON.parse(
       decrypt(Buffer.from(row.encrypted), getOrCreateMasterKey()),
     ) as Record<string, unknown>;
-    expect(version.value).toBe("3");
+    expect(version.value).toBe("4");
     expect(stored.descriptor).toBe(wallet.descriptor);
     expect(stored.m).toBeUndefined();
     expect(stored.n).toBeUndefined();
@@ -490,6 +493,43 @@ describe("key storage", () => {
   it("does not throw when removing non-existent key", () => {
     const email = trackEmail(uniqueEmail("key"));
     expect(() => removeKey(email, network, "nonexistent")).not.toThrow();
+  });
+});
+
+// ── MuSig2 nonce storage ─────────────────────────────────────────────
+
+describe("musig nonce storage", () => {
+  const network = "testnet" as const;
+
+  function makeNonce(id: string) {
+    return {
+      nonceId: id,
+      walletId: "wallet-1",
+      txId: "tx-1",
+      inputIndex: 0,
+      leafHash: "11".repeat(32),
+      signerPubkey: `02${"22".repeat(32)}`,
+      signerFingerprint: "aabbccdd",
+      msg: "33".repeat(32),
+      publicNonce: Buffer.from(new Uint8Array(66).fill(1)).toString("base64"),
+      secretNonce: Buffer.from(new Uint8Array(97).fill(2)).toString("base64"),
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  it("round-trips encrypted MuSig2 nonce state", () => {
+    const email = trackEmail(uniqueEmail("musig"));
+    const nonce = makeNonce("nonce-1");
+    saveMusigNonce(email, network, nonce);
+    expect(loadMusigNonce(email, network, nonce.nonceId)).toEqual(nonce);
+  });
+
+  it("removes MuSig2 nonce state after use", () => {
+    const email = trackEmail(uniqueEmail("musig"));
+    const nonce = makeNonce("nonce-1");
+    saveMusigNonce(email, network, nonce);
+    removeMusigNonce(email, network, nonce.nonceId);
+    expect(loadMusigNonce(email, network, nonce.nonceId)).toBeNull();
   });
 });
 
@@ -588,7 +628,7 @@ describe("encrypted storage properties", () => {
       | undefined;
     db.close();
 
-    expect(row?.value).toBe("3");
+    expect(row?.value).toBe("4");
   });
 
   it("stores encrypted profile blobs in meta", () => {
