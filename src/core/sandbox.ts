@@ -2,7 +2,10 @@ import { publicBox, publicOpen } from "./crypto.js";
 import {
   buildAnyDescriptorForParsed,
   buildWalletDescriptorForParsed,
+  formalizePath,
   getWalletIdForParsed,
+  sortTaprootDisableKeyPathSigners,
+  type TaprootWalletTemplate,
 } from "./descriptor.js";
 import type { ParsedDescriptor } from "./descriptor.js";
 import { deriveRootKeyFromDescriptor, deriveSecretboxKey, deriveGID } from "./wallet-keys.js";
@@ -13,11 +16,15 @@ import {
   miniscriptTemplateToMiniscript,
   normalizeMiniscriptTemplate,
   parseSignerNames,
+  tapscriptTemplateToTapscript,
   validateMiniscriptTemplate,
+  validateTapscriptTemplate,
 } from "./miniscript.js";
 import { isRecord } from "./utils.js";
 
 const VERSION = 1;
+const WALLET_TEMPLATE_DEFAULT = 0;
+const WALLET_TEMPLATE_DISABLE_KEY_PATH = 1;
 
 function normalizeGroupSigners(signers: string[], n: number): string[] {
   const normalized = signers.slice(0, n).map((signer) => (isEmptySigner(signer) ? "[]" : signer));
@@ -41,13 +48,16 @@ interface BuildGroupInitEventBodyParams {
   extraEphemeralKeys?: string[];
 }
 
-// Matches libnunchuk's FormalizePath: strip leading "m", replace "h" with "'", ensure leading "/"
-function formalizePath(path: string): string {
-  let rs = path;
-  if (rs.startsWith("m")) rs = rs.slice(1);
-  rs = rs.replaceAll("h", "'");
-  if (rs.length > 0 && rs[0] !== "/") rs = "/" + rs;
-  return rs;
+function taprootWalletTemplateFromPubstate(
+  pubstate: Record<string, unknown>,
+): TaprootWalletTemplate | undefined {
+  if (Number(pubstate.addressType ?? 0) !== ADDRESS_TYPE_TO_NUMBER.TAPROOT) {
+    return undefined;
+  }
+  return Number(pubstate.walletTemplate ?? WALLET_TEMPLATE_DISABLE_KEY_PATH) ===
+    WALLET_TEMPLATE_DISABLE_KEY_PATH
+    ? "DISABLE_KEY_PATH"
+    : "DEFAULT";
 }
 
 // Matches libnunchuk's SingleSigner::get_descriptor: "[xfp/path]xpub"
@@ -71,6 +81,10 @@ function buildGroupInitEventBody(params: BuildGroupInitEventBodyParams): string 
   }
 
   const signers = normalizeGroupSigners(params.signers ?? [], resolvedN);
+  const walletTemplate =
+    params.addressType === "TAPROOT" && (normalizedTemplate.length === 0 || resolvedM === 0)
+      ? WALLET_TEMPLATE_DISABLE_KEY_PATH
+      : WALLET_TEMPLATE_DEFAULT;
   const plaintext: Record<string, unknown> = { signers };
   if (params.platformKey != null) {
     plaintext.platformKey = params.platformKey;
@@ -97,7 +111,7 @@ function buildGroupInitEventBody(params: BuildGroupInitEventBodyParams): string 
     m: resolvedM,
     n: resolvedN,
     addressType: resolvedAddressType,
-    walletTemplate: 0,
+    walletTemplate,
     miniscriptTemplate: normalizedTemplate,
     name: params.name,
     occupied: [] as unknown[],
@@ -306,11 +320,17 @@ function getMiniscriptTemplateMetadata(
   miniscriptTemplate: string,
   addressType: number,
 ): { keypathM: number; slotNames: string[] } {
-  if (addressType !== ADDRESS_TYPE_TO_NUMBER.NATIVE_SEGWIT) {
-    throw new Error("Only native segwit miniscript sandboxes are supported yet");
+  if (
+    addressType !== ADDRESS_TYPE_TO_NUMBER.NATIVE_SEGWIT &&
+    addressType !== ADDRESS_TYPE_TO_NUMBER.TAPROOT
+  ) {
+    throw new Error("Only native segwit and taproot miniscript sandboxes are supported");
   }
 
-  const validation = validateMiniscriptTemplate(miniscriptTemplate, "NATIVE_SEGWIT");
+  const validation =
+    addressType === ADDRESS_TYPE_TO_NUMBER.TAPROOT
+      ? validateTapscriptTemplate(miniscriptTemplate)
+      : validateMiniscriptTemplate(miniscriptTemplate, "NATIVE_SEGWIT");
   if (!validation.ok) {
     throw new Error(validation.error ?? "Invalid miniscript template");
   }
@@ -385,13 +405,20 @@ function buildParsedDescriptorFromGroup(
   const metadata = getGroupDescriptorMetadata(pubstate);
 
   if (metadata.kind === "multisig") {
+    const taprootWalletTemplate = taprootWalletTemplateFromPubstate(pubstate);
+    const descriptorSigners = sortTaprootDisableKeyPathSigners(
+      signers,
+      addressType,
+      taprootWalletTemplate,
+    );
     return {
       descriptor: "",
       kind: "multisig",
       m: metadata.m,
       n: metadata.n,
       addressType,
-      signers,
+      signers: descriptorSigners,
+      taprootWalletTemplate,
     };
   }
 
@@ -402,12 +429,16 @@ function buildParsedDescriptorFromGroup(
   const namedSigners = Object.fromEntries(
     metadata.slotNames.map((name, index) => [name, signers[index]] as const),
   );
-  const miniscript = miniscriptTemplateToMiniscript(
-    metadata.miniscriptTemplate,
-    namedSigners,
-    "/<0;1>/*",
-    "NATIVE_SEGWIT",
-  );
+  const miniscript =
+    addressType === "TAPROOT"
+      ? tapscriptTemplateToTapscript(metadata.miniscriptTemplate, namedSigners, "/<0;1>/*")
+          .tapscript
+      : miniscriptTemplateToMiniscript(
+          metadata.miniscriptTemplate,
+          namedSigners,
+          "/<0;1>/*",
+          "NATIVE_SEGWIT",
+        );
 
   return {
     descriptor: "",
@@ -418,6 +449,68 @@ function buildParsedDescriptorFromGroup(
     signers,
     miniscript,
   };
+}
+
+function normalizeValueKeyset(valueKeyset: readonly number[]): number[] {
+  const seen = new Set<number>();
+  for (const index of valueKeyset) {
+    if (!Number.isSafeInteger(index) || index < 0) {
+      throw new Error("Invalid index");
+    }
+    if (seen.has(index)) {
+      throw new Error("Invalid keyset");
+    }
+    seen.add(index);
+  }
+
+  // libnunchuk accepts std::set<size_t>, so the selected slots are applied in ascending order.
+  return [...seen].sort((a, b) => a - b);
+}
+
+function applyFinalizeValueKeyset(
+  signers: string[],
+  pubstate: Record<string, unknown>,
+  valueKeyset: readonly number[],
+): { signers: string[]; pubstate: Record<string, unknown> } {
+  const metadata = getGroupDescriptorMetadata(pubstate);
+  const addressTypeNumber = Number(pubstate.addressType ?? 0);
+  const isTaprootMultisig =
+    addressTypeNumber === ADDRESS_TYPE_TO_NUMBER.TAPROOT && metadata.kind === "multisig";
+  const keyset = normalizeValueKeyset(valueKeyset);
+
+  if (!isTaprootMultisig) {
+    if (keyset.length > 0) {
+      throw new Error("Invalid keyset");
+    }
+    return { signers, pubstate: { ...pubstate } };
+  }
+
+  const nextPubstate = { ...pubstate };
+  if (keyset.length === 0) {
+    nextPubstate.walletTemplate = WALLET_TEMPLATE_DISABLE_KEY_PATH;
+    return { signers, pubstate: nextPubstate };
+  }
+
+  if (keyset.length !== metadata.m) {
+    throw new Error("Invalid keyset");
+  }
+
+  const selected = new Set(keyset);
+  const reorderedSigners: string[] = [];
+  for (const index of keyset) {
+    if (index >= signers.length || index >= metadata.n) {
+      throw new Error("Invalid index");
+    }
+    reorderedSigners.push(signers[index]);
+  }
+  for (let index = 0; index < signers.length; index++) {
+    if (!selected.has(index)) {
+      reorderedSigners.push(signers[index]);
+    }
+  }
+
+  nextPubstate.walletTemplate = WALLET_TEMPLATE_DEFAULT;
+  return { signers: reorderedSigners.slice(0, metadata.n), pubstate: nextPubstate };
 }
 
 export function getGroupDisplayState(
@@ -831,10 +924,16 @@ export async function buildFinalizeBody(
   ephemeralPub: string,
   ephemeralPriv: string,
   network: Network,
+  valueKeyset: readonly number[] = [],
 ): Promise<FinalizeResult> {
-  const { signers, pubstate, stateId } = decryptSigners(groupJson, ephemeralPub, ephemeralPriv);
+  const decrypted = decryptSigners(groupJson, ephemeralPub, ephemeralPriv);
+  const finalized = applyFinalizeValueKeyset(decrypted.signers, decrypted.pubstate, valueKeyset);
+  const { signers, pubstate } = finalized;
+  const stateId = decrypted.stateId;
   const parsed = buildParsedDescriptorFromGroup(signers, pubstate);
   const metadata = getGroupDescriptorMetadata(pubstate);
+  const taprootWalletTemplate = taprootWalletTemplateFromPubstate(pubstate);
+  const walletSigners = parsed.signers;
   const m = parsed.m;
   const n = parsed.n;
   const addressType = parsed.addressType;
@@ -862,14 +961,14 @@ export async function buildFinalizeBody(
   const state = init.state as Record<string, string>;
 
   // Encrypt plaintext with pubkey and walletId for all participants
-  const plaintext = JSON.stringify({ signers, pubkey: gid, walletId });
+  const plaintext = JSON.stringify({ signers: walletSigners, pubkey: gid, walletId });
   const newState: Record<string, string> = {};
   for (const key of Object.keys(state)) {
     newState[key] = publicBox(plaintext, ephemeralPub, ephemeralPriv, key);
   }
 
   // Build added array (all slots)
-  const added = signers.map((_, i) => i);
+  const added = walletSigners.map((_, i) => i);
 
   const data = {
     version: VERSION,
@@ -880,7 +979,11 @@ export async function buildFinalizeBody(
       m,
       n,
       addressType: ADDRESS_TYPE_TO_NUMBER[addressType],
-      walletTemplate: 0,
+      walletTemplate:
+        taprootWalletTemplate === "DISABLE_KEY_PATH" ||
+        (addressType === "TAPROOT" && metadata.kind === "miniscript" && m === 0)
+          ? WALLET_TEMPLATE_DISABLE_KEY_PATH
+          : WALLET_TEMPLATE_DEFAULT,
       miniscriptTemplate: metadata.kind === "miniscript" ? metadata.miniscriptTemplate : "",
       name,
       occupied: [],
@@ -900,7 +1003,7 @@ export async function buildFinalizeBody(
     walletId,
     gid,
     descriptor,
-    signers,
+    signers: walletSigners,
     secretboxKey,
     m,
     n,
@@ -1159,6 +1262,7 @@ export async function recoverFinalizedGroup(
     ephemeralPriv,
   );
   const parsed = buildParsedDescriptorFromGroup(signers, pubstate);
+  const walletSigners = parsed.signers;
   const m = parsed.m;
   const n = parsed.n;
   const addressType = parsed.addressType;
@@ -1182,7 +1286,7 @@ export async function recoverFinalizedGroup(
     walletId,
     gid,
     descriptor,
-    signers,
+    signers: walletSigners,
     secretboxKey,
     m,
     n,

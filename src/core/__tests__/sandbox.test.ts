@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { generateKeypair, publicOpen } from "../crypto.js";
+import { TAPROOT_UNSPENDABLE_KEY } from "../descriptor.js";
 import { buildMiniscriptDescriptor, miniscriptTemplateToMiniscript } from "../miniscript.js";
 import {
   buildCreateGroupBody,
@@ -120,6 +121,13 @@ describe("buildCreateGroupBody", () => {
     }
   });
 
+  it("disables Taproot multisig key path by default", () => {
+    const body = buildCreateGroupBody("Taproot", 2, 3, "TAPROOT", creator.pub, creator.priv);
+    const { pubstate } = JSON.parse(body).data;
+
+    expect(pubstate.walletTemplate).toBe(1);
+  });
+
   it("encrypts state for creator's ephemeral key only", () => {
     const body = buildCreateGroupBody("W", 2, 3, "NATIVE_SEGWIT", creator.pub, creator.priv);
     const state = JSON.parse(body).data.state;
@@ -155,6 +163,27 @@ describe("buildCreateGroupBody", () => {
     expect(parsed.data.pubstate.m).toBe(0);
     expect(parsed.data.pubstate.n).toBe(4);
     expect(parsed.data.pubstate.miniscriptTemplate).toBe(normalizedTemplate);
+  });
+
+  it("derives taproot miniscript slot count and stores template metadata", () => {
+    const template =
+      "thresh(3,pk(key_0_0),s:pk(key_1_0),s:pk(key_2_0),s:pk(key_3_0),sln:after(1842652800),sln:after(1937260800))";
+    const body = buildCreateGroupBody(
+      "Taproot Policy Wallet",
+      0,
+      0,
+      "TAPROOT",
+      creator.pub,
+      creator.priv,
+      template,
+    );
+    const parsed = JSON.parse(body);
+
+    expect(parsed.data.pubstate.addressType).toBe(4);
+    expect(parsed.data.pubstate.m).toBe(0);
+    expect(parsed.data.pubstate.n).toBe(4);
+    expect(parsed.data.pubstate.miniscriptTemplate).toBe(template);
+    expect(parsed.data.pubstate.walletTemplate).toBe(1);
   });
 });
 
@@ -625,6 +654,151 @@ describe("buildFinalizeBody", () => {
     expect(result.m).toBe(0);
     expect(result.n).toBe(2);
     expect(result.signers).toEqual([signerA, signerB]);
+  });
+
+  it("enables Taproot multisig key path when a finalize value keyset is supplied", async () => {
+    const body = buildCreateGroupBody("Taproot", 2, 2, "TAPROOT", creator.pub, creator.priv);
+    let group = { init: JSON.parse(body).data, status: "PENDING" };
+    const signerA = "[aaaa0000/87'/1'/0']tpubA";
+    const signerB = "[bbbb0000/87'/1'/0']tpubB";
+
+    let addBody = buildAddKeyBody("g1", clone(group), 0, signerA, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    addBody = buildAddKeyBody("g1", clone(group), 1, signerB, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    const result = await buildFinalizeBody(
+      "g1",
+      group,
+      creator.pub,
+      creator.priv,
+      "testnet",
+      [0, 1],
+    );
+    const finalizeBody = JSON.parse(result.body);
+    const plaintext = JSON.parse(
+      publicOpen(finalizeBody.data.state[creator.pub], creator.priv),
+    ) as { signers: string[] };
+
+    expect(finalizeBody.data.pubstate.walletTemplate).toBe(0);
+    expect(result.signers).toEqual([signerA, signerB]);
+    expect(plaintext.signers).toEqual([signerA, signerB]);
+    expect(result.descriptor).toContain("tr(musig(");
+    expect(result.descriptor).not.toContain(TAPROOT_UNSPENDABLE_KEY);
+  });
+
+  it("moves Taproot multisig value keyset signers to the front during finalize", async () => {
+    const body = buildCreateGroupBody("Taproot", 2, 3, "TAPROOT", creator.pub, creator.priv);
+    let group = { init: JSON.parse(body).data, status: "PENDING" };
+    const signerA = "[aaaa0000/87'/1'/0']tpubA";
+    const signerB = "[bbbb0000/87'/1'/0']tpubB";
+    const signerC = "[cccc0000/87'/1'/0']tpubC";
+
+    let addBody = buildAddKeyBody("g1", clone(group), 0, signerA, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    addBody = buildAddKeyBody("g1", clone(group), 1, signerB, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    addBody = buildAddKeyBody("g1", clone(group), 2, signerC, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    const result = await buildFinalizeBody(
+      "g1",
+      group,
+      creator.pub,
+      creator.priv,
+      "testnet",
+      [2, 0],
+    );
+    const finalizeBody = JSON.parse(result.body);
+    const plaintext = JSON.parse(
+      publicOpen(finalizeBody.data.state[creator.pub], creator.priv),
+    ) as { signers: string[] };
+
+    expect(finalizeBody.data.pubstate.walletTemplate).toBe(0);
+    expect(result.signers).toEqual([signerA, signerC, signerB]);
+    expect(plaintext.signers).toEqual([signerA, signerC, signerB]);
+    expect(result.descriptor.indexOf(signerA)).toBeLessThan(result.descriptor.indexOf(signerC));
+    expect(result.descriptor.indexOf(signerC)).toBeLessThan(result.descriptor.indexOf(signerB));
+  });
+
+  it("sorts Taproot disable-key-path multisig signers during finalize", async () => {
+    const body = buildCreateGroupBody("Taproot", 2, 2, "TAPROOT", creator.pub, creator.priv);
+    let group = { init: JSON.parse(body).data, status: "PENDING" };
+    const signerA = "[bbbb0000/87'/1'/0']tpubA";
+    const signerB = "[aaaa0000/87'/1'/0']tpubB";
+
+    let addBody = buildAddKeyBody("g1", clone(group), 0, signerA, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    addBody = buildAddKeyBody("g1", clone(group), 1, signerB, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    const result = await buildFinalizeBody("g1", group, creator.pub, creator.priv, "testnet");
+    const finalizeBody = JSON.parse(result.body);
+    const plaintext = JSON.parse(
+      publicOpen(finalizeBody.data.state[creator.pub], creator.priv),
+    ) as { signers: string[] };
+
+    expect(finalizeBody.data.pubstate.walletTemplate).toBe(1);
+    expect(result.signers).toEqual([signerB, signerA]);
+    expect(plaintext.signers).toEqual([signerB, signerA]);
+    expect(result.descriptor.indexOf(signerB)).toBeLessThan(result.descriptor.indexOf(signerA));
+  });
+
+  it("rejects value keysets for non-Taproot multisig finalize", async () => {
+    const body = buildCreateGroupBody("Native", 2, 2, "NATIVE_SEGWIT", creator.pub, creator.priv);
+    let group = { init: JSON.parse(body).data, status: "PENDING" };
+    const signerA = "[aaaa0000/48'/1'/0'/2']tpubA";
+    const signerB = "[bbbb0000/48'/1'/0'/2']tpubB";
+
+    let addBody = buildAddKeyBody("g1", clone(group), 0, signerA, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    addBody = buildAddKeyBody("g1", clone(group), 1, signerB, creator.pub, creator.priv);
+    group = { init: JSON.parse(addBody).data, status: "PENDING" };
+
+    await expect(
+      buildFinalizeBody("g1", group, creator.pub, creator.priv, "testnet", [0, 1]),
+    ).rejects.toThrow("Invalid keyset");
+  });
+
+  it("rejects Taproot multisig finalize value keysets with the wrong size", async () => {
+    const body = buildCreateGroupBody("Taproot", 2, 3, "TAPROOT", creator.pub, creator.priv);
+    let group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    for (const [slot, signer] of [
+      [0, "[aaaa0000/87'/1'/0']tpubA"],
+      [1, "[bbbb0000/87'/1'/0']tpubB"],
+      [2, "[cccc0000/87'/1'/0']tpubC"],
+    ] as const) {
+      const addBody = buildAddKeyBody("g1", clone(group), slot, signer, creator.pub, creator.priv);
+      group = { init: JSON.parse(addBody).data, status: "PENDING" };
+    }
+
+    await expect(
+      buildFinalizeBody("g1", group, creator.pub, creator.priv, "testnet", [0]),
+    ).rejects.toThrow("Invalid keyset");
+  });
+
+  it("rejects Taproot multisig finalize value keysets with invalid indexes", async () => {
+    const body = buildCreateGroupBody("Taproot", 2, 3, "TAPROOT", creator.pub, creator.priv);
+    let group = { init: JSON.parse(body).data, status: "PENDING" };
+
+    for (const [slot, signer] of [
+      [0, "[aaaa0000/87'/1'/0']tpubA"],
+      [1, "[bbbb0000/87'/1'/0']tpubB"],
+      [2, "[cccc0000/87'/1'/0']tpubC"],
+    ] as const) {
+      const addBody = buildAddKeyBody("g1", clone(group), slot, signer, creator.pub, creator.priv);
+      group = { init: JSON.parse(addBody).data, status: "PENDING" };
+    }
+
+    await expect(
+      buildFinalizeBody("g1", group, creator.pub, creator.priv, "testnet", [0, 3]),
+    ).rejects.toThrow("Invalid index");
   });
 });
 
