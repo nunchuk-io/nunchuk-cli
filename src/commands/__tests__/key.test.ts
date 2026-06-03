@@ -1,15 +1,13 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockListKeys, mockPrint, mockPrintError, mockPrintTable, mockSaveKey } = vi.hoisted(
-  () => ({
-    mockListKeys: vi.fn(),
-    mockPrint: vi.fn(),
-    mockPrintError: vi.fn(),
-    mockPrintTable: vi.fn(),
-    mockSaveKey: vi.fn(),
-  }),
-);
+const { mockListKeys, mockPrint, mockPrintError, mockPrintTable, mockSaveKey } = vi.hoisted(() => ({
+  mockListKeys: vi.fn(),
+  mockPrint: vi.fn(),
+  mockPrintError: vi.fn(),
+  mockPrintTable: vi.fn(),
+  mockSaveKey: vi.fn(),
+}));
 
 vi.mock("../../core/config.js", () => ({
   getNetwork: vi.fn((network?: string) => network ?? "testnet"),
