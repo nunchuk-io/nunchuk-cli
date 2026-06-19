@@ -14,7 +14,7 @@ import {
 } from "./paths.js";
 
 const ENCRYPTION_VERSION = 0x01;
-const STORAGE_SCHEMA_VERSION = 2;
+const STORAGE_SCHEMA_VERSION = 4;
 const STORAGE_SCHEMA_VERSION_KEY = "schema_version";
 const PROFILE_META_KEY = "profile";
 const HKDF_INFO = "nunchuk-cli/storage/v1";
@@ -225,6 +225,20 @@ function createSchemaTables(db: Database.Database): void {
       encrypted BLOB NOT NULL,
       PRIMARY KEY (fingerprint)
     );
+
+    CREATE TABLE IF NOT EXISTS replace_groups (
+      wallet_id TEXT NOT NULL,
+      group_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      PRIMARY KEY (wallet_id, group_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS musig_nonces (
+      nonce_id TEXT NOT NULL,
+      encrypted BLOB NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (nonce_id)
+    );
   `);
 }
 
@@ -369,6 +383,59 @@ function encryptedList<T>(table: "wallets" | "keys", email: string, network: Net
   }
 }
 
+function encryptedWriteById(
+  email: string,
+  network: Network,
+  table: "musig_nonces",
+  idColumn: "nonce_id",
+  id: string,
+  data: unknown,
+  extra: { createdAt: string },
+): void {
+  const db = getDatabase(email, network, { create: true });
+  db?.prepare(
+    `
+      INSERT INTO ${table} (${idColumn}, encrypted, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(${idColumn}) DO UPDATE SET
+        encrypted = excluded.encrypted,
+        created_at = excluded.created_at
+    `,
+  ).run(id, serializeEncrypted(data), extra.createdAt);
+}
+
+function encryptedReadById<T>(
+  email: string,
+  network: Network,
+  table: "musig_nonces",
+  idColumn: "nonce_id",
+  id: string,
+): T | null {
+  try {
+    const db = getDatabase(email, network, { create: false });
+    if (!db) return null;
+
+    const row = db.prepare(`SELECT encrypted FROM ${table} WHERE ${idColumn} = ?`).get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!(row?.encrypted instanceof Uint8Array)) return null;
+    return deserializeEncrypted<T>(row.encrypted);
+  } catch {
+    return null;
+  }
+}
+
+function encryptedRemoveById(
+  email: string,
+  network: Network,
+  table: "musig_nonces",
+  idColumn: "nonce_id",
+  id: string,
+): void {
+  const db = getDatabase(email, network, { create: false });
+  db?.prepare(`DELETE FROM ${table} WHERE ${idColumn} = ?`).run(id);
+}
+
 // ── Shared helpers ───────────────────────────────────────────────────
 
 export function emailHash(email: string): string {
@@ -438,6 +505,69 @@ export function getSandboxIds(email: string, network: Network): string[] {
       .filter((sandboxId): sandboxId is string => sandboxId !== null);
   } catch {
     return [];
+  }
+}
+
+// ── Wallet replacement storage ───────────────────────────────────────
+
+export enum ReplaceGroupStatus {
+  Accepted = "accepted",
+  Declined = "declined",
+}
+
+export function setReplaceGroupStatus(
+  email: string,
+  network: Network,
+  walletId: string,
+  groupId: string,
+  accepted: boolean,
+): void {
+  const db = getDatabase(email, network, { create: true });
+  db?.prepare(
+    `
+      INSERT INTO replace_groups (wallet_id, group_id, status)
+      VALUES (?, ?, ?)
+      ON CONFLICT(wallet_id, group_id) DO UPDATE SET status = excluded.status
+    `,
+  ).run(walletId, groupId, accepted ? ReplaceGroupStatus.Accepted : ReplaceGroupStatus.Declined);
+}
+
+export function getReplaceGroupStatuses(
+  email: string,
+  network: Network,
+  walletId: string,
+): Record<string, ReplaceGroupStatus> {
+  try {
+    const db = getDatabase(email, network, { create: false });
+    if (!db) return {};
+
+    const rows = db
+      .prepare(
+        `
+        SELECT group_id, status
+        FROM replace_groups
+        WHERE wallet_id = ?
+        ORDER BY rowid
+      `,
+      )
+      .all(walletId) as Record<string, unknown>[];
+
+    return Object.fromEntries(
+      rows.flatMap((row) => {
+        if (typeof row.group_id !== "string") {
+          return [];
+        }
+        if (
+          row.status === ReplaceGroupStatus.Accepted ||
+          row.status === ReplaceGroupStatus.Declined
+        ) {
+          return [[row.group_id, row.status]];
+        }
+        return [];
+      }),
+    );
+  } catch {
+    return {};
   }
 }
 
@@ -548,6 +678,42 @@ export function listKeys(email: string, network: Network): StoredKey[] {
 export function removeKey(email: string, network: Network, fingerprint: string): void {
   const db = getDatabase(email, network, { create: false });
   db?.prepare("DELETE FROM keys WHERE fingerprint = ?").run(fingerprint);
+}
+
+// ── MuSig2 nonce storage ─────────────────────────────────────────────
+// Secret nonces must never be uploaded to the shared PSBT. They are stored
+// encrypted locally and deleted immediately after producing a partial sig.
+
+export interface StoredMusigNonce {
+  nonceId: string;
+  walletId: string;
+  txId: string;
+  inputIndex: number;
+  leafHash: string;
+  signerPubkey: string;
+  signerFingerprint: string;
+  msg: string;
+  publicNonce: string;
+  secretNonce: string;
+  createdAt: string;
+}
+
+export function saveMusigNonce(email: string, network: Network, nonce: StoredMusigNonce): void {
+  encryptedWriteById(email, network, "musig_nonces", "nonce_id", nonce.nonceId, nonce, {
+    createdAt: nonce.createdAt,
+  });
+}
+
+export function loadMusigNonce(
+  email: string,
+  network: Network,
+  nonceId: string,
+): StoredMusigNonce | null {
+  return encryptedReadById<StoredMusigNonce>(email, network, "musig_nonces", "nonce_id", nonceId);
+}
+
+export function removeMusigNonce(email: string, network: Network, nonceId: string): void {
+  encryptedRemoveById(email, network, "musig_nonces", "nonce_id", nonceId);
 }
 
 export function _deleteAccountData(email: string): void {

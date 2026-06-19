@@ -596,6 +596,38 @@ If the wallet already exists locally, the command returns without overwriting:
 { "status": "already_exists", "wallet": { ... } }
 ```
 
+### `nunchuk wallet replace create <wallet-id>`
+
+Create a replacement sandbox for an existing finalized wallet. The new sandbox starts with the wallet's current signer set, matching libnunchuk's replacement flow. If the wallet has a platform key, the platform-key signer slot is cleared for replacement and the platform key policy is carried into the sandbox.
+
+```bash
+nunchuk wallet replace create w123
+```
+
+### `nunchuk wallet replace list <wallet-id>`
+
+List replacement sandboxes reported by the server for a wallet. Locally accepted groups are shown as `accepted`; undecided groups are shown as `pending`; locally declined groups are hidden.
+
+```bash
+nunchuk wallet replace list w123
+```
+
+### `nunchuk wallet replace accept <wallet-id> <group-id>`
+
+Accept and join a replacement sandbox. The CLI submits the local wallet signers in the join event so the replacement sandbox can be finalized without re-entering unchanged keys.
+
+```bash
+nunchuk wallet replace accept w123 replacement-group-id
+```
+
+### `nunchuk wallet replace decline <wallet-id> <group-id>`
+
+Decline a replacement sandbox locally.
+
+```bash
+nunchuk wallet replace decline w123 replacement-group-id
+```
+
 ### `nunchuk wallet platform-key get <wallet-id>`
 
 Get current platform key policies for a finalized wallet.
@@ -917,6 +949,33 @@ Fingerprint:   73c5da0a
 Key saved to local storage.
 ```
 
+### `nunchuk key import`
+
+Import an existing BIP39 mnemonic and save it to local encrypted storage. The mnemonic is not printed after import.
+
+| Argument        | Required | Description                                           |
+| --------------- | -------- | ----------------------------------------------------- |
+| `<bip39 words>` | Yes      | BIP39 mnemonic words, quoted or space-separated       |
+
+| Option          | Required | Default     | Description      |
+| --------------- | -------- | ----------- | ---------------- |
+| `--name <name>` | No       | `My key #N` | Name for the key |
+
+```bash
+nunchuk key import --name "Alice Backup" "abandon abandon abandon ... about"
+nunchuk key import abandon abandon abandon ... about
+```
+
+If the imported mnemonic derives to a fingerprint that already exists locally, the command fails with `ALREADY_EXISTS` and leaves the stored key unchanged. Stored imports use the standard empty BIP39 passphrase; passphrase-protected derivation remains available through `nunchuk key info --mnemonic ... --passphrase ...`.
+
+Output:
+
+```
+Key imported to local storage.
+Name:          Alice Backup
+Fingerprint:   73c5da0a
+```
+
 ### `nunchuk key info`
 
 Derive signer info (fingerprint, path, xpub, descriptor) from a stored key, mnemonic, or master xprv. Derivation is done on demand — the stored mnemonic can produce info for any address type.
@@ -945,8 +1004,9 @@ nunchuk key info --mnemonic "abandon abandon abandon ... about"
 # Derive from a mnemonic with passphrase
 nunchuk key info --mnemonic "abandon ..." --passphrase "secret"
 
-# Derive at a custom path
+# Derive at a custom path (h hardened suffixes are accepted)
 nunchuk key info --fingerprint 73c5da0a --path "m/48'/0'/1'/2'"
+nunchuk key info --fingerprint 73c5da0a --path "m/48h/0h/1h/2h"
 ```
 
 Output:
@@ -1063,6 +1123,9 @@ nunchuk network set testnet
 
 # 3. Generate a software signing key
 nunchuk key generate --name "Alice"
+
+# Or import an existing BIP39 mnemonic
+nunchuk key import --name "Alice Backup" <bip39 words>
 
 # 4. Create a 2-of-3 multisig sandbox
 nunchuk sandbox create --name "Team Vault" --m 2 --n 3

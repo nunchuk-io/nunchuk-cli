@@ -1,8 +1,7 @@
 import {
   getAllSigningPaths,
   getScriptNode,
-  timelockFromK,
-  timelockK,
+  sequenceSatisfied,
   type MiniscriptTransactionState,
   type ScriptNode,
   type SigningPath,
@@ -113,20 +112,6 @@ function buildPlan(
     supported,
     unsupportedReason,
   };
-}
-
-function sequenceSatisfied(requiredSequence: number, nSequence: number): boolean {
-  if (requiredSequence === 0) {
-    return true;
-  }
-
-  try {
-    return (
-      nSequence === timelockK(timelockFromK(false, nSequence)) && nSequence >= requiredSequence
-    );
-  } catch {
-    return false;
-  }
 }
 
 export function isMiniscriptPlanSatisfied(

@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { HDKey } from "@scure/bip32";
 import { print, printError, printTable } from "../output.js";
 import { requireEmail, getNetwork } from "../core/config.js";
-import { ADDRESS_TYPES, parseAddressTypeInput, type AddressType } from "../core/address-type.js";
+import { ADDRESS_TYPES, parseAddressTypeInput } from "../core/address-type.js";
 import {
   generateMnemonic24,
   generateMnemonic12,
@@ -11,6 +11,7 @@ import {
   getMasterFingerprint,
   getSignerInfo,
   getXpubAtPath,
+  normalizeDerivationPath,
 } from "../core/keygen.js";
 import { MAINNET_VERSIONS, TESTNET_VERSIONS } from "../core/address.js";
 import { saveKey, listKeys } from "../core/storage.js";
@@ -52,6 +53,50 @@ keyCommand
       console.log("MNEMONIC (back up these words securely!):");
       console.log(`  ${mnemonic}`);
       console.log("");
+      console.log(`Name:          ${name}`);
+      console.log(`Fingerprint:   ${fingerprint}`);
+      console.log("");
+    }
+  });
+
+keyCommand
+  .command("import")
+  .description("Import an existing BIP39 mnemonic and save to local storage")
+  .argument("<words...>", "BIP39 mnemonic words")
+  .option("--name <name>", "Name for the key (default: My key #N)")
+  .action((words: string[], options, cmd) => {
+    const globals = cmd.optsWithGlobals();
+    const network = getNetwork(globals.network);
+    const email = requireEmail(globals.network);
+    const mnemonic = words.join(" ").trim().replace(/\s+/g, " ");
+
+    if (!checkMnemonic(mnemonic)) {
+      printError({ error: "INVALID_MNEMONIC", message: "Invalid BIP39 mnemonic" }, cmd);
+      return;
+    }
+
+    const rootKey = mnemonicToRootKey(mnemonic, network);
+    const fingerprint = getMasterFingerprint(rootKey);
+    const keys = listKeys(email, network);
+
+    if (keys.some((key) => key.fingerprint.toLowerCase() === fingerprint)) {
+      printError({ error: "ALREADY_EXISTS", message: `Key ${fingerprint} already exists` }, cmd);
+      return;
+    }
+
+    const name = options.name || `My key #${keys.length + 1}`;
+    saveKey(email, network, {
+      name,
+      mnemonic,
+      fingerprint,
+      createdAt: new Date().toISOString(),
+    });
+
+    if (globals.json) {
+      print({ status: "imported", name, fingerprint }, cmd);
+    } else {
+      console.log("");
+      console.log("Key imported to local storage.");
       console.log(`Name:          ${name}`);
       console.log(`Fingerprint:   ${fingerprint}`);
       console.log("");
@@ -140,17 +185,27 @@ keyCommand
 
     if (options.path) {
       // Custom path mode
-      const xpub = getXpubAtPath(rootKey, options.path);
-      const normalizedPath = options.path.replace(/^m/, "");
+      const path = normalizeDerivationPath(options.path);
+      let xpub: string;
+      try {
+        xpub = getXpubAtPath(rootKey, path);
+      } catch {
+        printError(
+          { error: "INVALID_PATH", message: `Invalid derivation path: ${options.path}` },
+          cmd,
+        );
+        return;
+      }
+      const normalizedPath = path.replace(/^m/, "");
       const descriptor = `[${fingerprint}${normalizedPath}]${xpub}`;
 
       if (globals.json) {
-        print({ fingerprint, network, path: options.path, xpub, descriptor }, cmd);
+        print({ fingerprint, network, path, xpub, descriptor }, cmd);
       } else {
         console.log("");
         console.log(`Fingerprint:   ${fingerprint}`);
         console.log(`Network:       ${network}`);
-        console.log(`Path:          ${options.path}`);
+        console.log(`Path:          ${path}`);
         console.log(`Xpub:          ${xpub}`);
         console.log(`Descriptor:    ${descriptor}`);
         console.log("");

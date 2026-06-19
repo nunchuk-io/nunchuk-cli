@@ -11,7 +11,10 @@ import {
   getWalletId,
   getWalletIdForParsed,
   descriptorChecksum,
+  getUnspendableXpub,
+  isUnspendableXpub,
   parseSignerDescriptor,
+  TAPROOT_UNSPENDABLE_KEY,
 } from "../descriptor.js";
 
 // Test signers in [xfp/path]xpub format (using ' notation, matching libnunchuk)
@@ -19,12 +22,19 @@ const TEST_SIGNERS = [
   "[534a4a82/48'/1'/0'/2']tpubDFeha94AzbvqSzMLj6iihYeP1zwfW3KgNcmd7oXvKD9dApjWK4KT1RzzbSNUgmsgBs8sshky7pLTUZahkfPTNVck2fwS5wXyn1nTAy8jZCJ",
   "[4bda0966/48'/1'/0'/2']tpubDFTwhyhyq2m2eQGCGQvzgZocFVsQAyjYCAMdGs9ahzTsvd49M3ekAiZvpzyjXF57FpC5zm8NVEPgnptFGSdzM6aZcWVrB6cqVC7fXhXzW6s",
 ];
+const TAPROOT_SORTED_SIGNERS = [TEST_SIGNERS[1], TEST_SIGNERS[0]];
 
 // Pre-computed descriptors from build functions for roundtrip tests
 const EXTERNAL_DESC = buildExternalDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
 const ANY_DESC = buildAnyDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
 const WALLET_DESC = buildWalletDescriptor(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
 const WALLET_ID = getWalletId(TEST_SIGNERS, 2, "NATIVE_SEGWIT");
+const TAPROOT_WALLET_BODY = `tr(${TAPROOT_UNSPENDABLE_KEY},pk(musig(${TAPROOT_SORTED_SIGNERS[0]}/<0;1>/*,${TAPROOT_SORTED_SIGNERS[1]}/<0;1>/*)))`;
+const TAPROOT_WALLET_DESC = `${TAPROOT_WALLET_BODY}#${descriptorChecksum(TAPROOT_WALLET_BODY)}`;
+const TAPROOT_EXTERNAL_BODY = `tr(${TAPROOT_UNSPENDABLE_KEY},pk(musig(${TAPROOT_SORTED_SIGNERS[0]}/0/*,${TAPROOT_SORTED_SIGNERS[1]}/0/*)))`;
+const TAPROOT_EXTERNAL_DESC = `${TAPROOT_EXTERNAL_BODY}#${descriptorChecksum(TAPROOT_EXTERNAL_BODY)}`;
+const TAPROOT_ANY_BODY = `tr(${TAPROOT_UNSPENDABLE_KEY},pk(musig(${TAPROOT_SORTED_SIGNERS[0]}/*,${TAPROOT_SORTED_SIGNERS[1]}/*)))`;
+const TAPROOT_ANY_DESC = `${TAPROOT_ANY_BODY}#${descriptorChecksum(TAPROOT_ANY_BODY)}`;
 const MINISCRIPT_EXTERNAL_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/0/*),pk(${TEST_SIGNERS[1]}/0/*)))`;
 const MINISCRIPT_EXTERNAL_DESC = `${MINISCRIPT_EXTERNAL_BODY}#${descriptorChecksum(MINISCRIPT_EXTERNAL_BODY)}`;
 const MINISCRIPT_ANY_BODY = `wsh(and_v(v:pk(${TEST_SIGNERS[0]}/*),pk(${TEST_SIGNERS[1]}/*)))`;
@@ -71,6 +81,125 @@ describe("parseDescriptor", () => {
     expect(result.addressType).toBe("LEGACY");
     expect(result.m).toBe(2);
     expect(result.signers).toEqual(TEST_SIGNERS);
+  });
+
+  it("builds and parses libnunchuk disable-key-path taproot multisig descriptors", () => {
+    expect(buildWalletDescriptor(TEST_SIGNERS, 2, "TAPROOT")).toBe(TAPROOT_WALLET_DESC);
+    expect(buildExternalDescriptor(TEST_SIGNERS, 2, "TAPROOT")).toBe(TAPROOT_EXTERNAL_DESC);
+    expect(buildAnyDescriptor(TEST_SIGNERS, 2, "TAPROOT")).toBe(TAPROOT_ANY_DESC);
+
+    const result = parseDescriptor(TAPROOT_EXTERNAL_DESC);
+    expect(result.kind).toBe("multisig");
+    expect(result.m).toBe(2);
+    expect(result.n).toBe(2);
+    expect(result.addressType).toBe("TAPROOT");
+    expect(result.signers).toEqual(TAPROOT_SORTED_SIGNERS);
+    expect(result.descriptor).toBe(TAPROOT_WALLET_DESC);
+  });
+
+  it("parses nested libnunchuk taproot musig leaf trees", () => {
+    const signers = [...TEST_SIGNERS, TEST_SIGNERS[0].replace(/^\[[0-9a-f]+/, "[00000002")];
+    const sortedSigners = [signers[2], signers[1], signers[0]];
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT");
+    const body = descriptor.split("#")[0];
+
+    expect(body).toContain("{{pk(musig(");
+    const parsed = parseDescriptor(descriptor);
+    expect(parsed.m).toBe(2);
+    expect(parsed.n).toBe(3);
+    expect(parsed.signers).toEqual(sortedSigners);
+  });
+
+  it("uses sortedmulti_a for libnunchuk's large taproot disable-key-path fallback", () => {
+    const signers = Array.from({ length: 6 }, (_, index) =>
+      TEST_SIGNERS[index % TEST_SIGNERS.length].replace(/^\[[0-9a-f]+/, `[0000000${index}`),
+    );
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT");
+    const body = descriptor.split("#")[0];
+
+    expect(body).toBe(
+      `tr(${TAPROOT_UNSPENDABLE_KEY},sortedmulti_a(2,${signers
+        .map((signer) => `${signer}/<0;1>/*`)
+        .join(",")}))`,
+    );
+
+    const parsed = parseDescriptor(descriptor);
+    expect(parsed.m).toBe(2);
+    expect(parsed.n).toBe(6);
+    expect(parsed.signers).toEqual(signers);
+  });
+
+  it("parses libnunchuk taproot key-path musig multisig descriptors", () => {
+    const external = buildExternalDescriptor(TEST_SIGNERS, 2, "TAPROOT", "DEFAULT");
+    const wallet = buildWalletDescriptor(TEST_SIGNERS, 2, "TAPROOT", "DEFAULT");
+
+    expect(external.split("#")[0]).toBe(`tr(musig(${TEST_SIGNERS[0]}/0/*,${TEST_SIGNERS[1]}/0/*))`);
+
+    const parsed = parseDescriptor(external);
+    expect(parsed.kind).toBe("multisig");
+    expect(parsed.m).toBe(2);
+    expect(parsed.n).toBe(2);
+    expect(parsed.addressType).toBe("TAPROOT");
+    expect(parsed.taprootWalletTemplate).toBe("DEFAULT");
+    expect(parsed.signers).toEqual(TEST_SIGNERS);
+    expect(parsed.descriptor).toBe(wallet);
+  });
+
+  it("parses libnunchuk default taproot musig script trees", () => {
+    const signers = [...TEST_SIGNERS, TEST_SIGNERS[0].replace(/^\[[0-9a-f]+/, "[00000002")];
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const body = descriptor.split("#")[0];
+
+    expect(body).toContain("tr(musig(");
+    expect(body).not.toContain(TAPROOT_UNSPENDABLE_KEY);
+
+    const parsed = parseDescriptor(descriptor);
+    expect(parsed.m).toBe(2);
+    expect(parsed.n).toBe(3);
+    expect(parsed.taprootWalletTemplate).toBe("DEFAULT");
+    expect(parsed.signers).toEqual(signers);
+    expect(parsed.descriptor).toBe(descriptor);
+  });
+
+  it("rejects taproot single-sig descriptors", () => {
+    const body = `tr(${TEST_SIGNERS[0]}/0/*)`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+
+    expect(() => parseDescriptor(descriptor)).toThrow("taproot single-sig descriptors");
+  });
+
+  it("parses libnunchuk taproot miniscript disable-key-path descriptors", () => {
+    const unspendableXpub = getUnspendableXpub(TEST_SIGNERS);
+    const body = `tr(${unspendableXpub}/0/*,and_v(v:pk(${TEST_SIGNERS[0]}/0/*),pk(${TEST_SIGNERS[1]}/0/*)))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+
+    expect(isUnspendableXpub(`${unspendableXpub}/0/*`)).toBe(true);
+
+    const parsed = parseDescriptor(descriptor);
+    expect(parsed.kind).toBe("miniscript");
+    expect(parsed.addressType).toBe("TAPROOT");
+    expect(parsed.m).toBe(0);
+    expect(parsed.n).toBe(2);
+    expect(parsed.taprootWalletTemplate).toBe("DISABLE_KEY_PATH");
+    expect(parsed.signers).toEqual(TEST_SIGNERS);
+    expect(parsed.miniscript).toBe(
+      `and_v(v:pk(${TEST_SIGNERS[0]}/<0;1>/*),pk(${TEST_SIGNERS[1]}/<0;1>/*))`,
+    );
+    expect(buildExternalDescriptorForParsed(parsed)).toBe(descriptor);
+  });
+
+  it("parses libnunchuk taproot miniscript default musig key-path descriptors", () => {
+    const body = `tr(musig(${TEST_SIGNERS[0]},${TEST_SIGNERS[1]})/0/*,pk(${TEST_SIGNERS[1]}/0/*))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+
+    const parsed = parseDescriptor(descriptor);
+    expect(parsed.kind).toBe("miniscript");
+    expect(parsed.addressType).toBe("TAPROOT");
+    expect(parsed.m).toBe(2);
+    expect(parsed.n).toBe(2);
+    expect(parsed.taprootWalletTemplate).toBe("DEFAULT");
+    expect(parsed.signers).toEqual(TEST_SIGNERS);
+    expect(buildExternalDescriptorForParsed(parsed)).toBe(descriptor);
   });
 
   it("normalizes h to ' in derivation paths", () => {

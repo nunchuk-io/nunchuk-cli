@@ -378,11 +378,27 @@ export function createDummyPsbt(
   // Step 2: Derive multisig payments at index 1 (Tx1 output / Tx2 input) and index 2 (Tx2 output)
   const payment1 =
     parsed.kind === "multisig"
-      ? deriveMultisigPayment(wallet.signers, wallet.m, wallet.addressType, network, 0, 1)
+      ? deriveMultisigPayment(
+          parsed.signers,
+          parsed.m,
+          parsed.addressType,
+          network,
+          0,
+          1,
+          parsed.taprootWalletTemplate,
+        )
       : deriveDescriptorPayment(wallet.descriptor, network, 0, 1);
   const payment2 =
     parsed.kind === "multisig"
-      ? deriveMultisigPayment(wallet.signers, wallet.m, wallet.addressType, network, 0, 2)
+      ? deriveMultisigPayment(
+          parsed.signers,
+          parsed.m,
+          parsed.addressType,
+          network,
+          0,
+          2,
+          parsed.taprootWalletTemplate,
+        )
       : deriveDescriptorPayment(wallet.descriptor, network, 0, 2);
 
   // Step 3: Build Tx1 (fake previous transaction) to compute its txid
@@ -403,11 +419,15 @@ export function createDummyPsbt(
     txid: prevTxId,
     index: 0,
     witnessUtxo: { script: payment1.script, amount: 10150n },
-    bip32Derivation: payment1.bip32Derivation,
     sequence,
   };
+  if (payment1.bip32Derivation.length > 0) input.bip32Derivation = payment1.bip32Derivation;
   if (payment1.witnessScript) input.witnessScript = payment1.witnessScript;
   if (payment1.redeemScript) input.redeemScript = payment1.redeemScript;
+  if (payment1.tapInternalKey) input.tapInternalKey = payment1.tapInternalKey;
+  if (payment1.tapMerkleRoot) input.tapMerkleRoot = payment1.tapMerkleRoot;
+  if (payment1.tapLeafScript) input.tapLeafScript = payment1.tapLeafScript;
+  if (payment1.tapBip32Derivation) input.tapBip32Derivation = payment1.tapBip32Derivation;
   dummyTx.addInput(input);
 
   // Output: 10000 sats to address at index 2
@@ -423,26 +443,44 @@ export function extractPartialSignature(tx: Transaction, xfp: number): string {
   for (let i = 0; i < tx.inputsLength; i++) {
     const inp = tx.getInput(i);
     const partialSig = inp.partialSig as Array<[Uint8Array, Uint8Array]> | undefined;
-
-    if (!partialSig) continue;
-
     const bip32Derivation = inp.bip32Derivation as
       | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
       | undefined;
 
-    if (!bip32Derivation) continue;
+    if (partialSig && bip32Derivation) {
+      // Find pubkeys belonging to this signer
+      const signerPubkeys = new Set<string>();
+      for (const [pubkey, { fingerprint }] of bip32Derivation) {
+        if (fingerprint === xfp) {
+          signerPubkeys.add(Buffer.from(pubkey).toString("hex"));
+        }
+      }
 
-    // Find pubkeys belonging to this signer
-    const signerPubkeys = new Set<string>();
-    for (const [pubkey, { fingerprint }] of bip32Derivation) {
-      if (fingerprint === xfp) {
-        signerPubkeys.add(Buffer.from(pubkey).toString("hex"));
+      // Match partial signature against signer pubkeys
+      for (const [pubkey, sig] of partialSig) {
+        if (signerPubkeys.has(Buffer.from(pubkey).toString("hex"))) {
+          return Buffer.from(sig).toString("hex");
+        }
       }
     }
 
-    // Match partial signature against signer pubkeys
-    for (const [pubkey, sig] of partialSig) {
-      if (signerPubkeys.has(Buffer.from(pubkey).toString("hex"))) {
+    const tapScriptSig = inp.tapScriptSig as
+      | Array<[{ pubKey: Uint8Array; leafHash: Uint8Array }, Uint8Array]>
+      | undefined;
+    const tapBip32Derivation = inp.tapBip32Derivation as
+      | Array<[Uint8Array, { hashes: Uint8Array[]; der: { fingerprint: number; path: number[] } }]>
+      | undefined;
+    if (!tapScriptSig || !tapBip32Derivation) continue;
+
+    const signerTaprootPubkeys = new Set<string>();
+    for (const [pubkey, { der }] of tapBip32Derivation) {
+      if (der.fingerprint === xfp) {
+        signerTaprootPubkeys.add(Buffer.from(pubkey).toString("hex"));
+      }
+    }
+
+    for (const [{ pubKey }, sig] of tapScriptSig) {
+      if (signerTaprootPubkeys.has(Buffer.from(pubKey).toString("hex"))) {
         return Buffer.from(sig).toString("hex");
       }
     }

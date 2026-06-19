@@ -43,6 +43,9 @@ nunchuk network tip
 # Generate a software signing key
 nunchuk key generate --name "Alice"
 
+# Import an existing BIP39 mnemonic
+nunchuk key import --name "Alice Backup" <bip39 words>
+
 # Derive signer info for a stored key
 nunchuk key info --fingerprint <xfp>
 
@@ -193,6 +196,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | Command        | Description                                             |
 | -------------- | ------------------------------------------------------- |
 | `key generate` | Generate a new BIP39 mnemonic and save locally          |
+| `key import`   | Import an existing BIP39 mnemonic and save locally      |
 | `key info`     | Derive signer info from a stored key, mnemonic, or xprv |
 | `key list`     | List locally stored keys                                |
 
@@ -232,6 +236,10 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | `wallet delete <id>`              | Delete a wallet                                        |
 | `wallet rename <id>`              | Rename a wallet locally                                |
 | `wallet recover`                  | Recover a wallet from a descriptor or BSMS backup file |
+| `wallet replace create <id>`      | Create a replacement sandbox for a wallet              |
+| `wallet replace list <id>`        | List replacement sandboxes for a wallet                |
+| `wallet replace accept <id> <gid>`  | Accept and join a replacement sandbox                  |
+| `wallet replace decline <id> <gid>` | Decline a replacement sandbox locally                  |
 | `wallet platform-key get <id>`    | Get platform key policies for a wallet                 |
 | `wallet platform-key update <id>` | Request a platform key policy update                   |
 | `wallet dummy-tx list <id>`       | List pending dummy transactions                        |

@@ -11,6 +11,7 @@ import {
   getScriptNode,
   getTimelockedCoins,
   isNodeSatisfiable,
+  isValidMusigTemplate,
   isValidMiniscriptTemplate,
   isValidPolicy,
   isValidTapscriptTemplate,
@@ -201,6 +202,16 @@ describe("tapscript helpers", () => {
       subscripts: ["pk(key_1_0)", "pk(key_2_1)", "pk(musig(key_3,key_4))"],
       depths: [1, 2, 2],
     });
+  });
+
+  it("matches libnunchuk taproot musig parsing edge cases", () => {
+    expect(parseTapscriptTemplate("tr(musig(key_0_0,key_1_0))")).toEqual({
+      keypath: ["key_0_0", "key_1_0"],
+      subscripts: [],
+      depths: [],
+    });
+    expect(isValidMusigTemplate("pk(musig(key_0_0))")).toBe(true);
+    expect(isValidMusigTemplate("pk(musig())")).toBe(false);
   });
 
   it("validates tapscript templates and duplicate keys", () => {

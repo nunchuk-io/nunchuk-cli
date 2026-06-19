@@ -1,6 +1,11 @@
 import { hex } from "@scure/base";
 import { Transaction } from "@scure/btc-signer";
-import { deriveDescriptorMiniscriptKeys } from "./address.js";
+import { tapLeafHash } from "@scure/btc-signer/payment.js";
+import { TaprootControlBlock } from "@scure/btc-signer/psbt.js";
+import {
+  compileDescriptorTaprootMiniscriptLeafScripts,
+  deriveDescriptorMiniscriptKeys,
+} from "./address.js";
 import type { Network } from "./config.js";
 import { parseDescriptor } from "./descriptor.js";
 import {
@@ -8,12 +13,13 @@ import {
   miniscriptPreimageRequirementKey,
 } from "./miniscript-preimage.js";
 import {
+  isValidMusigTemplate,
   parseMiniscript,
-  timelockFromK,
-  timelockK,
+  sequenceSatisfied,
   type MiniscriptFragment,
   type MiniscriptTransactionState,
 } from "./miniscript.js";
+import { toXOnlyPubkey } from "./taproot.js";
 
 interface WitnessStackResult {
   hasSignature: boolean;
@@ -125,20 +131,6 @@ function chooseWitnessStacks(
     (selected, option) => chooseWitnessStack(selected, option),
     null,
   );
-}
-
-function sequenceSatisfied(requiredSequence: number, nSequence: number): boolean {
-  if (requiredSequence === 0) {
-    return true;
-  }
-
-  try {
-    return (
-      nSequence === timelockK(timelockFromK(false, nSequence)) && nSequence >= requiredSequence
-    );
-  } catch {
-    return false;
-  }
 }
 
 function zeroStack(count: number): WitnessStackResult {
@@ -425,6 +417,149 @@ function getInputChainAndIndex(input: ReturnType<Transaction["getInput"]>): {
   };
 }
 
+function getTaprootInputChainAndIndex(input: ReturnType<Transaction["getInput"]>): {
+  chain: 0 | 1;
+  index: number;
+} {
+  const bip32 = input.bip32Derivation as
+    | Array<[Uint8Array, { fingerprint: number; path: number[] }]>
+    | undefined;
+  const tapBip32 = input.tapBip32Derivation as
+    | Array<[Uint8Array, { hashes: Uint8Array[]; der: { fingerprint: number; path: number[] } }]>
+    | undefined;
+  const path = bip32?.[0]?.[1].path ?? tapBip32?.[0]?.[1].der.path;
+  if (!path || path.length < 2) {
+    return { chain: 0, index: 0 };
+  }
+  return {
+    chain: path[path.length - 2] === 1 ? 1 : 0,
+    index: path[path.length - 1],
+  };
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  return hex.encode(a) === hex.encode(b);
+}
+
+function taprootLeafScripts(input: ReturnType<Transaction["getInput"]>): Array<{
+  controlBlock: unknown;
+  leafHash: Uint8Array;
+  script: Uint8Array;
+  version: number;
+}> {
+  const tapLeafScript = input.tapLeafScript as Array<[unknown, Uint8Array]> | undefined;
+  return (tapLeafScript ?? []).map(([controlBlock, scriptWithVersion]) => {
+    const script = scriptWithVersion.subarray(0, -1);
+    const version = scriptWithVersion[scriptWithVersion.length - 1];
+    return {
+      controlBlock,
+      leafHash: tapLeafHash(script, version),
+      script,
+      version,
+    };
+  });
+}
+
+function finalizeTaprootMiniscriptInput(
+  tx: Transaction,
+  inputIndex: number,
+  descriptor: string,
+  network: Network,
+  txState: MiniscriptTransactionState,
+  keyPathRequiredSignatures: number,
+): { requiredPreimages: number; requiredSignatures: number } {
+  const input = tx.getInput(inputIndex);
+  if (input.finalScriptWitness?.length) {
+    return { requiredPreimages: 0, requiredSignatures: 0 };
+  }
+  if (input.tapKeySig) {
+    setFinalWitness(tx, inputIndex, [input.tapKeySig]);
+    return { requiredPreimages: 0, requiredSignatures: keyPathRequiredSignatures };
+  }
+
+  const leaves = taprootLeafScripts(input);
+  const tapScriptSig = input.tapScriptSig as
+    | Array<[{ pubKey: Uint8Array; leafHash: Uint8Array }, Uint8Array]>
+    | undefined;
+  if (leaves.length === 0 || !tapScriptSig?.length) {
+    throw new Error("Not enough signatures or hash preimages to finalize miniscript PSBT");
+  }
+
+  const { chain, index } = getTaprootInputChainAndIndex(input);
+  const descriptorLeaves = compileDescriptorTaprootMiniscriptLeafScripts(
+    descriptor,
+    network,
+    chain,
+    index,
+  );
+  const keyInfos = deriveDescriptorMiniscriptKeys(descriptor, network, chain, index);
+  const pubkeys = new Map<string, Uint8Array>();
+  for (const info of keyInfos) {
+    pubkeys.set(info.keyExpression, info.pubkey);
+  }
+  const preimages = getInputMiniscriptPreimages(input);
+
+  for (const leaf of leaves) {
+    const matchingDescriptorLeaves = descriptorLeaves.filter((descriptorLeaf) =>
+      bytesEqual(descriptorLeaf.script, leaf.script),
+    );
+    for (const descriptorLeaf of matchingDescriptorLeaves) {
+      if (isValidMusigTemplate(descriptorLeaf.leaf)) {
+        continue;
+      }
+
+      const signatureByXOnlyPubkey = new Map<string, Uint8Array>();
+      for (const [{ pubKey, leafHash }, signature] of tapScriptSig) {
+        if (bytesEqual(leafHash, leaf.leafHash)) {
+          signatureByXOnlyPubkey.set(hex.encode(pubKey), signature);
+        }
+      }
+      if (signatureByXOnlyPubkey.size === 0) {
+        continue;
+      }
+
+      const signatures = new Map<string, Uint8Array>();
+      for (const info of keyInfos) {
+        const signature = signatureByXOnlyPubkey.get(hex.encode(toXOnlyPubkey(info.pubkey)));
+        if (signature) {
+          signatures.set(info.keyExpression, signature);
+        }
+      }
+
+      const fragment = parseMiniscript(descriptorLeaf.leaf, "TAPROOT");
+      const result = produceInput(fragment, { preimages, pubkeys, signatures, txState }).sat;
+      if (!result || result.malleable || !result.hasSignature) {
+        continue;
+      }
+
+      setFinalWitness(tx, inputIndex, [
+        ...result.stack,
+        leaf.script,
+        TaprootControlBlock.encode(leaf.controlBlock as never),
+      ]);
+      return {
+        requiredPreimages: result.preimagesUsed.length,
+        requiredSignatures: result.signaturesUsed.length,
+      };
+    }
+  }
+
+  try {
+    tx.finalizeIdx(inputIndex);
+    return {
+      requiredPreimages: 0,
+      requiredSignatures:
+        (
+          input.tapScriptSig as
+            | Array<[{ pubKey: Uint8Array; leafHash: Uint8Array }, Uint8Array]>
+            | undefined
+        )?.length ?? 0,
+    };
+  } catch {
+    throw new Error("Not enough signatures or hash preimages to finalize miniscript PSBT");
+  }
+}
+
 function setFinalWitness(
   tx: Transaction,
   inputIndex: number,
@@ -457,6 +592,24 @@ export function finalizeMiniscriptPsbt(
   const addressType = parsed.addressType;
   if (addressType !== "NATIVE_SEGWIT" && addressType !== "TAPROOT") {
     throw new Error("Only native segwit and taproot miniscript descriptors are supported");
+  }
+  if (addressType === "TAPROOT") {
+    const txState = getTransactionState(tx);
+    let requiredPreimages = 0;
+    let requiredSignatures = 0;
+    for (let inputIndex = 0; inputIndex < tx.inputsLength; inputIndex++) {
+      const result = finalizeTaprootMiniscriptInput(
+        tx,
+        inputIndex,
+        descriptor,
+        network,
+        txState,
+        Math.max(parsed.m, 1),
+      );
+      requiredPreimages += result.requiredPreimages;
+      requiredSignatures += result.requiredSignatures;
+    }
+    return { requiredPreimages, requiredSignatures };
   }
   const fragment = parseMiniscript(parsed.miniscript, addressType);
   const txState = getTransactionState(tx);

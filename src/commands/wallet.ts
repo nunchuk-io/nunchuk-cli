@@ -1,11 +1,28 @@
 import fs from "node:fs";
 import { Command, InvalidArgumentError } from "commander";
-import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
+import {
+  requireApiKey,
+  requireEmail,
+  getNetwork,
+  getElectrumServer,
+  getEphemeralKeypair,
+  loadConfig,
+} from "../core/config.js";
 import type { Network } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
-import { listWallets, loadWallet, removeWallet, saveWallet } from "../core/storage.js";
+import {
+  addSandboxId,
+  getReplaceGroupStatuses,
+  getSandboxIds,
+  listWallets,
+  loadWallet,
+  ReplaceGroupStatus,
+  removeWallet,
+  saveWallet,
+  setReplaceGroupStatus,
+} from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
-import { print, printError, printTable, printWalletResult } from "../output.js";
+import { print, printError, printTable, printSandboxResult, printWalletResult } from "../output.js";
 import {
   buildWalletDescriptorForParsed,
   buildExternalDescriptorForParsed,
@@ -39,9 +56,27 @@ import {
   createDummyPsbt,
   extractPartialSignature,
   formatPoliciesText,
+  fetchBackendPubkey,
 } from "../core/platform-key.js";
+import { buildCreateReplaceGroupBody, buildJoinGroupEvent } from "../core/sandbox.js";
+import {
+  getReplacementAcceptSigners,
+  getReplacementGroupDetails,
+} from "../core/wallet-replacement.js";
+import { isRecord } from "../core/utils.js";
 
 export const walletCommand = new Command("wallet").description("Manage finalized group wallets");
+
+function requireEphemeralKeys(flagNetwork?: string): { pub: string; priv: string } {
+  const config = loadConfig();
+  const network = getNetwork(flagNetwork);
+  const keys = getEphemeralKeypair(config, network);
+  if (!keys?.pub || !keys?.priv) {
+    console.error('Error: No ephemeral keys. Run "nunchuk auth login" first.');
+    process.exit(1);
+  }
+  return { pub: keys.pub, priv: keys.priv };
+}
 
 function parseSigningDelayOption(value: string): number {
   try {
@@ -71,6 +106,33 @@ function toWalletView(wallet: WalletData) {
   const { gid: _gid, secretboxKey: _secretboxKey, descriptor: _descriptor, ...walletView } = wallet;
 
   return { ...walletView, typeLabel: getWalletTypeLabel(wallet) };
+}
+
+function getGroupIdFromResult(result: unknown): string | null {
+  if (!isRecord(result) || !isRecord(result.group)) {
+    return null;
+  }
+  return typeof result.group.id === "string" ? result.group.id : null;
+}
+
+function parseReplaceStatusGroups(data: unknown): string[] {
+  const walletData = isRecord(data) && isRecord(data.wallet) ? data.wallet : data;
+  if (!isRecord(walletData)) {
+    return [];
+  }
+
+  const statuses = walletData.replace_statuses ?? walletData.replaceStatuses;
+  if (!Array.isArray(statuses)) {
+    return [];
+  }
+
+  return statuses.flatMap((item) => {
+    if (!isRecord(item)) {
+      return [];
+    }
+    const groupId = item.group_id ?? item.groupId;
+    return typeof groupId === "string" ? [groupId] : [];
+  });
 }
 
 walletCommand
@@ -436,6 +498,131 @@ walletCommand
         },
         cmd,
       );
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+// -- Wallet replacement subcommands --
+
+const replaceCommand = walletCommand
+  .command("replace")
+  .description("Manage wallet replacement sandboxes");
+
+replaceCommand
+  .command("create")
+  .description("Create a replacement sandbox for a finalized wallet")
+  .argument("<wallet-id>", "Wallet ID")
+  .action(async (walletId, _options, cmd) => {
+    try {
+      const { apiKey, network, email } = getGlobals(cmd);
+      const globals = cmd.optsWithGlobals();
+      const { pub, priv } = requireEphemeralKeys(globals.network);
+      const wallet = requireWallet(email, network, walletId);
+      const client = new ApiClient(apiKey, network);
+      const platformKeyConfig = await getWalletPlatformKeyConfig(client, wallet);
+      const replacement = getReplacementGroupDetails(wallet, platformKeyConfig);
+      const backendPubkey = platformKeyConfig.platformKey ? await fetchBackendPubkey(client) : null;
+
+      const body = buildCreateReplaceGroupBody({
+        ...replacement,
+        ephemeralPub: pub,
+        ephemeralPriv: priv,
+        platformKey: platformKeyConfig.platformKey ?? null,
+        backendPubkey,
+      });
+
+      const result = await client.post(`/v1.1/shared-wallets/wallets/${wallet.gid}/replace`, body);
+      const groupId = getGroupIdFromResult(result);
+      if (groupId) {
+        addSandboxId(email, network, groupId);
+        setReplaceGroupStatus(email, network, wallet.walletId, groupId, true);
+      }
+
+      printSandboxResult(result, cmd);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+replaceCommand
+  .command("list")
+  .description("List replacement sandboxes for a wallet")
+  .argument("<wallet-id>", "Wallet ID")
+  .action(async (walletId, _options, cmd) => {
+    try {
+      const { apiKey, network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, walletId);
+      const client = new ApiClient(apiKey, network);
+      const walletData = await client.get(`/v1.1/shared-wallets/wallets/${wallet.gid}`);
+      const localStatuses = getReplaceGroupStatuses(email, network, wallet.walletId);
+      const localSandboxIds = new Set(getSandboxIds(email, network));
+
+      const rows = parseReplaceStatusGroups(walletData).flatMap((groupId) => {
+        if (localStatuses[groupId] === ReplaceGroupStatus.Declined) {
+          return [];
+        }
+        const accepted =
+          localStatuses[groupId] === ReplaceGroupStatus.Accepted || localSandboxIds.has(groupId);
+        return [{ groupId, status: accepted ? "accepted" : "pending" }];
+      });
+
+      if (rows.length === 0) {
+        print({ message: "No replacement sandboxes found" }, cmd);
+        return;
+      }
+
+      if (cmd.optsWithGlobals().json) {
+        print(rows, cmd);
+      } else {
+        printTable(rows);
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+replaceCommand
+  .command("accept")
+  .description("Accept and join a wallet replacement sandbox")
+  .argument("<wallet-id>", "Wallet ID")
+  .argument("<group-id>", "Replacement sandbox ID")
+  .action(async (walletId, groupId, _options, cmd) => {
+    try {
+      const { apiKey, network, email } = getGlobals(cmd);
+      const globals = cmd.optsWithGlobals();
+      const { pub, priv } = requireEphemeralKeys(globals.network);
+      const wallet = requireWallet(email, network, walletId);
+      const client = new ApiClient(apiKey, network);
+      const platformKeyConfig = await getWalletPlatformKeyConfig(client, wallet);
+      const signers = getReplacementAcceptSigners(wallet, platformKeyConfig);
+
+      const groupData = await client.get<{ group: Record<string, unknown> }>(
+        `/v1.1/shared-wallets/groups/${groupId}`,
+      );
+      const body = buildJoinGroupEvent(groupId, groupData.group, pub, signers, priv);
+      await client.post("/v1.1/shared-wallets/groups/join", body);
+
+      addSandboxId(email, network, groupId);
+      setReplaceGroupStatus(email, network, wallet.walletId, groupId, true);
+      const result = await client.get(`/v1.1/shared-wallets/groups/${groupId}`);
+      printSandboxResult(result, cmd);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+replaceCommand
+  .command("decline")
+  .description("Decline a wallet replacement sandbox locally")
+  .argument("<wallet-id>", "Wallet ID")
+  .argument("<group-id>", "Replacement sandbox ID")
+  .action((walletId, groupId, _options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, walletId);
+      setReplaceGroupStatus(email, network, wallet.walletId, groupId, false);
+      print({ status: "declined", walletId: wallet.walletId, groupId }, cmd);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }

@@ -8,10 +8,11 @@ import {
   getMasterFingerprint,
   getXpubAtPath,
   getXprvAtPath,
+  normalizeDerivationPath,
   getBip32Path,
   getSignerInfo,
 } from "../keygen.js";
-import { MAINNET_VERSIONS, TESTNET_VERSIONS } from "../address.js";
+import { TESTNET_VERSIONS } from "../address.js";
 
 // BIP39 test vector from https://github.com/trezor/python-mnemonic/blob/master/vectors.json
 // Vector #0: entropy 00000000000000000000000000000000
@@ -120,6 +121,17 @@ describe("getMasterFingerprint", () => {
 
 // ─── getXpubAtPath ─────────────────────────────────────────────────
 
+describe("normalizeDerivationPath", () => {
+  it("normalizes h hardened suffixes to apostrophes", () => {
+    expect(normalizeDerivationPath("m/48h/0h/0h/2h")).toBe("m/48'/0'/0'/2'");
+  });
+
+  it("adds the root prefix when omitted", () => {
+    expect(normalizeDerivationPath("48h/0h")).toBe("m/48'/0'");
+    expect(normalizeDerivationPath("/48h/0h")).toBe("m/48'/0'");
+  });
+});
+
 describe("getXpubAtPath", () => {
   it("derives xpub for mainnet root key", () => {
     const rootKey = mnemonicToRootKey(TEST_MNEMONIC_12, "mainnet");
@@ -138,6 +150,13 @@ describe("getXpubAtPath", () => {
     const a = getXpubAtPath(rootKey, "m/84'/0'/0'");
     const b = getXpubAtPath(rootKey, "m/84'/0'/0'");
     expect(a).toBe(b);
+  });
+
+  it("accepts h hardened suffixes", () => {
+    const rootKey = mnemonicToRootKey(TEST_MNEMONIC_12, "mainnet");
+    const apostrophe = getXpubAtPath(rootKey, "m/48'/0'/0'/2'");
+    const h = getXpubAtPath(rootKey, "m/48h/0h/0h/2h");
+    expect(h).toBe(apostrophe);
   });
 
   it("returns different xpub for different paths", () => {
@@ -167,6 +186,11 @@ describe("getXprvAtPath", () => {
     const mainRoot = mnemonicToRootKey(TEST_MNEMONIC_12, "mainnet");
     expect(getXprvAtPath(testRoot, "m/84'/1'/0'")).toMatch(/^tprv/);
     expect(getXprvAtPath(mainRoot, "m/84'/0'/0'")).toMatch(/^xprv/);
+  });
+
+  it("accepts h hardened suffixes", () => {
+    const rootKey = mnemonicToRootKey(TEST_MNEMONIC_12, "testnet");
+    expect(getXprvAtPath(rootKey, "m/84h/1h/0h")).toBe(getXprvAtPath(rootKey, "m/84'/1'/0'"));
   });
 });
 

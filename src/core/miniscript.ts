@@ -1,5 +1,6 @@
 import { descriptorChecksum } from "./descriptor.js";
 import type { AddressType } from "./address-type.js";
+import { combinationIndices } from "./utils.js";
 
 const LOCKTIME_THRESHOLD = 500000000;
 const MAX_PUBKEYS_PER_MULTISIG = 20;
@@ -895,7 +896,7 @@ function getAllPaths(node: ScriptNode): SigningPath[] {
   }
 
   const required = node.type === "THRESH" ? node.k : 2;
-  const combinations = chooseIndices(node.subs.length, required);
+  const combinations = combinationIndices(node.subs.length, required);
   for (const selected of combinations) {
     let partials: SigningPath[] = [[]];
     for (const index of selected) {
@@ -911,26 +912,6 @@ function getAllPaths(node: ScriptNode): SigningPath[] {
     paths.push(...partials);
   }
   return paths;
-}
-
-function chooseIndices(length: number, count: number): number[][] {
-  const result: number[][] = [];
-  const current: number[] = [];
-
-  function visit(start: number): void {
-    if (current.length === count) {
-      result.push([...current]);
-      return;
-    }
-    for (let i = start; i < length; i++) {
-      current.push(i);
-      visit(i + 1);
-      current.pop();
-    }
-  }
-
-  visit(0);
-  return result;
 }
 
 function typeBits(flags: string): number {
@@ -2234,8 +2215,9 @@ function parseMusigInner(expression: string): { keys: string[]; suffix: string }
   }
   const innerStart = "pk(musig(".length;
   const closingIndex = findMusigClosingIndex(working, "pk(musig(");
-  const keys = splitTopLevel(working.slice(innerStart, closingIndex), ",");
-  if (keys.length < 2) {
+  const inner = working.slice(innerStart, closingIndex);
+  const keys = splitTopLevel(inner, ",");
+  if (keys.length === 0 || keys.join(",") !== inner) {
     invalid("Invalid musig template");
   }
   return { keys, suffix: working.slice(closingIndex + 1, -1) };
@@ -3366,6 +3348,20 @@ export function timelockK(lock: Timelock): number {
   return 0;
 }
 
+export function sequenceSatisfied(requiredSequence: number, nSequence: number): boolean {
+  if (requiredSequence === 0) {
+    return true;
+  }
+
+  try {
+    return (
+      nSequence === timelockK(timelockFromK(false, nSequence)) && nSequence >= requiredSequence
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function timelockToMiniscript(lock: Timelock): string {
   return lock.type === "LOCKTYPE_ABSOLUTE"
     ? `after(${timelockK(lock)})`
@@ -3577,6 +3573,10 @@ export function isValidMusigTemplate(expression: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function parseMusigTemplateKeys(expression: string): string[] {
+  return parseMusigInner(expression).keys;
 }
 
 export function getMusigScript(

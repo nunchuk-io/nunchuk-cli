@@ -6,6 +6,7 @@ import {
   getEphemeralKeypair,
   getNetwork,
   loadConfig,
+  type Network,
 } from "../core/config.js";
 import { ApiClient } from "../core/api-client.js";
 import { ADDRESS_TYPES, numberToAddressType, type AddressType } from "../core/address-type.js";
@@ -29,7 +30,10 @@ import {
   removeSandboxId,
   getSandboxIds,
   saveWallet,
+  listWallets,
   loadKey,
+  getReplaceGroupStatuses,
+  ReplaceGroupStatus,
   type WalletData,
 } from "../core/storage.js";
 import { print, printError, printSandboxResult } from "../output.js";
@@ -48,6 +52,7 @@ import {
   type PlatformKeyPolicies,
   type PolicyFlagOptions,
 } from "../core/platform-key.js";
+import { getDeprecatedWalletName, getGroupReplaceWalletId } from "../core/wallet-replacement.js";
 import { readFileSync } from "node:fs";
 
 function requireEphemeralKeys(flagNetwork?: string): { pub: string; priv: string } {
@@ -117,6 +122,125 @@ function parseSlotListOption(value: string, previous: string[]): string[] {
   return [...previous, ...next];
 }
 
+function parseValueKeysetOption(value: string): string[] {
+  const parts = value.split(",").map((slot) => slot.trim());
+  if (parts.length === 0 || parts.some((part) => part.length === 0)) {
+    throw new InvalidArgumentError(
+      "Value key set must be comma-separated signer slot indexes or fingerprints",
+    );
+  }
+
+  return parts.map((part) => {
+    if (!/^\d+$/.test(part) && !/^[0-9a-fA-F]{8}$/.test(part)) {
+      throw new InvalidArgumentError(
+        "Value key set entries must be non-negative slot indexes or 8-hex fingerprints",
+      );
+    }
+    return part.toLowerCase();
+  });
+}
+
+function signerFingerprint(signer: string): string | null {
+  if (!isSignerDescriptor(signer)) {
+    return null;
+  }
+  return parseSignerDescriptor(signer).masterFingerprint.toLowerCase();
+}
+
+function resolveValueKeysetOption(
+  entries: readonly string[],
+  signers: readonly string[],
+): number[] {
+  const fingerprintSlots = new Map<string, number>();
+  const duplicateFingerprints = new Set<string>();
+  signers.forEach((signer, index) => {
+    const fingerprint = signerFingerprint(signer);
+    if (!fingerprint) {
+      return;
+    }
+    if (fingerprintSlots.has(fingerprint)) {
+      duplicateFingerprints.add(fingerprint);
+      return;
+    }
+    fingerprintSlots.set(fingerprint, index);
+  });
+
+  const indexes: number[] = [];
+  for (const entry of entries) {
+    let index: number | undefined;
+    if (/^[0-9a-f]{8}$/.test(entry)) {
+      if (duplicateFingerprints.has(entry)) {
+        throw new Error(`Value key set fingerprint ${entry} matches multiple signer slots`);
+      }
+      index = fingerprintSlots.get(entry);
+    }
+
+    if (index === undefined) {
+      if (!/^\d+$/.test(entry)) {
+        throw new Error(`Unknown signer fingerprint in value key set: ${entry}`);
+      }
+      index = Number(entry);
+      if (!Number.isSafeInteger(index)) {
+        throw new Error("Value key set index is too large");
+      }
+    }
+
+    if (index < 0 || index >= signers.length) {
+      throw new Error(`Value key set slot ${index} is out of range`);
+    }
+    indexes.push(index);
+  }
+
+  return indexes;
+}
+
+function isDifferentWallet(candidate: WalletData, finalized: WalletData): boolean {
+  return candidate.walletId !== finalized.walletId && candidate.gid !== finalized.gid;
+}
+
+function findReplacedWalletById(
+  wallets: WalletData[],
+  replaceWalletId: unknown,
+  finalized: WalletData,
+): WalletData | undefined {
+  if (typeof replaceWalletId !== "string" || replaceWalletId.length === 0) {
+    return undefined;
+  }
+
+  return wallets.find(
+    (wallet) =>
+      isDifferentWallet(wallet, finalized) &&
+      (wallet.walletId === replaceWalletId || wallet.gid === replaceWalletId),
+  );
+}
+
+function deprecateReplacedWallet(
+  email: string,
+  network: Network,
+  sandboxId: string,
+  group: Record<string, unknown>,
+  finalized: WalletData,
+): void {
+  const wallets = listWallets(email, network);
+  const replacedWallet =
+    findReplacedWalletById(wallets, getGroupReplaceWalletId(group), finalized) ??
+    wallets.find(
+      (wallet) =>
+        isDifferentWallet(wallet, finalized) &&
+        getReplaceGroupStatuses(email, network, wallet.walletId)[sandboxId] ===
+          ReplaceGroupStatus.Accepted,
+    );
+
+  if (!replacedWallet) {
+    return;
+  }
+
+  const name = getDeprecatedWalletName(replacedWallet.name);
+  if (name !== replacedWallet.name) {
+    saveWallet(email, network, { ...replacedWallet, name });
+  }
+}
+
 async function resolveSandboxId(client: ApiClient, input: string): Promise<string> {
   if (!looksLikeJoinUrl(input)) {
     return input;
@@ -175,17 +299,20 @@ sandboxCommand
         );
         return;
       }
-      if (miniscriptTemplate.length > 0 && options.addressType !== "NATIVE_SEGWIT") {
+      if (
+        miniscriptTemplate.length > 0 &&
+        options.addressType !== "NATIVE_SEGWIT" &&
+        options.addressType !== "TAPROOT"
+      ) {
         printError(
           {
             error: "INVALID_PARAM",
-            message: "Miniscript sandboxes currently support NATIVE_SEGWIT only",
+            message: "Miniscript sandboxes support NATIVE_SEGWIT or TAPROOT only",
           },
           cmd,
         );
         return;
       }
-
       if (miniscriptTemplate.length === 0 && options.m > options.n) {
         printError({ error: "INVALID_PARAM", message: "m must be <= n" }, cmd);
         return;
@@ -505,8 +632,15 @@ sandboxCommand
   .command("finalize")
   .description("Finalize sandbox into an active wallet")
   .argument("<sandbox-id>", "Sandbox ID")
+  .option(
+    "--value-key-set <indexes>",
+    "Taproot multisig value key set signer slot indexes or fingerprints, comma-separated",
+    parseValueKeysetOption,
+  )
   .action(async (sandboxId, _options, cmd) => {
     try {
+      const options = _options as { valueKeySet?: string[] };
+      const valueKeysetEntries = options.valueKeySet ?? [];
       const globals = cmd.optsWithGlobals();
       const { pub, priv } = requireEphemeralKeys(globals.network);
       const apiKey = requireApiKey(globals.apiKey, globals.network);
@@ -520,11 +654,32 @@ sandboxCommand
       );
 
       const alreadyFinalized = isGroupFinalized(groupData.group);
+      if (alreadyFinalized && valueKeysetEntries.length > 0) {
+        printError(
+          {
+            error: "INVALID_PARAM",
+            message: "--value-key-set is only valid when finalizing a pending sandbox",
+          },
+          cmd,
+        );
+        return;
+      }
+
+      let valueKeyset: number[] = [];
+      if (!alreadyFinalized && valueKeysetEntries.length > 0) {
+        try {
+          const display = getGroupDisplayState(groupData.group, pub, priv);
+          valueKeyset = resolveValueKeysetOption(valueKeysetEntries, display.signers);
+        } catch (err) {
+          printError({ error: "INVALID_PARAM", message: (err as Error).message }, cmd);
+          return;
+        }
+      }
 
       // 2-7. Build descriptor, derive keys, build finalize event or recover finalized wallet
       const result = alreadyFinalized
         ? await recoverFinalizedGroup(groupData.group, pub, priv, network)
-        : await buildFinalizeBody(sandboxId, groupData.group, pub, priv, network);
+        : await buildFinalizeBody(sandboxId, groupData.group, pub, priv, network, valueKeyset);
 
       // 8. Send finalize event only when the sandbox is still pending
       if (!alreadyFinalized) {
@@ -548,6 +703,7 @@ sandboxCommand
         createdAt: new Date().toISOString(),
       };
       saveWallet(email, network, wallet);
+      deprecateReplacedWallet(email, network, sandboxId, groupData.group, wallet);
 
       print(
         {
