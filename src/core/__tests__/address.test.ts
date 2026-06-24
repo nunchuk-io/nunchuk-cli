@@ -6,7 +6,9 @@ import { bip32Path } from "@scure/btc-signer";
 import { Script } from "@scure/btc-signer/script.js";
 import {
   TESTNET_VERSIONS,
+  compileDescriptorTaprootMiniscriptLeafScripts,
   deriveDescriptorAddresses,
+  deriveDescriptorFirstAddress,
   deriveDescriptorPayment,
 } from "../address.js";
 import {
@@ -142,6 +144,19 @@ describe("deriveDescriptorPayment", () => {
     expect(payment.tapLeafScript).toHaveLength(1);
     expect(payment.tapBip32Derivation).toHaveLength(4);
     expect(deriveDescriptorAddresses(descriptor, "testnet", 0, 0, 1)).toEqual([payment.address]);
+  });
+
+  it("matches libnunchuk taproot miniscript multi_a verify-form addresses", () => {
+    const descriptor =
+      "tr(xpub661MyMwAqRbcGWEttB7w8WyKaeTJ5Cr8MuNeRToMyAEKXMk8rei9p4rDzWdnwRHQegT4dV6XyGV3hLuhvfRf7QGTBLnM1EPrCXgUXUTeKsx/<0;1>/*," +
+      "or_d(multi_a(2,[4bdae5b6/87'/0'/0']xpub6DMwJ7e2g8qByWHCsYcTRdij9LhSFeeDfvpfvACVWRXxgMu6CCqz1nrNYERKD1NrphFDSbNcsezrwmuaW2cQMbywRqhuyjDwEX8xJZnEe9o/<0;1>/*,[701a4fa8/48'/0'/0'/2']xpub6Ef3rBZ9JAmChQnHfdRFHntZCdBFuc7KyGcGkrPnhQY3nY68DABatNVqjGaMWZnsAhaqNeoj9Y2oeDmVaZYc2FUzBT286P2DYv4LnCxfpvu/<0;1>/*,[ad231801/48'/0'/2'/2']xpub6EcGdZsjdLkAJbR1N1Gv62AcFde5vydcNpCjypJVYnGJiF5rAWo2GFHofgDB1ev9saCSrQEWe47ova8hB8LnZEgusrtAgVKcmt3w9TcvqxH/<0;1>/*)," +
+      "and_v(v:multi_a(1,[b89b7ac3/87'/0'/1']xpub6DGtYvwdYbjsqkzVeDJVwcYhNP941YUd6JC3Fhu8ct7QjJ4VBgxHXSfYr6gmKa4aRF36YXS5NF3i5763V5i76t2VgnUKghHxqeuNYqM6Scc/<0;1>/*,[701a4fa8/48'/0'/1'/2']xpub6FQjam2xz2zKvicZNgZSGLUhbqWBFunwLRqsn8RprQH3tRP4duCncGn5zT4KM3hcs63SYu9QbmPcqGFkGcJJUQMBmpGDycxtc23oKqji5Xe/<0;1>/*,[ad231801/48'/0'/3'/2']xpub6Ep9PYx2HRkjHa6eeWw29dSdgucWeRUMu4KMrFWaTYPJ29L9dRWsJt8apAcAGRxiX6fffyaDLz2x48TZ5sSgv3qaVtpdRV953TGf7ck6UKH/<0;1>/*),after(1782266400))))#w5z5cxjk";
+    const [leaf] = compileDescriptorTaprootMiniscriptLeafScripts(descriptor, "mainnet", 0, 0);
+
+    expect(deriveDescriptorFirstAddress(descriptor, "mainnet")).toBe(
+      "bc1pv6zkuv0jdhfgwqhhqnh76rvt6jpgmq0mks9gngxf5y22y8wrhmpsk08ek6",
+    );
+    expect(Script.decode(leaf.script)).toContain("NUMEQUALVERIFY");
   });
 
   it("derives taproot sortedmulti_a metadata for large libnunchuk multisig fallback", () => {
