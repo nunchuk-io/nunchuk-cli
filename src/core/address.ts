@@ -52,6 +52,19 @@ function encodeScript(parts: ScriptOP[]): Uint8Array {
   return Script.encode(parts);
 }
 
+function buildTaprootMultiAScript(m: number, pubkeys: Uint8Array[], verify = false): Uint8Array {
+  const script = p2tr_ms(m, pubkeys).script;
+  if (!verify) {
+    return script;
+  }
+
+  const parts = Script.decode(script);
+  if (parts[parts.length - 1] !== "NUMEQUAL") {
+    throw new Error("Invalid taproot multi_a script");
+  }
+  return encodeScript([...parts.slice(0, -1), "NUMEQUALVERIFY"]);
+}
+
 // Build multisig redeem script: OP_m <pubkey1> ... <pubkeyn> OP_n OP_CHECKMULTISIG
 export function buildMultisigScript(pubkeys: Uint8Array[], m: number): Uint8Array {
   const n = pubkeys.length;
@@ -830,7 +843,7 @@ function compileMiniscriptFragment(
     }
     case "MULTI_A": {
       const keys = node.keys.map((key) => toXOnlyPubkey(resolveKey(key).pubkey));
-      return p2tr_ms(node.k, keys).script;
+      return buildTaprootMultiAScript(node.k, keys, verify);
     }
     case "WRAP_A":
       return concatBytes([

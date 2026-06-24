@@ -363,7 +363,10 @@ walletCommand
           );
         }
       } else {
-        const descriptor = buildAnyDescriptorForParsed(parsed);
+        const descriptor =
+          parsed.kind === "miniscript"
+            ? buildWalletDescriptorForParsed(parsed)
+            : buildAnyDescriptorForParsed(parsed);
         const bsms = {
           version: "BSMS 1.0",
           descriptor,
