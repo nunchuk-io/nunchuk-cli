@@ -50,13 +50,13 @@
     "@scure/bip32": "2.0.1",
     "@scure/bip39": "2.0.1",
     "@scure/btc-signer": "2.0.1",
-    "better-sqlite3": "^12.8.0",
+    "better-sqlite3": "12.8.0",
     "commander": "12.1.0",
     "tweetnacl": "1.0.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/better-sqlite3": "^7.6.13",
+    "@types/better-sqlite3": "7.6.13",
     "@types/node": "^22.0.0",
     "eslint": "^10.0.3",
     "eslint-config-prettier": "^10.1.8",
