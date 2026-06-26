@@ -1,6 +1,6 @@
 {
   "name": "nunchuk-cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "CLI for AI agents to use Bitcoin safely with group and miniscript wallets",
   "license": "MIT",
   "type": "module",
