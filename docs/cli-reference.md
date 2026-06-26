@@ -1,6 +1,6 @@
 # Nunchuk CLI Reference
 
-Command-line interface for Nunchuk group and native-segwit miniscript wallet management.
+Command-line interface for Nunchuk group multisig and miniscript wallet management (native segwit, nested segwit, legacy, and taproot).
 
 ## Installation
 
@@ -181,11 +181,11 @@ Output:
 
 ## Sandbox Commands
 
-Manage group wallet sandboxes. A sandbox is a pre-wallet state where participants assemble their signer keys before finalizing into an active multisig or native-segwit miniscript wallet.
+Manage group wallet sandboxes. A sandbox is a pre-wallet state where participants assemble their signer keys before finalizing into an active multisig or miniscript wallet.
 
 ### `nunchuk sandbox create`
 
-Create a new group wallet sandbox. Use `--m` and `--n` for standard multisig, or `--miniscript-template` for native-segwit miniscript. The sandbox state is end-to-end encrypted using the selected network's ephemeral keypair generated during login.
+Create a new group wallet sandbox. Use `--m` and `--n` for standard multisig, or `--miniscript-template` for a miniscript wallet (native segwit or taproot via `--address-type`). The sandbox state is end-to-end encrypted using the selected network's ephemeral keypair generated during login.
 
 | Option                             | Required        | Default         | Description                                                 |
 | ---------------------------------- | --------------- | --------------- | ----------------------------------------------------------- |
@@ -197,7 +197,7 @@ Create a new group wallet sandbox. Use `--m` and `--n` for standard multisig, or
 
 Valid multisig address types: `NATIVE_SEGWIT`, `NESTED_SEGWIT`, `LEGACY`, `TAPROOT`.
 
-Miniscript sandboxes currently support `NATIVE_SEGWIT` only. Taproot/tapscript miniscript is not supported in this phase. Do not combine `--miniscript-template` with `--m` or `--n`; the signer count is derived from the signer names in the template.
+Miniscript sandboxes support `NATIVE_SEGWIT` and `TAPROOT`. Do not combine `--miniscript-template` with `--m` or `--n`; the signer count is derived from the signer names in the template. For taproot multisig, use `--address-type TAPROOT` without a template.
 
 ```bash
 # Uses default NATIVE_SEGWIT
@@ -206,9 +206,16 @@ nunchuk sandbox create --name "Team Vault" --m 2 --n 3
 # Explicit address type
 nunchuk sandbox create --name "Team Vault" --m 2 --n 3 --address-type NESTED_SEGWIT
 
+# Taproot multisig
+nunchuk sandbox create --name "TR Vault" --m 2 --n 3 --address-type TAPROOT
+
 # Native-segwit miniscript
 nunchuk sandbox create --name "Mini Vault" \
   --miniscript-template "or_d(multi(2,key_0_0,key_1_0,key_2_0),and_v(v:pk(key_3_0),after(1785542400)))"
+
+# Taproot miniscript (decaying 2-of-3 → 1-of-3 tapscript tree)
+nunchuk sandbox create --name "TR Decay" --address-type TAPROOT \
+  --miniscript-template "{multi_a(2,key_0_0,key_1_0,key_2_0),and_v(v:multi_a(1,key_0_1,key_1_1,key_2_1),after(1785542400))}"
 ```
 
 ### `nunchuk sandbox list`
@@ -283,12 +290,25 @@ nunchuk sandbox add-key abc123 \
 
 Finalize a sandbox into an active wallet. All signer slots must be filled before finalizing.
 
-| Argument       | Description |
-| -------------- | ----------- |
-| `<sandbox-id>` | Sandbox ID  |
+| Argument / Option           | Required | Description                                                                                        |
+| --------------------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `<sandbox-id>`              | Yes      | Sandbox ID                                                                                        |
+| `--value-key-set <indexes>` | No       | **Taproot multisig only.** Exactly `m` signer slot indexes or fingerprints (comma-separated) that form the MuSig2 key-path aggregate (`musig(...)`) |
+
+For **taproot multisig**, `--value-key-set` selects which `m` signers are aggregated into the key-path MuSig2 key, enabling efficient key-path spends; the selected slots are applied in ascending order and all signers remain spendable via the script path. The set must contain exactly `m` entries.
+
+If `--value-key-set` is **omitted**, the wallet is finalized with the **key path disabled** (`DISABLE_KEY_PATH` template): there is no aggregated key-path spend and every `m`-of-`n` combination is a tapscript leaf, so spends always go through the script path (`tx create --taproot-script-path`). The option only applies to a still-pending sandbox and is rejected when re-running finalize on an already-finalized one (and on non-taproot-multisig sandboxes).
 
 ```bash
+# Standard multisig / miniscript — no extra options
 nunchuk sandbox finalize abc123
+
+# Taproot multisig, key path disabled (script-path only)
+nunchuk sandbox finalize abc123
+
+# Taproot 2-of-3 — enable a MuSig2 key path over exactly m=2 signers
+nunchuk sandbox finalize abc123 --value-key-set 0,1
+nunchuk sandbox finalize abc123 --value-key-set 249fdf68,480101ce
 ```
 
 ### `nunchuk sandbox delete <sandbox-id>`
@@ -474,7 +494,7 @@ nunchuk invitation deny 9d53f7aa-1234-4567-89ab-0123456789ab
 
 ## Wallet Commands
 
-Manage finalized group wallets, including multisig and native-segwit miniscript wallets.
+Manage finalized group wallets, including multisig and miniscript wallets.
 
 ### `nunchuk wallet list`
 
@@ -835,23 +855,29 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 | `--amount <value>`          | Yes      | Amount to send (default unit: sat)                                  |
 | `--currency <code>`         | No       | Currency for amount. Supports BTC, USD, and fiat codes              |
 | `--miniscript-path <index>` | No       | Select a miniscript signing path by index                           |
+| `--taproot-script-path`     | No       | Spend a taproot wallet through its script path instead of the key path |
 | `--preimage <hex>`          | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
 
 Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback).
 
 For miniscript wallets, the CLI selects the first satisfiable supported path with the fewest preimage requirements unless `--miniscript-path` is provided. The selected path sets transaction locktime and input sequence when required.
 
+**Taproot spending paths.** For a taproot wallet, the key path (MuSig2 aggregate) is used by default when available. `--taproot-script-path` forces a script-path (tapscript) spend instead — it requires a taproot wallet whose descriptor has script-path spending enabled, and cannot be combined with key-path selection. For taproot miniscript wallets, select a specific tapscript leaf with `--miniscript-path <index>` (which implies script-path spending).
+
 ```bash
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000
 nunchuk tx create --wallet w123 --to bc1q... --amount 0.001 --currency BTC
 nunchuk tx create --wallet w123 --to bc1q... --amount 50 --currency USD
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --miniscript-path 0
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --taproot-script-path
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --preimage <32-byte-hex>
 ```
 
 ### `nunchuk tx sign`
 
 Sign a transaction. By default, this fetches the PSBT from the group server, signs matching inputs locally, and re-uploads the merged result. You can also pass `--psbt <base64>` to merge an externally signed PSBT into the current pending transaction. Upload only happens when the merge adds new data.
+
+**Taproot multisig (MuSig2) requires two signing rounds.** Taproot multisig uses `musig(...)` aggregates (on the key path, and — for wallets up to 5 signers — on the tapscript leaves too), so the spend goes through `PENDING_NONCE` → `PENDING_SIGNATURES` → `READY_TO_BROADCAST`. The first `tx sign` from a signer publishes its public nonce (the tx stays `PENDING_NONCE` until every required signer has contributed a nonce); running `tx sign` again produces that signer's partial signature. So with local keys you typically run `tx sign` twice. Taproot **miniscript** (`multi_a`), large taproot multisig that falls back to `sortedmulti_a`, and non-taproot wallets sign in a single pass per signer and do not use nonces.
 
 | Option                 | Required | Description                                                         |
 | ---------------------- | -------- | ------------------------------------------------------------------- |
@@ -877,6 +903,10 @@ nunchuk tx sign --wallet w123 --tx-id tx456 --preimage <32-byte-hex>
 
 # Or merge an externally signed PSBT
 nunchuk tx sign --wallet w123 --tx-id tx456 --psbt "cHNidP8B..."
+
+# Taproot multisig (MuSig2): run twice — first publishes nonces, second adds partial signatures
+nunchuk tx sign --wallet w123 --tx-id tx456   # → PENDING_NONCE / PENDING_SIGNATURES
+nunchuk tx sign --wallet w123 --tx-id tx456   # → READY_TO_BROADCAST
 ```
 
 ### `nunchuk tx broadcast`

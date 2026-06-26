@@ -4,8 +4,8 @@ A command-line tool that lets AI agents use Bitcoin safely. Agents operate withi
 
 Built for integration with AI agent frameworks. See [agent-skills](https://github.com/nunchuk-io/agent-skills) for ready-made skills.
 
-- ✅ Group Wallet (m-of-n multisig)
-- ✅ Miniscript Wallet (native segwit; Taproot next phase)
+- ✅ Group Wallet (m-of-n multisig — native segwit, nested segwit, legacy, taproot)
+- ✅ Miniscript Wallet (native segwit and taproot/tapscript)
 
 ## Prerequisites
 
@@ -59,9 +59,16 @@ nunchuk --network testnet auth login
 # Create a 2-of-3 sandbox (defaults to NATIVE_SEGWIT)
 nunchuk sandbox create --name "My Wallet" --m 2 --n 3
 
+# Taproot multisig
+nunchuk sandbox create --name "TR Wallet" --m 2 --n 3 --address-type TAPROOT
+
 # Or create a native-segwit miniscript sandbox from a signer-name template
 nunchuk sandbox create --name "Mini Wallet" \
   --miniscript-template "or_d(multi(2,key_0_0,key_1_0,key_2_0),and_v(v:pk(key_3_0),after(1785542400)))"
+
+# Taproot miniscript (tapscript tree using multi_a)
+nunchuk sandbox create --name "TR Mini Wallet" --address-type TAPROOT \
+  --miniscript-template "{multi_a(2,key_0_0,key_1_0,key_2_0),and_v(v:multi_a(1,key_0_1,key_1_1,key_2_1),after(1785542400))}"
 
 # Invite participants by email
 nunchuk invitation send <sandbox-id> alice@example.com bob@example.com
@@ -91,6 +98,10 @@ nunchuk sandbox add-key <sandbox-id> --slot 2 \
 
 # Finalize into an active wallet
 nunchuk sandbox finalize <sandbox-id>
+
+# Taproot multisig: enable a MuSig2 key path over exactly m signers
+# (omit --value-key-set for a script-path-only taproot wallet)
+nunchuk sandbox finalize <sandbox-id> --value-key-set 0,1
 
 # View wallets
 nunchuk wallet list
@@ -123,6 +134,12 @@ nunchuk tx broadcast --wallet <wallet-id> --tx-id <tx-id>
 # For miniscript, optionally choose a path and attach required hash preimages
 nunchuk tx create --wallet <wallet-id> --to <address> --amount 100000 --miniscript-path 0
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --preimage <32-byte-hex>
+
+# Taproot: force a script-path spend (key path is the default)
+nunchuk tx create --wallet <wallet-id> --to <address> --amount 100000 --taproot-script-path
+# Taproot multisig (MuSig2) needs two signing rounds — run tx sign twice
+nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>   # publishes nonces
+nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>   # adds partial signatures
 
 # View transaction history
 nunchuk tx list --wallet <wallet-id>
@@ -204,7 +221,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 
 | Command                                | Description                                               |
 | -------------------------------------- | --------------------------------------------------------- |
-| `sandbox create`                       | Create a new multisig or native-segwit miniscript sandbox |
+| `sandbox create`                       | Create a new multisig or miniscript sandbox (native segwit or taproot) |
 | `sandbox list`                         | List sandbox IDs                                          |
 | `sandbox get <id>`                     | Get sandbox details from server                           |
 | `sandbox join <id-or-url>`             | Join an existing sandbox by ID or URL                     |
@@ -269,9 +286,10 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 ```bash
 nunchuk tx create --wallet <id> --to <address> --amount <sats>
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --miniscript-path 0
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --taproot-script-path  # taproot script-path spend
 ```
 
-Fee rate is automatically estimated from the Nunchuk API.
+Fee rate is automatically estimated from the Nunchuk API. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
 
 #### `tx sign`
 
@@ -282,6 +300,8 @@ nunchuk tx sign --wallet <id> --tx-id <txid> --xprv <extended-private-key>
 nunchuk tx sign --wallet <id> --tx-id <txid> --preimage <32-byte-hex>    # miniscript hash preimage
 nunchuk tx sign --wallet <id> --tx-id <txid> --psbt <signed-psbt-base64> # merge signed PSBT
 ```
+
+Taproot multisig spends use **MuSig2** and need two signing rounds: the first `tx sign` publishes the signer's nonce (`PENDING_NONCE` → `PENDING_SIGNATURES`), the second produces its partial signature (`READY_TO_BROADCAST`). Taproot miniscript (`multi_a`) and non-taproot wallets sign in one pass.
 
 #### `tx broadcast`
 
