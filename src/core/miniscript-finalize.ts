@@ -229,8 +229,29 @@ function produceInput(node: MiniscriptFragment, ctx: SatisfactionContext): Input
         sat: sats[node.k] ?? null,
       };
     }
-    case "MULTI_A":
-      throw new Error("Taproot miniscript finalization is not supported yet");
+    case "MULTI_A": {
+      const signedKeys = node.keys.filter((key) => ctx.signatures.has(key));
+      if (signedKeys.length < node.k) {
+        return {
+          dsat: zeroStack(node.keys.length),
+          sat: null,
+        };
+      }
+
+      const selectedKeys = signedKeys.slice(0, node.k);
+      const selected = new Set(selectedKeys);
+      const stack = node.keys
+        .map((key) => (selected.has(key) ? ctx.signatures.get(key)! : new Uint8Array()))
+        .reverse();
+
+      return {
+        dsat: zeroStack(node.keys.length),
+        sat: inputStack(stack, {
+          hasSignature: true,
+          signaturesUsed: selectedKeys,
+        }),
+      };
+    }
     case "WRAP_A":
     case "WRAP_S":
     case "WRAP_C":

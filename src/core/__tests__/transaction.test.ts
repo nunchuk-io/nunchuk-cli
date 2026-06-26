@@ -1241,6 +1241,56 @@ describe("createTransaction miniscript", () => {
     }
   });
 
+  it("finalizes taproot miniscript multi_a script-path inputs", async () => {
+    const descriptors = VALID_MINISCRIPT_SIGNERS.map((signer) => signer.descriptor);
+    const unspendableXpub = getUnspendableXpub(descriptors);
+    const body = `tr(${unspendableXpub}/<0;1>/*,and_v(v:multi_a(2,${descriptors[0]}/<0;1>/*,${descriptors[1]}/<0;1>/*,${descriptors[2]}/<0;1>/*),after(1)))`;
+    const descriptor = `${body}#${descriptorChecksum(body)}`;
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      n: 3,
+      addressType: "TAPROOT",
+      descriptor,
+      signers: descriptors,
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        taprootScriptPath: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+
+      expect(tx.getInput(0).tapLeafScript).toHaveLength(1);
+      expect(signWithValidMiniscriptSigner(tx, 0, wallet.descriptor)).toBe(1);
+      expect(signWithValidMiniscriptSigner(tx, 2, wallet.descriptor)).toBe(1);
+
+      expect(finalizeMiniscriptPsbt(tx, wallet.descriptor, "testnet")).toMatchObject({
+        requiredPreimages: 0,
+        requiredSignatures: 2,
+      });
+      const witness = tx.getInput(0).finalScriptWitness;
+      expect(witness).toHaveLength(5);
+      expect(witness?.[1]).toHaveLength(0);
+      expect(tx.isFinal).toBe(true);
+      expect(() => tx.extract()).not.toThrow();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("reports all compatible taproot miniscript satisfaction paths and narrows by signatures", async () => {
     const descriptors = VALID_MINISCRIPT_SIGNERS.map((signer) => signer.descriptor);
     const unspendableXpub = getUnspendableXpub(descriptors);
