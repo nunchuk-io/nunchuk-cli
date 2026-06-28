@@ -14,7 +14,7 @@ import {
 } from "./paths.js";
 
 const ENCRYPTION_VERSION = 0x01;
-const STORAGE_SCHEMA_VERSION = 4;
+const STORAGE_SCHEMA_VERSION = 5;
 const STORAGE_SCHEMA_VERSION_KEY = "schema_version";
 const PROFILE_META_KEY = "profile";
 const HKDF_INFO = "nunchuk-cli/storage/v1";
@@ -135,7 +135,7 @@ export function decrypt(data: Buffer, key: Buffer): string {
   return decrypted.toString("utf8");
 }
 
-function getDatabase(
+export function getDatabase(
   email: string,
   network: Network,
   options: { create?: boolean } = {},
@@ -238,6 +238,15 @@ function createSchemaTables(db: Database.Database): void {
       encrypted BLOB NOT NULL,
       created_at TEXT NOT NULL,
       PRIMARY KEY (nonce_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS coins (
+      wallet_id TEXT NOT NULL,
+      txid      TEXT NOT NULL,
+      vout      INTEGER NOT NULL,
+      memo      TEXT,
+      locked    INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (wallet_id, txid, vout)
     );
   `);
 }

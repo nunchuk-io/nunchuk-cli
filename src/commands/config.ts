@@ -1,17 +1,24 @@
 import { Command } from "commander";
 import {
   buildElectrumServer,
+  clearDefaultFeeLevel,
+  DEFAULT_FEE_LEVEL,
+  FEE_LEVELS,
   getAuthProfile,
   getDefaultElectrumServer,
+  getDefaultFeeLevel,
   getElectrumServerFromConfig,
   getEphemeralKeypair,
   getNetwork,
   hasElectrumProtocol,
+  isFeeLevel,
   loadConfig,
   parseElectrumAddress,
   parseElectrumServer,
   resetElectrumServer,
+  requireEmail,
   saveConfig,
+  setDefaultFeeLevel,
   setElectrumServer,
   type ElectrumServer,
 } from "../core/config.js";
@@ -85,6 +92,7 @@ configCommand
     const masked = profile?.apiKey
       ? `${profile.apiKey.slice(0, 8)}...${profile.apiKey.slice(-4)}`
       : "not set";
+    const savedFeeLevel = profile?.email ? getDefaultFeeLevel(config, profile.email) : undefined;
 
     print(
       {
@@ -95,6 +103,7 @@ configCommand
         ephemeralPriv: ephemeralKeys?.priv ? "(hidden)" : "not generated",
         electrumServer: electrumServer.url,
         electrumServerSource: config[network]?.electrumServer ? "custom" : "default",
+        defaultFeeLevel: savedFeeLevel ?? `${DEFAULT_FEE_LEVEL} (default)`,
       },
       cmd,
     );
@@ -181,3 +190,81 @@ electrumCommand
   });
 
 configCommand.addCommand(electrumCommand);
+
+const feeRateCommand = new Command("fee-rate").description(
+  "Manage the default fee rate level for the active account",
+);
+
+feeRateCommand
+  .command("get")
+  .description("Show the active account's default fee rate level")
+  .action((_options, cmd) => {
+    const config = loadConfig();
+    const globals = cmd.optsWithGlobals();
+    const email = requireEmail(globals.network);
+    const level = getDefaultFeeLevel(config, email);
+
+    print(
+      {
+        email,
+        defaultFeeLevel: level ?? DEFAULT_FEE_LEVEL,
+        source: level ? "custom" : "default",
+      },
+      cmd,
+    );
+  });
+
+feeRateCommand
+  .command("set")
+  .description("Set the default fee rate level for the active account")
+  .argument("<level>", `Fee level: ${FEE_LEVELS.join(", ")}`)
+  .action((level: string, _options, cmd) => {
+    const globals = cmd.optsWithGlobals();
+    if (!isFeeLevel(level)) {
+      printError(
+        {
+          error: "INVALID_FEE_LEVEL",
+          message: `Fee level must be one of: ${FEE_LEVELS.join(", ")}`,
+        },
+        cmd,
+      );
+      return;
+    }
+    const config = loadConfig();
+    const email = requireEmail(globals.network);
+    setDefaultFeeLevel(config, email, level);
+    saveConfig(config);
+
+    print(
+      {
+        email,
+        defaultFeeLevel: level,
+        source: "custom",
+        message: `Default fee rate set to ${level} for ${email}`,
+      },
+      cmd,
+    );
+  });
+
+feeRateCommand
+  .command("reset")
+  .description("Remove the saved default fee rate level (falls back to the built-in default)")
+  .action((_options, cmd) => {
+    const config = loadConfig();
+    const globals = cmd.optsWithGlobals();
+    const email = requireEmail(globals.network);
+    clearDefaultFeeLevel(config, email);
+    saveConfig(config);
+
+    print(
+      {
+        email,
+        defaultFeeLevel: DEFAULT_FEE_LEVEL,
+        source: "default",
+        message: `Default fee rate reset for ${email}`,
+      },
+      cmd,
+    );
+  });
+
+configCommand.addCommand(feeRateCommand);

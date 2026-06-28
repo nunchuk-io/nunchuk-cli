@@ -1,6 +1,9 @@
 node_modules/
 dist/
 *.tsbuildinfo
+# Stray in-place TypeScript output. The real build emits to dist/; compiled JS
+# should never live next to sources under src/.
+src/**/*.js
 .claude/
 .DS_Store
 .vscode/

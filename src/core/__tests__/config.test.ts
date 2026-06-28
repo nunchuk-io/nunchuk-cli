@@ -1,13 +1,22 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import {
   clearAuthProfile,
+  clearDefaultFeeLevel,
   getDefaultElectrumServer,
+  getDefaultFeeLevel,
   getElectrumServerFromConfig,
   getAuthProfile,
   getConfiguredNetworks,
   getEphemeralKeypair,
+  isFeeLevel,
+  loadConfig,
   parseElectrumServer,
   resetElectrumServer,
+  saveConfig,
+  setDefaultFeeLevel,
   setElectrumServer,
   setEphemeralKeypair,
   setAuthProfile,
@@ -15,8 +24,14 @@ import {
 } from "../config.js";
 import { saveProfile, type Profile } from "../storage.js";
 
-const { profileStore } = vi.hoisted(() => ({
+const { profileStore, tmpHome } = vi.hoisted(() => ({
   profileStore: new Map<string, Profile>(),
+  tmpHome: { dir: "" },
+}));
+
+vi.mock("../paths.js", () => ({
+  getCliHome: () => tmpHome.dir,
+  getConfigFile: () => path.join(tmpHome.dir, "config.json"),
 }));
 
 vi.mock("../storage.js", () => ({
@@ -43,10 +58,12 @@ function setupProfile(email: string, network: string, data: Partial<Profile>): v
 
 beforeEach(() => {
   profileStore.clear();
+  tmpHome.dir = fs.mkdtempSync(path.join(os.tmpdir(), "nunchuk-cli-config-"));
 });
 
 afterEach(() => {
   profileStore.clear();
+  fs.rmSync(tmpHome.dir, { recursive: true, force: true });
 });
 
 describe("getAuthProfile", () => {
@@ -266,5 +283,55 @@ describe("Electrum server config", () => {
 
     expect(server).toEqual(getDefaultElectrumServer("mainnet"));
     expect(config.mainnet).toEqual({ email: "main@example.com" });
+  });
+});
+
+describe("default fee level", () => {
+  it("validates fee level strings", () => {
+    expect(isFeeLevel("economy")).toBe(true);
+    expect(isFeeLevel("standard")).toBe(true);
+    expect(isFeeLevel("priority")).toBe(true);
+    expect(isFeeLevel("turbo")).toBe(false);
+  });
+
+  it("sets, gets and clears a per-account default", () => {
+    const config: Config = {};
+
+    expect(getDefaultFeeLevel(config, "user@example.com")).toBeUndefined();
+
+    setDefaultFeeLevel(config, "user@example.com", "priority");
+    expect(getDefaultFeeLevel(config, "user@example.com")).toBe("priority");
+    expect(config.accounts).toEqual({ "user@example.com": { defaultFeeLevel: "priority" } });
+
+    clearDefaultFeeLevel(config, "user@example.com");
+    expect(getDefaultFeeLevel(config, "user@example.com")).toBeUndefined();
+    expect(config.accounts).toEqual({});
+  });
+
+  it("keeps preferences per account, independent of network", () => {
+    const config: Config = {};
+    setDefaultFeeLevel(config, "alice@example.com", "standard");
+    setDefaultFeeLevel(config, "bob@example.com", "priority");
+
+    // The same account preference is read with no network argument, so it is
+    // identical regardless of the active network.
+    expect(getDefaultFeeLevel(config, "alice@example.com")).toBe("standard");
+    expect(getDefaultFeeLevel(config, "bob@example.com")).toBe("priority");
+  });
+
+  it("persists accounts through saveConfig/loadConfig and drops empty entries", () => {
+    const config: Config = {
+      network: "mainnet",
+      accounts: {
+        "alice@example.com": { defaultFeeLevel: "standard" },
+        "bob@example.com": {},
+      },
+    };
+
+    saveConfig(config);
+    const reloaded = loadConfig();
+
+    expect(reloaded.accounts).toEqual({ "alice@example.com": { defaultFeeLevel: "standard" } });
+    expect(getDefaultFeeLevel(reloaded, "alice@example.com")).toBe("standard");
   });
 });

@@ -5,6 +5,18 @@ import { getCliHome, getConfigFile } from "./paths.js";
 export type Network = "mainnet" | "testnet";
 export type ElectrumProtocol = "tcp" | "ssl";
 
+// Default fee rate level for auto-estimation. economy = hourFee, standard =
+// halfHourFee, priority = fastestFee (mirrors the mobile app's selector).
+export type FeeLevel = "economy" | "standard" | "priority";
+
+export const FEE_LEVELS: readonly FeeLevel[] = ["economy", "standard", "priority"] as const;
+
+export const DEFAULT_FEE_LEVEL: FeeLevel = "economy";
+
+export function isFeeLevel(value: string): value is FeeLevel {
+  return (FEE_LEVELS as readonly string[]).includes(value);
+}
+
 // Config.json stores session state only — no secrets.
 // Secrets live in encrypted profile storage.
 
@@ -13,10 +25,17 @@ export interface NetworkSession {
   electrumServer?: string;
 }
 
+// Per-account preferences, keyed by email. Network-independent: the same
+// account shares these across mainnet and testnet.
+export interface AccountPreferences {
+  defaultFeeLevel?: FeeLevel;
+}
+
 export interface Config {
   network?: Network;
   mainnet?: NetworkSession;
   testnet?: NetworkSession;
+  accounts?: Record<string, AccountPreferences>;
 }
 
 export interface AuthProfile {
@@ -71,7 +90,35 @@ export function saveConfig(config: Config): void {
     if (config.testnet.email) clean.testnet.email = config.testnet.email;
     if (config.testnet.electrumServer) clean.testnet.electrumServer = config.testnet.electrumServer;
   }
+  // Preserve per-account preferences, copying only known keys and dropping
+  // empty entries.
+  if (config.accounts) {
+    const accounts: Record<string, AccountPreferences> = {};
+    for (const [email, prefs] of Object.entries(config.accounts)) {
+      if (prefs?.defaultFeeLevel) {
+        accounts[email] = { defaultFeeLevel: prefs.defaultFeeLevel };
+      }
+    }
+    if (Object.keys(accounts).length > 0) clean.accounts = accounts;
+  }
   fs.writeFileSync(getConfigFile(), JSON.stringify(clean, null, 2), { mode: 0o600 });
+}
+
+export function getDefaultFeeLevel(config: Config, email: string): FeeLevel | undefined {
+  return config.accounts?.[email]?.defaultFeeLevel;
+}
+
+export function setDefaultFeeLevel(config: Config, email: string, level: FeeLevel): void {
+  if (!config.accounts) config.accounts = {};
+  if (!config.accounts[email]) config.accounts[email] = {};
+  config.accounts[email].defaultFeeLevel = level;
+}
+
+export function clearDefaultFeeLevel(config: Config, email: string): void {
+  const prefs = config.accounts?.[email];
+  if (!prefs) return;
+  delete prefs.defaultFeeLevel;
+  if (Object.keys(prefs).length === 0) delete config.accounts![email];
 }
 
 export function deleteConfig(): void {
