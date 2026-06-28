@@ -3,6 +3,7 @@ import {
   buildMiniscriptDummyWitness,
   estimateMiniscriptInputVBytes,
   estimateMultisigInputVBytes,
+  estimateTaprootKeyPathInputVBytes,
   getChangeOutputSize,
   getChangeScriptLen,
   isWalletWitnessOutput,
@@ -85,8 +86,15 @@ describe("estimateMiniscriptInputVBytes", () => {
   });
 });
 
+describe("estimateTaprootKeyPathInputVBytes", () => {
+  it("sizes a single 64-byte Schnorr key-path spend at 58 vbytes", () => {
+    // non-witness 41 * 4 + witness (1 + 1 + 64) = 164 + 66 = 230 → ceil(230/4) = 58
+    expect(estimateTaprootKeyPathInputVBytes()).toBe(58);
+  });
+});
+
 describe("buildMiniscriptDummyWitness", () => {
-  it("pushes one 72-byte signature placeholder per required signature", () => {
+  it("pushes one 72-byte signature placeholder per required signature (v0)", () => {
     const parsed = parseDescriptor(MINISCRIPT_WALLET.descriptor);
     const plans = getMiniscriptSpendingPlans(parsed.miniscript!).filter((p) => p.supported);
     const plan = plans[0];
@@ -96,6 +104,19 @@ describe("buildMiniscriptDummyWitness", () => {
     expect(sigCount).toBe(plan.requiredSignatures);
     // last item is always the witness script
     expect(stack[stack.length - 1]).toBe(witnessScript);
+  });
+
+  it("uses 64-byte Schnorr sigs and appends the control block for taproot script-path", () => {
+    const parsed = parseDescriptor(MINISCRIPT_WALLET.descriptor);
+    const plan = getMiniscriptSpendingPlans(parsed.miniscript!).filter((p) => p.supported)[0];
+    const leafScript = new Uint8Array([0xab, 0xcd]);
+    const controlBlock = new Uint8Array(33); // minimal control block (parity+x-only)
+    const stack = buildMiniscriptDummyWitness(plan, leafScript, controlBlock);
+    expect(stack.filter((item) => item.length === 64).length).toBe(plan.requiredSignatures);
+    expect(stack.filter((item) => item.length === 72).length).toBe(0);
+    // control block is last, leaf script second-to-last
+    expect(stack[stack.length - 1]).toBe(controlBlock);
+    expect(stack[stack.length - 2]).toBe(leafScript);
   });
 });
 

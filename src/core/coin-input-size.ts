@@ -2,6 +2,7 @@
 // Feeds CoinInput.inputVBytes for the coin-selection port, mirroring
 // libnunchuk's spender.cpp:62-130 (MaxInputWeight / GetVirtualTransactionInputSize).
 
+import { TaprootControlBlock } from "@scure/btc-signer/psbt.js";
 import { CFeeRate } from "./coin-selection.js";
 import { compactSizeBytes, getDustThreshold } from "./coin-selection-params.js";
 import type { AddressType } from "./address-type.js";
@@ -11,16 +12,25 @@ import { deriveDescriptorPayment, deriveMultisigPayment } from "./address.js";
 import { parseDescriptor } from "./descriptor.js";
 import type { MiniscriptSpendingPlan } from "./miniscript-spend.js";
 
-// Bitcoin Core spend.cpp uses can_grind_r=false, so signatures are 72 bytes.
+// Bitcoin Core spend.cpp uses can_grind_r=false, so ECDSA signatures are 72
+// bytes. Taproot (BIP340) Schnorr signatures are 64 bytes (SIGHASH_DEFAULT).
 const ECDSA_SIG_BYTES = 72;
+const SCHNORR_SIG_BYTES = 64;
 
-// Build the witness items for a miniscript spend of `witnessScript` along
+// Build the witness items for a script-path spend of `witnessScript` along
 // `plan`. Used by both fee estimation and input-size estimation. Mirrors
 // libnunchuk spender.cpp:166-198 (GetStackAndWitnessSize).
+//
+// When `controlBlock` is provided the spend is a taproot script-path: signatures
+// are 64-byte Schnorr and the control block is pushed as the final witness item
+// (after the leaf script). Otherwise it is a v0 segwit miniscript spend with
+// 72-byte ECDSA signatures.
 export function buildMiniscriptDummyWitness(
   plan: MiniscriptSpendingPlan,
   witnessScript: Uint8Array,
+  controlBlock?: Uint8Array,
 ): Uint8Array[] {
+  const isTaproot = controlBlock != null;
   const stack: Uint8Array[] = [];
   const multisigLeafCount = plan.leafNodes.filter((leaf) => leaf.type === "MULTI").length;
   const placeholderLeaves =
@@ -41,10 +51,22 @@ export function buildMiniscriptDummyWitness(
   }
   for (let i = 0; i < multisigLeafCount; i++) stack.push(new Uint8Array());
   for (let i = 0; i < plan.requiredSignatures; i++) {
-    stack.push(new Uint8Array(ECDSA_SIG_BYTES));
+    stack.push(new Uint8Array(isTaproot ? SCHNORR_SIG_BYTES : ECDSA_SIG_BYTES));
   }
   stack.push(witnessScript);
+  if (controlBlock) stack.push(controlBlock);
   return stack;
+}
+
+// -- Taproot key-path --
+// A key-path spend (taproot single-sig, or taproot multisig with the DEFAULT
+// musig2 template) carries a single 64-byte Schnorr signature and no script.
+export function estimateTaprootKeyPathInputVBytes(): number {
+  // witness: stack item count (1) + sig length (1) + 64-byte Schnorr sig
+  const witnessSize = compactSizeBytes(1) + compactSizeBytes(SCHNORR_SIG_BYTES) + SCHNORR_SIG_BYTES;
+  // base tx input: prevout (32+4) + empty scriptSig (compactSize(0)) + sequence (4)
+  const nonWitness = 32 + 4 + compactSizeBytes(0) + 0 + 4;
+  return Math.ceil((nonWitness * 4 + witnessSize) / 4);
 }
 
 // -- Multisig --
@@ -102,10 +124,22 @@ export function estimateMiniscriptInputVBytes(
   plan: MiniscriptSpendingPlan,
 ): number {
   const payment = deriveDescriptorPayment(wallet.descriptor, network, 0, 0);
-  if (!payment.witnessScript) {
-    throw new Error("Miniscript wallet payment is missing witnessScript");
+  let witness: Uint8Array[];
+  if (payment.witnessScript) {
+    // v0 segwit miniscript: witnessScript + ECDSA signatures.
+    witness = buildMiniscriptDummyWitness(plan, payment.witnessScript);
+  } else if (payment.tapLeafScript?.[0]) {
+    // Taproot script-path: [satisfaction..., leaf script, control block], with
+    // 64-byte Schnorr signatures. tapLeafScript[0] = [controlBlock, scriptWithVersion].
+    const [controlBlock, scriptWithVersion] = payment.tapLeafScript[0];
+    witness = buildMiniscriptDummyWitness(
+      plan,
+      scriptWithVersion.slice(0, -1), // drop the trailing leaf-version byte
+      TaprootControlBlock.encode(controlBlock),
+    );
+  } else {
+    throw new Error("Miniscript wallet payment is missing witnessScript or tapLeafScript");
   }
-  const witness = buildMiniscriptDummyWitness(plan, payment.witnessScript);
 
   let witnessSize = compactSizeBytes(witness.length);
   for (const item of witness) {
@@ -126,22 +160,28 @@ export function estimateMiniscriptInputVBytes(
 }
 
 // Dispatcher used by createTransaction to populate CoinInput.inputVBytes.
+// `taprootKeyPath` short-circuits to a single 64-byte Schnorr sig (taproot
+// single-sig, or taproot multisig with the DEFAULT musig2 template);
+// `miniscriptPlan` drives v0 / taproot script-path sizing.
 export function estimateInputVBytes(
   wallet: WalletData,
   network: Network,
-  plan?: MiniscriptSpendingPlan,
+  opts: { miniscriptPlan?: MiniscriptSpendingPlan | null; taprootKeyPath?: boolean } = {},
 ): number {
+  if (opts.taprootKeyPath) {
+    return estimateTaprootKeyPathInputVBytes();
+  }
   const parsed = parseDescriptor(wallet.descriptor);
   if (parsed.kind === "multisig") {
     return estimateMultisigInputVBytes(wallet.m, wallet.signers.length, wallet.addressType);
   }
   if (parsed.kind === "miniscript") {
-    if (!plan) {
+    if (!opts.miniscriptPlan) {
       throw new Error(
         "estimateInputVBytes requires a miniscript spending plan for miniscript wallets",
       );
     }
-    return estimateMiniscriptInputVBytes(wallet, network, plan);
+    return estimateMiniscriptInputVBytes(wallet, network, opts.miniscriptPlan);
   }
   throw new Error(`Unsupported wallet kind: ${parsed.kind}`);
 }
