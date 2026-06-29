@@ -57,6 +57,7 @@ import {
   CFeeRate,
   makeCOutput,
   selectCoins,
+  type COutput,
   type CoinInput,
   type SelectionError,
 } from "./coin-selection.js";
@@ -1556,13 +1557,48 @@ function isWitnessProgramScript(script: Uint8Array): boolean {
 }
 
 // Dust threshold for a recipient output paying `script`, at the discard feerate.
-// Mirrors Bitcoin Core's IsDust(txout, m_discard_feerate) (spender.cpp:328).
+// Mirrors Bitcoin Core's IsDust(txout, m_discard_feerate) (spender.cpp CreateTransaction).
 function getRecipientDust(script: Uint8Array, discardFeerate: CFeeRate): bigint {
   return getDustThreshold(
     getChangeOutputSize(script.length),
     isWitnessProgramScript(script),
     discardFeerate,
   );
+}
+
+// Candidate coins for automatic selection, mirroring spender.cpp AvailableCoins
+// + the remain_target gate in CreateTransaction.
+//
+// Coins are always sorted oldest-confirmed-first (unconfirmed last). For a
+// relative-timelock (CSV) spend the input sequence is custom (not the RBF
+// sentinel, not 0), so libnunchuk caps the set to the oldest coins whose
+// cumulative effective value covers the selection target — biasing toward coins
+// that have aged into the timelock. For a normal RBF spend every coin stays
+// available (remain_target = MAX_MONEY).
+export function availableCandidates(
+  coOutputs: COutput[],
+  sequence: number,
+  selectionTarget: bigint,
+  subtractFeeOutputs: boolean,
+): COutput[] {
+  const sorted = [...coOutputs].sort((a, b) => {
+    const ha = a.coin.height <= 0 ? Number.POSITIVE_INFINITY : a.coin.height;
+    const hb = b.coin.height <= 0 ? Number.POSITIVE_INFINITY : b.coin.height;
+    return ha - hb;
+  });
+  if (sequence === MAX_BIP125_RBF_SEQUENCE || sequence === 0) {
+    return sorted; // no relative timelock — every coin is a candidate
+  }
+  // No manually pre-selected coins yet, so remain_target == selection_target.
+  // (When coin control lands, subtract the pre-selected inputs' total here.)
+  const capped: COutput[] = [];
+  let total = 0n;
+  for (const co of sorted) {
+    if (total >= selectionTarget) break;
+    capped.push(co);
+    total += subtractFeeOutputs ? co.coin.value : co.effectiveValue;
+  }
+  return capped;
 }
 
 function humanizeSelectionError(error: SelectionError): Error {
@@ -1697,7 +1733,7 @@ export async function createTransaction(
   const feePerByte = await estimateFeeRate(network, electrum);
 
   // Step 6: Coin selection (BnB / Knapsack / SRD) + transaction building.
-  // Reference: libnunchuk wallet::CreateTransaction (spender.cpp:200-511),
+  // Reference: libnunchuk wallet::CreateTransaction (spender.cpp),
   // selector.cpp (run BnB + Knapsack + SRD, choose least waste), coinselection.cpp.
   const inputVBytes = estimateInputVBytes(wallet, network, { miniscriptPlan, taprootKeyPath });
   const coinInputs: CoinInput[] = preparedInputs.map(({ utxo }) => ({
@@ -1717,7 +1753,7 @@ export async function createTransaction(
   const txNoinputsSize = computeTxNoinputsSize([recipientScript.length]);
 
   // Reject a recipient output that is below the dust threshold, before selecting
-  // coins. Reference: spender.cpp:322-332 (IsDust → "Transaction amount too small").
+  // coins. Reference: spender.cpp CreateTransaction (IsDust → "Transaction amount too small").
   const discardFeerate = new CFeeRate(3_000n);
   if (amount < getRecipientDust(recipientScript, discardFeerate)) {
     throw new Error("Transaction amount too small.");
@@ -1745,7 +1781,13 @@ export async function createTransaction(
 
   const notInputFees = selectionParams.effectiveFeerate.getFee(txNoinputsSize);
   const selectionTarget = amount + notInputFees;
-  const sel = selectCoins(coOutputs, selectionTarget, selectionParams);
+  const candidateOutputs = availableCandidates(
+    coOutputs,
+    inputSequence,
+    selectionTarget,
+    selectionParams.subtractFeeOutputs,
+  );
+  const sel = selectCoins(candidateOutputs, selectionTarget, selectionParams);
   if (!("result" in sel)) throw humanizeSelectionError(sel.error);
 
   const selected: PreparedWalletInput[] = sel.result.inputs.map((co) => {
@@ -1756,7 +1798,7 @@ export async function createTransaction(
     return match;
   });
 
-  // Step 7: Settle change + fee against the actual signed vsize (spender.cpp:385-453).
+  // Step 7: Settle change + fee against the actual signed vsize (spender.cpp CreateTransaction).
   const totalIn = selected.reduce((s, p) => s + p.utxo.value, 0n);
   let txChangeAddress: string | null =
     sel.result.getChange(selectionParams.minViableChange, selectionParams.changeFee) > 0n

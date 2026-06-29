@@ -15,6 +15,7 @@ import { finalizeMiniscriptPsbt } from "../miniscript-finalize.js";
 import { signWalletPsbtWithKey } from "../psbt-sign.js";
 import { encryptWalletPayload } from "../wallet-keys.js";
 import {
+  availableCandidates,
   classifyWalletOutput,
   combinePendingPsbt,
   createWalletOutputClassifier,
@@ -25,6 +26,7 @@ import {
   fetchPendingTxInputTimelockMetadataBatch,
   fetchPsbtInputTimelockMetadata,
 } from "../transaction.js";
+import { CFeeRate, makeCOutput, type COutput } from "../coin-selection.js";
 import { createDummyPsbt } from "../platform-key.js";
 import {
   buildWalletDescriptor,
@@ -511,6 +513,59 @@ function createMultiUtxoElectrumMock(
     } as unknown as ElectrumClient,
   };
 }
+
+describe("availableCandidates (remain_target oldest-first cap)", () => {
+  const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
+
+  // feerate 0 → fee 0 → effectiveValue == value, so cap math is exact and obvious.
+  function coinAt(height: number, value: bigint): COutput {
+    return makeCOutput(
+      {
+        txid: "00".repeat(32),
+        vout: 0,
+        value,
+        inputVBytes: 68,
+        height,
+        blocktime: 0,
+        isChange: false,
+      },
+      {
+        effectiveFeerate: new CFeeRate(0n),
+        longTermFeerate: new CFeeRate(0n),
+        currentHeight: 1_000_000,
+      },
+    );
+  }
+
+  const coins = [
+    coinAt(300, 30_000n),
+    coinAt(100, 25_000n),
+    coinAt(-1, 99_000n), // unconfirmed
+    coinAt(200, 20_000n),
+  ];
+
+  it("returns every coin, oldest-confirmed-first, for a normal RBF spend", () => {
+    const result = availableCandidates(coins, MAX_BIP125_RBF_SEQUENCE, 10_000n, false);
+    expect(result.map((c) => c.coin.height)).toEqual([100, 200, 300, -1]);
+  });
+
+  it("does not cap when sequence is 0 (no relative timelock)", () => {
+    const result = availableCandidates(coins, 0, 10_000n, false);
+    expect(result).toHaveLength(coins.length);
+  });
+
+  it("caps a CSV spend to the oldest coins covering the target", () => {
+    // target 40k: oldest-first 25k (h100) + 20k (h200) = 45k >= 40k → stop.
+    const result = availableCandidates(coins, 6, 40_000n, false);
+    expect(result.map((c) => c.coin.height)).toEqual([100, 200]);
+  });
+
+  it("keeps adding oldest coins until the target is met, unconfirmed last", () => {
+    // target 80k: 25k + 20k + 30k = 75k (< 80k) then unconfirmed 99k crosses it.
+    const result = availableCandidates(coins, 6, 80_000n, false);
+    expect(result.map((c) => c.coin.height)).toEqual([100, 200, 300, -1]);
+  });
+});
 
 describe("createTransaction coin selection (multi-UTXO end-to-end)", () => {
   // Sum of every input's value and every output's value, read off the PSBT.
