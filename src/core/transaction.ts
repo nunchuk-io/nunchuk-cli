@@ -1,7 +1,7 @@
 // Transaction operations for group wallets
 // Reference: libnunchuk nunchukimpl.cpp, groupservice.cpp
 
-import { Transaction, bip32Path, selectUTXO, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
+import { Transaction, bip32Path, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
 import { RawPSBTV0, TaprootControlBlock } from "@scure/btc-signer/psbt.js";
 import { base58 } from "@scure/base";
 import { getElectrumServer } from "./config.js";
@@ -52,6 +52,27 @@ import { formatBtc, formatSats, getOutputAddress } from "./format.js";
 import { estimateFeeRate } from "./fees.js";
 import { timelockFromK, type TimelockBased } from "./miniscript.js";
 import { toXOnlyPubkey } from "./taproot.js";
+import type { AddressType } from "./address-type.js";
+import {
+  CFeeRate,
+  makeCOutput,
+  selectCoins,
+  type CoinInput,
+  type SelectionError,
+} from "./coin-selection.js";
+import {
+  CryptoRng,
+  buildCoinSelectionParams,
+  computeTxNoinputsSize,
+} from "./coin-selection-params.js";
+import {
+  buildMiniscriptDummyWitness,
+  buildTaprootMultisigDummyWitness,
+  estimateInputVBytes,
+  getChangeDust,
+  getChangeOutputSize,
+  getChangeScriptLen,
+} from "./coin-input-size.js";
 
 const GAP_LIMIT = 20;
 const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
@@ -881,44 +902,6 @@ function buildPaymentPsbtMetadata(
   return update;
 }
 
-function buildMiniscriptDummyWitness(
-  plan: MiniscriptSpendingPlan,
-  witnessScript: Uint8Array,
-  controlBlock?: Uint8Array,
-): Uint8Array[] {
-  const stack: Uint8Array[] = [];
-  const isTaproot = controlBlock != null;
-  const multisigLeafCount = plan.leafNodes.filter((leaf) => leaf.type === "MULTI").length;
-  const placeholderLeaves =
-    plan.leafNodes.length > 0 ? plan.leafNodes : [{ type: "NONE" as const }];
-
-  for (const leaf of placeholderLeaves) {
-    switch (leaf.type) {
-      case "HASH160":
-      case "HASH256":
-      case "RIPEMD160":
-      case "SHA256":
-        stack.push(new Uint8Array(32));
-        break;
-      default:
-        stack.push(new Uint8Array());
-        break;
-    }
-  }
-  for (let i = 0; i < multisigLeafCount; i++) {
-    stack.push(new Uint8Array());
-  }
-  for (let i = 0; i < plan.requiredSignatures; i++) {
-    stack.push(new Uint8Array(isTaproot ? 64 : 72));
-  }
-
-  stack.push(witnessScript);
-  if (controlBlock) {
-    stack.push(controlBlock);
-  }
-  return stack;
-}
-
 function buildMiniscriptPathSummary(plan: MiniscriptSpendingPlan): MiniscriptPathSummary {
   return {
     index: plan.index,
@@ -1004,22 +987,6 @@ function getDisplaySignerDescriptors(
     signerFingerprints(parsedDescriptor.signers.slice(0, parsedDescriptor.m)),
   );
   return descriptorKeyPathSigners.length > 0 ? descriptorKeyPathSigners : walletSigners;
-}
-
-function buildTaprootKeyPathPlan(
-  parsed: ReturnType<typeof parseDescriptor>,
-): MiniscriptSpendingPlan {
-  return {
-    index: -1,
-    leafNodes: [],
-    lockTime: 0,
-    path: [],
-    preimageRequirements: [],
-    requiredSignatures: parsed.m,
-    sequence: 0,
-    signerNames: parsed.signers.slice(0, parsed.m),
-    supported: true,
-  };
 }
 
 function canSpendTaprootKeyPath(parsed: ReturnType<typeof parseDescriptor>): boolean {
@@ -1364,109 +1331,226 @@ function getMiniscriptPlanProgress(
   return { ready: true, signedCount, signedFingerprints };
 }
 
-function estimateMiniscriptFee(
-  inputs: PreparedWalletInput[],
-  btcNet: typeof NETWORK,
-  toAddress: string,
-  amount: bigint,
-  changeAddress: string,
-  includeChange: boolean,
-  txLockTime: number,
-  plan: MiniscriptSpendingPlan,
-  feePerByte: bigint,
-  taprootKeyPath = false,
-): bigint {
-  const tx = new Transaction({
-    lockTime: txLockTime,
-    allowUnknownInputs: true,
-    disableScriptCheck: true,
-  });
+// m-of-n P2WSH / P2SH-P2WSH multisig dummy witness: OP_0 + m × 72-byte sig + script.
+function buildMultisigP2WSHDummyWitness(m: number, witnessScript: Uint8Array): Uint8Array[] {
+  const stack: Uint8Array[] = [new Uint8Array()];
+  for (let i = 0; i < m; i++) stack.push(new Uint8Array(72));
+  stack.push(witnessScript);
+  return stack;
+}
 
-  const inputIndexes: number[] = [];
-  for (const prepared of inputs) {
-    inputIndexes.push(tx.addInput(prepared.input));
+// scriptSig bytes for a bare P2SH (LEGACY) m-of-n multisig spend:
+//   OP_0 OP_PUSHBYTES_72 <sig_1> ... OP_PUSHBYTES_72 <sig_m> push(redeemScript)
+function buildLegacyMultisigScriptSig(m: number, redeemScript: Uint8Array): Uint8Array {
+  const parts: number[] = [0x00]; // OP_0
+  for (let i = 0; i < m; i++) {
+    parts.push(0x48); // OP_PUSHBYTES_72
+    for (let j = 0; j < 72; j++) parts.push(0x00);
   }
-
-  tx.addOutputAddress(toAddress, amount, btcNet);
-  if (includeChange) {
-    tx.addOutputAddress(changeAddress, 1n, btcNet);
+  if (redeemScript.length <= 75) {
+    parts.push(redeemScript.length);
+  } else if (redeemScript.length <= 255) {
+    parts.push(0x4c, redeemScript.length); // OP_PUSHDATA1
+  } else {
+    parts.push(0x4d, redeemScript.length & 0xff, (redeemScript.length >> 8) & 0xff); // OP_PUSHDATA2
   }
+  for (const b of redeemScript) parts.push(b);
+  return new Uint8Array(parts);
+}
 
-  for (let i = 0; i < inputs.length; i++) {
-    const prepared = inputs[i];
-    const index = inputIndexes[i];
-    if (taprootKeyPath) {
-      tx.updateInput(index, { finalScriptWitness: [new Uint8Array(64)] }, true);
-      continue;
-    }
-
-    if (prepared.payment.witnessScript) {
-      tx.updateInput(
-        index,
-        {
-          finalScriptWitness: buildMiniscriptDummyWitness(plan, prepared.payment.witnessScript),
-        },
-        true,
-      );
-      continue;
-    }
-
-    const tapLeaf = prepared.payment.tapLeafScript?.[0];
-    if (!tapLeaf) {
-      throw new Error("Miniscript wallet input is missing witnessScript or tapLeafScript");
-    }
+function applyMultisigDummyInput(
+  tx: Transaction,
+  inputIndex: number,
+  addressType: AddressType,
+  m: number,
+  n: number,
+  payment: PreparedWalletInput["payment"],
+): void {
+  if (addressType === "NATIVE_SEGWIT" || addressType === "NESTED_SEGWIT") {
+    if (!payment.witnessScript) throw new Error("Multisig input missing witnessScript");
+    tx.updateInput(
+      inputIndex,
+      { finalScriptWitness: buildMultisigP2WSHDummyWitness(m, payment.witnessScript) },
+      true,
+    );
+    return;
+  }
+  if (addressType === "LEGACY") {
+    if (!payment.redeemScript) throw new Error("Legacy multisig input missing redeemScript");
+    tx.updateInput(
+      inputIndex,
+      { finalScriptSig: buildLegacyMultisigScriptSig(m, payment.redeemScript) },
+      true,
+    );
+    return;
+  }
+  if (addressType === "TAPROOT") {
+    const tapLeaf = payment.tapLeafScript?.[0];
+    if (!tapLeaf) throw new Error("Taproot multisig input missing tapLeafScript");
     const [controlBlock, scriptWithVersion] = tapLeaf;
     tx.updateInput(
-      index,
+      inputIndex,
       {
-        finalScriptWitness: buildMiniscriptDummyWitness(
-          plan,
+        finalScriptWitness: buildTaprootMultisigDummyWitness(
+          m,
+          n,
           scriptWithVersion.slice(0, -1),
           TaprootControlBlock.encode(controlBlock),
         ),
       },
       true,
     );
+    return;
   }
-
-  const vsize = Math.ceil(tx.weight / 4);
-  return feePerByte * BigInt(vsize);
+  throw new Error(`Unsupported address type for multisig: ${addressType}`);
 }
 
-function buildMiniscriptTransaction(
-  inputs: PreparedWalletInput[],
-  wallet: WalletData,
-  network: Network,
-  toAddress: string,
-  amount: bigint,
-  changeAddress: string,
-  changeAmount: bigint,
-  nextChangeIndex: number,
-  txLockTime: number,
-  taprootKeyPath = false,
-): Transaction {
-  const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
+// Build a dummy transaction mirroring the fully-signed PSBT and measure its
+// vsize, used to settle the post-selection fee. Handles every wallet type:
+// taproot key-path (single 64-byte Schnorr sig), miniscript v0 / taproot
+// script-path (control block + leaf), and m-of-n multisig.
+function estimateSignedTxVsize(args: {
+  selected: PreparedWalletInput[];
+  wallet: WalletData;
+  network: Network;
+  toAddress: string;
+  amount: bigint;
+  changeAddress: string | null;
+  changeAmount: bigint;
+  txLockTime: number;
+  miniscriptPlan: MiniscriptSpendingPlan | null;
+  taprootKeyPath: boolean;
+}): number {
+  const btcNet = args.network === "mainnet" ? NETWORK : TEST_NETWORK;
   const tx = new Transaction({
-    lockTime: txLockTime,
+    lockTime: args.txLockTime,
     allowUnknownInputs: true,
     disableScriptCheck: true,
   });
 
-  for (const prepared of inputs) {
-    tx.addInput(prepared.input);
+  for (const prepared of args.selected) tx.addInput(prepared.input);
+  tx.addOutputAddress(args.toAddress, args.amount, btcNet);
+  if (args.changeAddress && args.changeAmount > 0n) {
+    tx.addOutputAddress(args.changeAddress, args.changeAmount, btcNet);
   }
 
-  tx.addOutputAddress(toAddress, amount, btcNet);
+  for (let i = 0; i < args.selected.length; i++) {
+    const prepared = args.selected[i];
+    if (args.taprootKeyPath) {
+      tx.updateInput(i, { finalScriptWitness: [new Uint8Array(64)] }, true);
+      continue;
+    }
+    if (args.miniscriptPlan) {
+      if (prepared.payment.witnessScript) {
+        tx.updateInput(
+          i,
+          {
+            finalScriptWitness: buildMiniscriptDummyWitness(
+              args.miniscriptPlan,
+              prepared.payment.witnessScript,
+            ),
+          },
+          true,
+        );
+        continue;
+      }
+      const tapLeaf = prepared.payment.tapLeafScript?.[0];
+      if (!tapLeaf) {
+        throw new Error("Miniscript wallet input is missing witnessScript or tapLeafScript");
+      }
+      const [controlBlock, scriptWithVersion] = tapLeaf;
+      tx.updateInput(
+        i,
+        {
+          finalScriptWitness: buildMiniscriptDummyWitness(
+            args.miniscriptPlan,
+            scriptWithVersion.slice(0, -1),
+            TaprootControlBlock.encode(controlBlock),
+          ),
+        },
+        true,
+      );
+      continue;
+    }
+    applyMultisigDummyInput(
+      tx,
+      i,
+      args.wallet.addressType,
+      args.wallet.m,
+      args.wallet.signers.length,
+      prepared.payment,
+    );
+  }
 
-  if (changeAmount > 0n) {
-    tx.addOutputAddress(changeAddress, changeAmount, btcNet);
+  return Math.ceil(tx.weight / 4);
+}
 
-    const changePayment = deriveDescriptorPayment(wallet.descriptor, network, 1, nextChangeIndex);
-    const outputUpdate = buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath });
-    tx.updateOutput(tx.outputsLength - 1, outputUpdate);
+// Build the unsigned PSBT-ready transaction from the selected inputs, attaching
+// taproot-aware BIP-174 change-output metadata for every wallet type.
+function buildUnifiedTransaction(args: {
+  selected: PreparedWalletInput[];
+  parsed: ReturnType<typeof parseDescriptor>;
+  wallet: WalletData;
+  network: Network;
+  toAddress: string;
+  amount: bigint;
+  changeAddress: string | null;
+  changeAmount: bigint;
+  changeIndex: number;
+  txLockTime: number;
+  taprootKeyPath: boolean;
+}): Transaction {
+  const { parsed } = args;
+  const btcNet = args.network === "mainnet" ? NETWORK : TEST_NETWORK;
+  const tx = new Transaction({
+    lockTime: args.txLockTime,
+    allowUnknownInputs: true,
+    disableScriptCheck: true,
+  });
+
+  for (const prepared of args.selected) tx.addInput(prepared.input);
+  tx.addOutputAddress(args.toAddress, args.amount, btcNet);
+
+  if (args.changeAddress && args.changeAmount > 0n) {
+    tx.addOutputAddress(args.changeAddress, args.changeAmount, btcNet);
+    const changePayment =
+      parsed.kind === "multisig"
+        ? deriveMultisigPayment(
+            parsed.signers,
+            parsed.m,
+            parsed.addressType,
+            args.network,
+            1,
+            args.changeIndex,
+            parsed.taprootWalletTemplate,
+          )
+        : deriveDescriptorPayment(args.wallet.descriptor, args.network, 1, args.changeIndex);
+    tx.updateOutput(
+      tx.outputsLength - 1,
+      buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath: args.taprootKeyPath }),
+    );
   }
 
   return tx;
+}
+
+// Output script for a recipient address — used to size the recipient output
+// when computing the selection target's tx_noinputs_size.
+function getOutputScriptForAddress(address: string, btcNet: typeof NETWORK): Uint8Array {
+  const tx = new Transaction({ allowUnknownInputs: true, disableScriptCheck: true });
+  tx.addOutputAddress(address, 1n, btcNet);
+  const script = tx.getOutput(0).script;
+  if (!script) throw new Error("Unable to derive script for recipient address");
+  return script;
+}
+
+function humanizeSelectionError(error: SelectionError): Error {
+  if (error === "max_weight") {
+    return new Error(
+      "Coin selection failed: the selected inputs would exceed the maximum transaction weight.",
+    );
+  }
+  return new Error("Insufficient funds to cover amount + fee.");
 }
 
 // Create a transaction PSBT with all metadata matching libnunchuk's FillPsbt
@@ -1526,7 +1610,6 @@ export async function createTransaction(
     parsed.kind === "miniscript" && !taprootKeyPath
       ? selectMiniscriptSpendingPlan(parsed.miniscript!, undefined, miniscriptPath)
       : null;
-  const taprootKeyPathPlan = taprootKeyPath ? buildTaprootKeyPathPlan(parsed) : null;
   const inputSequence = miniscriptPlan?.sequence || MAX_BIP125_RBF_SEQUENCE;
   const txLockTime = miniscriptPlan?.lockTime || 0;
 
@@ -1592,133 +1675,133 @@ export async function createTransaction(
   // Reference: NunchukImpl::EstimateFee (nunchukimpl.cpp:1854-1895)
   const feePerByte = await estimateFeeRate(network, electrum);
 
-  // Step 6: Coin selection + transaction building
-  // Reference: wallet::CreateTransaction in spender.cpp:200-511 (BnB + Knapsack)
-  // CLI uses @scure/btc-signer's selectUTXO for MVP
-  let fee = 0n;
-  let tx: Transaction | null = null;
-  let txChangeAddress: string | null = null;
+  // Step 6: Coin selection (BnB / Knapsack / SRD) + transaction building.
+  // Reference: libnunchuk wallet::CreateTransaction (spender.cpp:200-511),
+  // selector.cpp (run BnB + Knapsack + SRD, choose least waste), coinselection.cpp.
+  const inputVBytes = estimateInputVBytes(wallet, network, { miniscriptPlan, taprootKeyPath });
+  const coinInputs: CoinInput[] = preparedInputs.map(({ utxo }) => ({
+    txid: utxo.txHash,
+    vout: utxo.txPos,
+    value: utxo.value,
+    inputVBytes,
+    height: utxo.height,
+    blocktime: utxo.blocktime,
+    isChange: utxo.chain === 1,
+  }));
 
-  if (parsed.kind !== "miniscript") {
-    const result = selectUTXO(
-      preparedInputs.map((prepared) => prepared.input),
-      [{ address: toAddress, amount }],
-      "default",
-      {
-        feePerByte,
-        changeAddress,
-        lockTime: txLockTime,
-        network: btcNet,
-        createTx: true,
-      },
+  const changeOutputSize = getChangeOutputSize(
+    getChangeScriptLen(wallet, network, nextChangeIndex),
+  );
+  const recipientScript = getOutputScriptForAddress(toAddress, btcNet);
+  const txNoinputsSize = computeTxNoinputsSize([recipientScript.length]);
+
+  const selectionParams = buildCoinSelectionParams({
+    feeRate: feePerByte,
+    changeOutputSize,
+    changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, new CFeeRate(3_000n)),
+    txNoinputsSize,
+    paymentValue: amount,
+    subtractFeeOutputs: false,
+    rng: new CryptoRng(),
+  });
+
+  // All wallet coins are our own (from_me) and the eligibility ladder only needs
+  // conf_mine >= 1, so a sentinel depth is sufficient; unconfirmed maps to 0.
+  const coOutputs = coinInputs.map((c) =>
+    makeCOutput(c, {
+      effectiveFeerate: selectionParams.effectiveFeerate,
+      longTermFeerate: selectionParams.longTermFeerate,
+      currentHeight: c.height > 0 ? c.height + 1000 : 0,
+    }),
+  );
+
+  const notInputFees = selectionParams.effectiveFeerate.getFee(txNoinputsSize);
+  const selectionTarget = amount + notInputFees;
+  const sel = selectCoins(coOutputs, selectionTarget, selectionParams);
+  if (!("result" in sel)) throw humanizeSelectionError(sel.error);
+
+  const selected: PreparedWalletInput[] = sel.result.inputs.map((co) => {
+    const match = preparedInputs.find(
+      (p) => p.utxo.txHash === co.coin.txid && p.utxo.txPos === co.coin.vout,
     );
+    if (!match) throw new Error("Internal: selection picked an unknown UTXO");
+    return match;
+  });
 
-    if (!result) {
-      throw new Error("Insufficient funds to cover amount + fee.");
-    }
+  // Step 7: Settle change + fee against the actual signed vsize (spender.cpp:385-453).
+  const totalIn = selected.reduce((s, p) => s + p.utxo.value, 0n);
+  let txChangeAddress: string | null =
+    sel.result.getChange(selectionParams.minViableChange, selectionParams.changeFee) > 0n
+      ? changeAddress
+      : null;
+  let changeAmount =
+    txChangeAddress != null
+      ? totalIn -
+        amount -
+        feePerByte *
+          BigInt(
+            estimateSignedTxVsize({
+              selected,
+              wallet,
+              network,
+              toAddress,
+              amount,
+              changeAddress,
+              changeAmount: sel.result.getChange(
+                selectionParams.minViableChange,
+                selectionParams.changeFee,
+              ),
+              txLockTime,
+              miniscriptPlan: miniscriptPlan ?? null,
+              taprootKeyPath,
+            }),
+          )
+      : 0n;
 
-    tx = result.tx!;
-    fee = result.fee ?? 0n;
-    txChangeAddress = result.change ? changeAddress : null;
-
-    // Step 7: Add metadata to change output (bip32Derivation, witnessScript, redeemScript)
-    // Reference: FillPsbt calls UpdatePSBTOutput for ALL outputs (walletdb.cpp:1096-1099)
-    // BIP-174: outputs should include redeemScript (0x00), witnessScript (0x01), bip32Derivation (0x02)
-    if (result.change) {
-      const changePayment = deriveDescriptorPayment(wallet.descriptor, network, 1, nextChangeIndex);
-      for (let i = 0; i < tx.outputsLength; i++) {
-        const out = tx.getOutput(i);
-        if (out.script && getOutputAddress(out.script, network) === changeAddress) {
-          tx.updateOutput(i, buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath }));
-          break;
-        }
-      }
-    }
-  } else {
-    const selectedPlan = miniscriptPlan ?? taprootKeyPathPlan;
-    if (!selectedPlan) {
-      throw new Error("Unable to select a miniscript signing path");
-    }
-
-    const selected: PreparedWalletInput[] = [];
-    let totalSelected = 0n;
-
-    for (const prepared of preparedInputs) {
-      selected.push(prepared);
-      totalSelected += prepared.utxo.value;
-
-      const feeWithChange = estimateMiniscriptFee(
-        selected,
-        btcNet,
-        toAddress,
-        amount,
-        changeAddress,
-        true,
-        txLockTime,
-        selectedPlan,
-        feePerByte,
-        taprootKeyPath,
-      );
-      const candidateChange = totalSelected - amount - feeWithChange;
-      if (candidateChange >= 546n) {
-        fee = feeWithChange;
-        txChangeAddress = changeAddress;
-        tx = buildMiniscriptTransaction(
-          selected,
-          wallet,
-          network,
-          toAddress,
-          amount,
-          changeAddress,
-          candidateChange,
-          nextChangeIndex,
-          txLockTime,
-          taprootKeyPath,
-        );
-        break;
-      }
-
-      const feeWithoutChange = estimateMiniscriptFee(
-        selected,
-        btcNet,
-        toAddress,
-        amount,
-        changeAddress,
-        false,
-        txLockTime,
-        selectedPlan,
-        feePerByte,
-        taprootKeyPath,
-      );
-      if (totalSelected >= amount + feeWithoutChange) {
-        fee = feeWithoutChange;
-        txChangeAddress = null;
-        tx = buildMiniscriptTransaction(
-          selected,
-          wallet,
-          network,
-          toAddress,
-          amount,
-          changeAddress,
-          0n,
-          nextChangeIndex,
-          txLockTime,
-          taprootKeyPath,
-        );
-        break;
-      }
-    }
-
-    if (!tx) {
-      throw new Error("Insufficient funds to cover amount + fee.");
-    }
+  if (txChangeAddress != null && changeAmount < selectionParams.minViableChange) {
+    // Change fell below the dust/viability threshold after the fee adjustment.
+    txChangeAddress = null;
+    changeAmount = 0n;
   }
+
+  let fee: bigint;
+  if (txChangeAddress != null) {
+    fee = totalIn - amount - changeAmount;
+  } else {
+    const vsizeNoChange = estimateSignedTxVsize({
+      selected,
+      wallet,
+      network,
+      toAddress,
+      amount,
+      changeAddress: null,
+      changeAmount: 0n,
+      txLockTime,
+      miniscriptPlan: miniscriptPlan ?? null,
+      taprootKeyPath,
+    });
+    if (totalIn < amount + feePerByte * BigInt(vsizeNoChange)) {
+      throw new Error("Insufficient funds to cover amount + fee.");
+    }
+    fee = totalIn - amount;
+  }
+
+  const tx: Transaction = buildUnifiedTransaction({
+    selected,
+    parsed,
+    wallet,
+    network,
+    toAddress,
+    amount,
+    changeAddress: txChangeAddress,
+    changeAmount,
+    changeIndex: nextChangeIndex,
+    txLockTime,
+    taprootKeyPath,
+  });
 
   // Step 8: Add global xpubs
   // Reference: FillPsbt stores signer xpubs in PSBT (walletdb.cpp:1101-1119)
-  if (!tx) {
-    throw new Error("Insufficient funds to cover amount + fee.");
-  }
   if (parsed.kind === "miniscript" && preimages.length > 0) {
     addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, preimages);
   }

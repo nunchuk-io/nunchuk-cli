@@ -115,6 +115,51 @@ export function estimateMultisigInputVBytes(
   throw new Error(`Unsupported address type for multisig input estimation: ${addressType}`);
 }
 
+// Witness stack for a taproot multisig (multi_a) spend: one item per key
+// (m 64-byte Schnorr sigs + (n-m) empty), then the leaf script and control block.
+export function buildTaprootMultisigDummyWitness(
+  m: number,
+  n: number,
+  leafScript: Uint8Array,
+  controlBlock: Uint8Array,
+): Uint8Array[] {
+  const stack: Uint8Array[] = [];
+  for (let i = 0; i < n; i++) {
+    stack.push(i < m ? new Uint8Array(SCHNORR_SIG_BYTES) : new Uint8Array());
+  }
+  stack.push(leafScript);
+  stack.push(controlBlock);
+  return stack;
+}
+
+// Taproot multisig spends via a multi_a tapscript leaf (DISABLE_KEY_PATH).
+export function estimateTaprootMultisigInputVBytes(wallet: WalletData, network: Network): number {
+  const payment = deriveMultisigPayment(
+    wallet.signers,
+    wallet.m,
+    wallet.addressType,
+    network,
+    0,
+    0,
+  );
+  const tapLeaf = payment.tapLeafScript?.[0];
+  if (!tapLeaf) {
+    throw new Error("Taproot multisig payment is missing tapLeafScript");
+  }
+  const [controlBlock, scriptWithVersion] = tapLeaf;
+  const witness = buildTaprootMultisigDummyWitness(
+    wallet.m,
+    wallet.signers.length,
+    scriptWithVersion.slice(0, -1), // leaf script (drop version byte)
+    TaprootControlBlock.encode(controlBlock),
+  );
+
+  let witnessSize = compactSizeBytes(witness.length);
+  for (const item of witness) witnessSize += compactSizeBytes(item.length) + item.length;
+  const nonWitness = 32 + 4 + compactSizeBytes(0) + 0 + 4; // empty scriptSig (taproot)
+  return Math.ceil((nonWitness * 4 + witnessSize) / 4);
+}
+
 // -- Miniscript / taproot script-path --
 // Builds a 1-input dummy witness via buildMiniscriptDummyWitness and measures
 // the resulting per-input weight.
@@ -173,6 +218,9 @@ export function estimateInputVBytes(
   }
   const parsed = parseDescriptor(wallet.descriptor);
   if (parsed.kind === "multisig") {
+    if (wallet.addressType === "TAPROOT") {
+      return estimateTaprootMultisigInputVBytes(wallet, network);
+    }
     return estimateMultisigInputVBytes(wallet.m, wallet.signers.length, wallet.addressType);
   }
   if (parsed.kind === "miniscript") {
