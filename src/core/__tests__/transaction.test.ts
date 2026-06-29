@@ -783,6 +783,67 @@ describe("createTransaction privacy (input shuffle + change position)", () => {
   });
 });
 
+describe("createTransaction manual fee rate", () => {
+  const offlineBase = (electrum: ElectrumClient) => ({
+    wallet: TEST_WALLET,
+    network: "testnet" as const,
+    electrum,
+    toAddress: TEST_RECIPIENT,
+    amount: 10_000n,
+  });
+
+  it("uses the manual rate verbatim and scales the fee by it (overriding the estimate)", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const base = offlineBase(electrum);
+      const high = await createTransaction({ ...base, feeRateSatPerKvB: 25_000n }); // 25 sat/vB
+      const low = await createTransaction({ ...base, feeRateSatPerKvB: 5_000n }); // 5 sat/vB
+      const auto = await createTransaction(base); // estimate (~1 sat/vB)
+
+      // Manual rate is used verbatim, not the estimate.
+      expect(high.feeRateSatPerKvB).toBe(25_000n);
+      expect(low.feeRateSatPerKvB).toBe(5_000n);
+      expect(high.feeRateSatPerKvB).not.toBe(auto.feeRateSatPerKvB);
+
+      // fee == getFee(vsize) = rate × vsize / 1000; an integer sat/vB rate divides it.
+      expect(high.fee % 25n).toBe(0n);
+      expect(low.fee % 5n).toBe(0n);
+      expect(high.fee).toBeGreaterThan(low.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("supports a fractional rate (1.5 sat/vB = 1500 sat/kvB)", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const base = offlineBase(electrum);
+      const r1 = await createTransaction({ ...base, feeRateSatPerKvB: 1_000n }); // 1 sat/vB → fee == vsize
+      const r15 = await createTransaction({ ...base, feeRateSatPerKvB: 1_500n }); // 1.5 sat/vB
+      const r2 = await createTransaction({ ...base, feeRateSatPerKvB: 2_000n }); // 2 sat/vB
+
+      expect(r15.feeRateSatPerKvB).toBe(1_500n);
+      // Same single-UTXO tx shape → fee scales with the rate, strictly between 1× and 2×.
+      expect(r15.fee).toBeGreaterThan(r1.fee);
+      expect(r15.fee).toBeLessThan(r2.fee);
+      // fee(1.5) == floor(1.5 × vsize), and vsize == fee at 1 sat/vB.
+      expect(r15.fee).toBe((3n * r1.fee) / 2n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);

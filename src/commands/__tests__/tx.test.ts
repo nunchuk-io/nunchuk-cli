@@ -95,7 +95,7 @@ describe("tx create", () => {
     mockCreateTransaction.mockResolvedValue({
       changeAddress: "bc1qchangeaddress0000000000000000000000000000000000000000",
       fee: 308n,
-      feePerByte: 1n,
+      feeRateSatPerKvB: 1_000n,
       miniscriptPath: {
         index: 0,
         lockTime: 0,
@@ -214,6 +214,38 @@ describe("tx create", () => {
       expect.objectContaining({
         taprootScriptPath: true,
       }),
+    );
+  });
+
+  it("converts a fractional --fee-rate (sat/vB) to sat/kvB", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--fee-rate",
+        "1.5",
+      ],
+      { from: "user" },
+    );
+
+    // 1.5 sat/vB → 1500 sat/kvB (round to nearest).
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ feeRateSatPerKvB: 1_500n }),
     );
   });
 });

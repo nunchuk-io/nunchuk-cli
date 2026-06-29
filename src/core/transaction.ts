@@ -827,6 +827,10 @@ export interface CreateTransactionParams {
   taprootKeyPath?: boolean;
   taprootScriptPath?: boolean;
   preimages?: string[];
+  // Manual fee rate in sat/kvB (Bitcoin Core's CFeeRate unit; e.g. 1.5 sat/vB =
+  // 1500). When > 0 it overrides the auto-estimate; otherwise the rate is
+  // estimated. Mirrors libnunchuk's `fee_rate > 0 ? manual : EstimateFee`.
+  feeRateSatPerKvB?: bigint;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -836,7 +840,8 @@ export interface CreateTransactionResult {
   psbtB64: string;
   txId: string;
   fee: bigint;
-  feePerByte: bigint;
+  // Effective fee rate in sat/kvB (CFeeRate unit). Display as sat/vB by /1000.
+  feeRateSatPerKvB: bigint;
   changeAddress: string | null;
   miniscriptPath?: MiniscriptPathSummary;
 }
@@ -1654,6 +1659,7 @@ export async function createTransaction(
     taprootKeyPath: requestedTaprootKeyPath,
     taprootScriptPath = false,
     preimages = [],
+    feeRateSatPerKvB,
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1757,9 +1763,11 @@ export async function createTransaction(
       : deriveDescriptorAddresses(wallet.descriptor, network, 1, nextChangeIndex, 1);
   const changeAddress = changeAddrs[0];
 
-  // Step 5: Fee estimation from Nunchuk API (hourFee) with Electrum fallback
-  // Reference: NunchukImpl::EstimateFee (nunchukimpl.cpp:1854-1895)
-  const feePerByte = await estimateFeeRate(network, electrum);
+  // Step 5: Fee rate in sat/kvB — a manual rate (> 0) overrides; otherwise
+  // estimate from the Nunchuk API (hourFee) with Electrum fallback.
+  // Reference: nunchukimpl.cpp CreateTransaction (`if (fee_rate <= 0) fee_rate = EstimateFee()`).
+  const usingManualFeeRate = feeRateSatPerKvB != null && feeRateSatPerKvB > 0n;
+  const feeRate = usingManualFeeRate ? feeRateSatPerKvB : await estimateFeeRate(network, electrum);
 
   // Step 6: Coin selection (BnB / Knapsack / SRD) + transaction building.
   // Reference: libnunchuk wallet::CreateTransaction (spender.cpp),
@@ -1789,7 +1797,7 @@ export async function createTransaction(
   }
 
   const selectionParams = buildCoinSelectionParams({
-    feeRate: feePerByte,
+    feeRateSatPerKvB: feeRate,
     changeOutputSize,
     changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, discardFeerate),
     txNoinputsSize,
@@ -1837,24 +1845,23 @@ export async function createTransaction(
     txChangeAddress != null
       ? totalIn -
         amount -
-        feePerByte *
-          BigInt(
-            estimateSignedTxVsize({
-              selected,
-              wallet,
-              network,
-              toAddress,
-              amount,
-              changeAddress,
-              changeAmount: sel.result.getChange(
-                selectionParams.minViableChange,
-                selectionParams.changeFee,
-              ),
-              txLockTime,
-              miniscriptPlan: miniscriptPlan ?? null,
-              taprootKeyPath,
-            }),
-          )
+        selectionParams.effectiveFeerate.getFee(
+          estimateSignedTxVsize({
+            selected,
+            wallet,
+            network,
+            toAddress,
+            amount,
+            changeAddress,
+            changeAmount: sel.result.getChange(
+              selectionParams.minViableChange,
+              selectionParams.changeFee,
+            ),
+            txLockTime,
+            miniscriptPlan: miniscriptPlan ?? null,
+            taprootKeyPath,
+          }),
+        )
       : 0n;
 
   if (txChangeAddress != null && changeAmount < selectionParams.minViableChange) {
@@ -1879,7 +1886,7 @@ export async function createTransaction(
       miniscriptPlan: miniscriptPlan ?? null,
       taprootKeyPath,
     });
-    if (totalIn < amount + feePerByte * BigInt(vsizeNoChange)) {
+    if (totalIn < amount + selectionParams.effectiveFeerate.getFee(vsizeNoChange)) {
       throw new Error("Insufficient funds to cover amount + fee.");
     }
     fee = totalIn - amount;
@@ -1914,7 +1921,7 @@ export async function createTransaction(
     psbtB64,
     txId,
     fee,
-    feePerByte,
+    feeRateSatPerKvB: feeRate,
     changeAddress: txChangeAddress,
     miniscriptPath: miniscriptPlan
       ? {

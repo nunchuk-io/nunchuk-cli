@@ -37,9 +37,10 @@ export async function fetchRecommendedFees(network: Network): Promise<Recommende
   return (await response.json()) as RecommendedFees;
 }
 
-// Estimate fee rate (sat/vB) for the given level using the Nunchuk API, falling
-// back to Electrum. API returns sat/kvB (satoshis per 1000 virtual bytes) — same
-// unit as Bitcoin Core's CFeeRate. Divide by 1000 to get sat/vB.
+// Estimate fee rate in sat/kvB (satoshis per 1000 virtual bytes) for the given
+// level using the Nunchuk API, falling back to Electrum. sat/kvB is Bitcoin
+// Core's CFeeRate unit; keeping this resolution (rather than rounding to sat/vB)
+// lets callers express fractional sat/vB rates such as 1.5 (= 1500 sat/kvB).
 export async function estimateFeeRate(
   network: Network,
   electrum: ElectrumClient,
@@ -47,9 +48,9 @@ export async function estimateFeeRate(
 ): Promise<bigint> {
   try {
     const fees = await fetchRecommendedFees(network);
-    const rate = fees[FEE_FIELD[level]];
+    const rate = fees[FEE_FIELD[level]]; // sat/kvB
     if (rate > 0) {
-      return BigInt(Math.ceil(rate / 1000));
+      return BigInt(Math.ceil(rate));
     }
   } catch {
     // API unavailable — fall through to Electrum
@@ -57,7 +58,7 @@ export async function estimateFeeRate(
 
   const btcPerKb = await electrum.estimateFee(FEE_CONF_TARGET[level]);
   if (btcPerKb <= 0) {
-    return 1n;
+    return 1000n; // 1 sat/vB floor
   }
-  return BigInt(Math.ceil(btcPerKb * 100_000));
+  return BigInt(Math.ceil(btcPerKb * 100_000_000)); // BTC/kvB → sat/kvB
 }

@@ -287,9 +287,10 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 nunchuk tx create --wallet <id> --to <address> --amount <sats>
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --miniscript-path 0
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --taproot-script-path  # taproot script-path spend
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --fee-rate 1.5          # manual fee rate (sat/vB, fractional ok)
 ```
 
-Fee rate is automatically estimated from the Nunchuk API. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
+Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
 
 #### `tx sign`
 

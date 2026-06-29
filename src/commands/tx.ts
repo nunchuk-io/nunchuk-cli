@@ -54,6 +54,28 @@ function parseMiniscriptPathOption(value: string): number {
   return parsed;
 }
 
+// Parse --fee-rate as a decimal sat/vB and convert to integer sat/kvB (CFeeRate
+// unit), rounding to the nearest sat/kvB. So 1.5 sat/vB → 1500, 12 → 12000.
+function parseFeeRateOption(value: string): bigint {
+  const satPerVb = Number(value);
+  if (!Number.isFinite(satPerVb) || satPerVb <= 0) {
+    throw new InvalidArgumentError("--fee-rate must be a positive number in sat/vB (e.g. 1.5)");
+  }
+  const satPerKvB = BigInt(Math.round(satPerVb * 1000));
+  if (satPerKvB <= 0n) {
+    throw new InvalidArgumentError("--fee-rate is too small (rounds to 0)");
+  }
+  return satPerKvB;
+}
+
+// Render a sat/kvB rate as sat/vB for display, trimming trailing zeros
+// (1500 → "1.5", 12000 → "12", 1235 → "1.235").
+function formatFeeRateSatPerVb(satPerKvB: bigint): string {
+  const whole = satPerKvB / 1000n;
+  const frac = (satPerKvB % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
+  return frac.length > 0 ? `${whole}.${frac}` : whole.toString();
+}
+
 function parsePreimageOption(value: string, previous: string[]): string[] {
   const next = value
     .split(",")
@@ -351,6 +373,11 @@ txCommand
     "--taproot-script-path",
     "Spend a taproot wallet through its script path; key path is the default when available",
   )
+  .option(
+    "--fee-rate <sat/vB>",
+    "Manual fee rate in sat/vB (default: auto-estimate)",
+    parseFeeRateOption,
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -379,7 +406,8 @@ txCommand
           miniscriptPath: options.miniscriptPath,
           taprootScriptPath: options.taprootScriptPath,
           preimages: options.preimage,
-          // Fee rate always estimated from Nunchuk API (with Electrum fallback)
+          // Manual fee rate (sat/kvB) when --fee-rate is given; else auto-estimate.
+          feeRateSatPerKvB: options.feeRate,
         });
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
@@ -395,7 +423,9 @@ txCommand
           print(
             {
               txId: result.txId,
-              feeRate: result.feePerByte.toString(),
+              feeRate: formatFeeRateSatPerVb(result.feeRateSatPerKvB),
+              feeRateSatPerKvB: result.feeRateSatPerKvB.toString(),
+              feeRateManual: Boolean(options.feeRate),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
@@ -410,7 +440,11 @@ txCommand
 
         console.log("Transaction created and uploaded to group server.");
         console.log(`  Transaction ID: ${result.txId}`);
-        console.log(`  Fee rate: ${result.feePerByte} sat/vB`);
+        console.log(
+          `  Fee rate: ${formatFeeRateSatPerVb(result.feeRateSatPerKvB)} sat/vB${
+            options.feeRate ? " (manual)" : ""
+          }`,
+        );
         console.log(`  Fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})`);
         console.log(`  Recipient: ${options.to}`);
         console.log(`  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})`);

@@ -857,8 +857,9 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 | `--miniscript-path <index>` | No       | Select a miniscript signing path by index                           |
 | `--taproot-script-path`     | No       | Spend a taproot wallet through its script path instead of the key path |
 | `--preimage <hex>`          | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
+| `--fee-rate <sat/vB>`       | No       | Manual fee rate in sat/vB; overrides the auto-estimate              |
 
-Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback).
+Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback), unless `--fee-rate <sat/vB>` is given to set it manually. The value is a positive number in sat/vB and may be fractional (e.g. `1.5`); it is applied at sat/kvB precision.
 
 For miniscript wallets, the CLI selects the first satisfiable supported path with the fewest preimage requirements unless `--miniscript-path` is provided. The selected path sets transaction locktime and input sequence when required.
 

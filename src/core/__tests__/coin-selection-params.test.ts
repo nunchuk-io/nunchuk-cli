@@ -77,7 +77,7 @@ describe("getDustThreshold", () => {
 
 describe("buildCoinSelectionParams", () => {
   const baseArgs = () => ({
-    feeRate: 5n, // sat/vB → 5000 sat/kvB
+    feeRateSatPerKvB: 5_000n, // 5 sat/vB
     changeOutputSize: 43, // P2WSH change
     changeOutputDust: 330n,
     txNoinputsSize: 42,

@@ -28,25 +28,25 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("estimateFeeRate", () => {
-  it("maps economy → hourFee (sat/kvB → sat/vB)", async () => {
+describe("estimateFeeRate (sat/kvB)", () => {
+  it("maps economy → hourFee", async () => {
     mockFetchOk(RECOMMENDED);
-    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "economy")).toBe(10n);
+    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "economy")).toBe(10_000n);
   });
 
   it("maps standard → halfHourFee", async () => {
     mockFetchOk(RECOMMENDED);
-    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "standard")).toBe(20n);
+    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "standard")).toBe(20_000n);
   });
 
   it("maps priority → fastestFee", async () => {
     mockFetchOk(RECOMMENDED);
-    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "priority")).toBe(30n);
+    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "priority")).toBe(30_000n);
   });
 
   it("defaults to economy when no level is given", async () => {
     mockFetchOk(RECOMMENDED);
-    expect(await estimateFeeRate("mainnet", fakeElectrum(0))).toBe(10n);
+    expect(await estimateFeeRate("mainnet", fakeElectrum(0))).toBe(10_000n);
   });
 
   it("falls back to Electrum with the level's conf_target when the API fails", async () => {
@@ -54,16 +54,16 @@ describe("estimateFeeRate", () => {
       "fetch",
       vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })),
     );
-    const electrum = fakeElectrum(0.000_05); // 0.00005 BTC/kvB → 5 sat/vB
-    expect(await estimateFeeRate("mainnet", electrum, "priority")).toBe(5n);
+    const electrum = fakeElectrum(0.000_05); // 0.00005 BTC/kvB → 5000 sat/kvB
+    expect(await estimateFeeRate("mainnet", electrum, "priority")).toBe(5_000n);
     expect(electrum.estimateFee).toHaveBeenCalledWith(2);
   });
 
-  it("returns 1 sat/vB when both API and Electrum yield nothing", async () => {
+  it("returns the 1 sat/vB floor (1000 sat/kvB) when both API and Electrum yield nothing", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })),
     );
-    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "economy")).toBe(1n);
+    expect(await estimateFeeRate("mainnet", fakeElectrum(0), "economy")).toBe(1_000n);
   });
 });

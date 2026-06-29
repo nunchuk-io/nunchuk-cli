@@ -128,8 +128,8 @@ export function computeTxNoinputsSize(recipientScriptLens: number[]): number {
 // -- CoinSelectionParams builder --
 
 export interface BuildCoinSelectionParamsArgs {
-  // Sats per vbyte (CLI / mempool unit). Converted to sat/kvB internally.
-  feeRate: bigint;
+  // Effective fee rate in sat/kvB (Bitcoin Core's CFeeRate unit).
+  feeRateSatPerKvB: bigint;
   // Optional overrides (default to libnunchuk's pinned values).
   longTermFeerateSatPerKvB?: bigint;
   discardFeerateSatPerKvB?: bigint;
@@ -153,7 +153,7 @@ export interface BuildCoinSelectionParamsArgs {
 
 export function buildCoinSelectionParams(args: BuildCoinSelectionParamsArgs): CoinSelectionParams {
   const subtractFeeOutputs = args.subtractFeeOutputs ?? false;
-  const effectiveFeerate = new CFeeRate(args.feeRate * 1000n);
+  const effectiveFeerate = new CFeeRate(args.feeRateSatPerKvB);
   const longTermFeerate = new CFeeRate(
     args.longTermFeerateSatPerKvB ?? DEFAULT_LONG_TERM_FEERATE_SAT_PER_KVB,
   );
