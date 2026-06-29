@@ -64,6 +64,7 @@ import {
   CryptoRng,
   buildCoinSelectionParams,
   computeTxNoinputsSize,
+  getDustThreshold,
 } from "./coin-selection-params.js";
 import {
   buildMiniscriptDummyWitness,
@@ -1544,6 +1545,26 @@ function getOutputScriptForAddress(address: string, btcNet: typeof NETWORK): Uin
   return script;
 }
 
+// BIP141 witness-program shape for an arbitrary scriptPubKey: a 1-byte version
+// opcode (OP_0, or OP_1..OP_16) followed by a single push of 2..40 bytes. Used
+// to apply the witness discount in the recipient dust threshold.
+function isWitnessProgramScript(script: Uint8Array): boolean {
+  if (script.length < 4 || script.length > 42) return false;
+  const version = script[0];
+  if (version !== 0x00 && (version < 0x51 || version > 0x60)) return false;
+  return script[1] === script.length - 2;
+}
+
+// Dust threshold for a recipient output paying `script`, at the discard feerate.
+// Mirrors Bitcoin Core's IsDust(txout, m_discard_feerate) (spender.cpp:328).
+function getRecipientDust(script: Uint8Array, discardFeerate: CFeeRate): bigint {
+  return getDustThreshold(
+    getChangeOutputSize(script.length),
+    isWitnessProgramScript(script),
+    discardFeerate,
+  );
+}
+
 function humanizeSelectionError(error: SelectionError): Error {
   if (error === "max_weight") {
     return new Error(
@@ -1695,10 +1716,17 @@ export async function createTransaction(
   const recipientScript = getOutputScriptForAddress(toAddress, btcNet);
   const txNoinputsSize = computeTxNoinputsSize([recipientScript.length]);
 
+  // Reject a recipient output that is below the dust threshold, before selecting
+  // coins. Reference: spender.cpp:322-332 (IsDust → "Transaction amount too small").
+  const discardFeerate = new CFeeRate(3_000n);
+  if (amount < getRecipientDust(recipientScript, discardFeerate)) {
+    throw new Error("Transaction amount too small.");
+  }
+
   const selectionParams = buildCoinSelectionParams({
     feeRate: feePerByte,
     changeOutputSize,
-    changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, new CFeeRate(3_000n)),
+    changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, discardFeerate),
     txNoinputsSize,
     paymentValue: amount,
     subtractFeeOutputs: false,

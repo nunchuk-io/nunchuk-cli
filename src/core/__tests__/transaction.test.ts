@@ -615,6 +615,29 @@ describe("createTransaction coin selection (multi-UTXO end-to-end)", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("rejects a recipient amount below the dust threshold", async () => {
+    // TEST_RECIPIENT is a P2WSH output → ~330 sat dust at the 3000 sat/kvB discard rate.
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 100n,
+        }),
+      ).rejects.toThrow(/too small/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 describe("createTransaction multisig", () => {
