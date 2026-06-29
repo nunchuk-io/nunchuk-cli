@@ -16,7 +16,6 @@ import {
 import type { ElectrumClient } from "../electrum.js";
 import type { Profile, WalletData } from "../storage.js";
 import { listCoins, raiseStatus, type CoinStatus } from "../coins.js";
-import { setCoinLock, setCoinMemo } from "../coin-store.js";
 
 const TEST_RUN_ID = crypto.randomBytes(4).toString("hex");
 const TEST_HOME = path.join(os.tmpdir(), "nunchuk-cli-coins", TEST_RUN_ID);
@@ -161,7 +160,7 @@ describe("listCoins", () => {
       { value: 100_000n, height: 100, chain: 0, index: 0 },
       { value: 50_000n, height: 0, chain: 0, index: 1 }, // unconfirmed
     ]);
-    const coins = await listCoins({ email, wallet: WALLET, network: "testnet", electrum });
+    const coins = await listCoins({ wallet: WALLET, network: "testnet", electrum });
     expect(coins).toHaveLength(2);
     const byHeight = Object.fromEntries(coins.map((c) => [c.height, c.status]));
     expect(byHeight[100]).toBe("CONFIRMED");
@@ -172,32 +171,16 @@ describe("listCoins", () => {
     const email = uniqueEmail();
     saveProfile(email, "testnet", { ...FAKE_PROFILE, email });
     const { electrum } = mockElectrum([{ value: 100_000n, height: 100, chain: 1, index: 0 }]);
-    const coins = await listCoins({ email, wallet: WALLET, network: "testnet", electrum });
+    const coins = await listCoins({ wallet: WALLET, network: "testnet", electrum });
     expect(coins).toHaveLength(1);
     expect(coins[0].isChange).toBe(true);
-  });
-
-  it("joins memo and lock state from coin-store", async () => {
-    const email = uniqueEmail();
-    saveProfile(email, "testnet", { ...FAKE_PROFILE, email });
-    const { electrum, outpoints } = mockElectrum([
-      { value: 100_000n, height: 100, chain: 0, index: 0 },
-    ]);
-    const op = outpoints[0];
-    setCoinMemo(email, "testnet", WALLET.walletId, op.txid, op.vout, "rent");
-    setCoinLock(email, "testnet", WALLET.walletId, op.txid, op.vout, true);
-
-    const coins = await listCoins({ email, wallet: WALLET, network: "testnet", electrum });
-    expect(coins).toHaveLength(1);
-    expect(coins[0].memo).toBe("rent");
-    expect(coins[0].locked).toBe(true);
   });
 
   it("computes confirmations relative to the chain tip", async () => {
     const email = uniqueEmail();
     saveProfile(email, "testnet", { ...FAKE_PROFILE, email });
     const { electrum } = mockElectrum([{ value: 100_000n, height: 849_991, chain: 0, index: 0 }]);
-    const coins = await listCoins({ email, wallet: WALLET, network: "testnet", electrum });
+    const coins = await listCoins({ wallet: WALLET, network: "testnet", electrum });
     // tip = 850_000 → confirmations = 850_000 - 849_991 + 1 = 10
     expect(coins[0].confirmations).toBe(10);
   });

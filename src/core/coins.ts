@@ -16,7 +16,6 @@ import type { ApiClient } from "./api-client.js";
 import type { ElectrumClient } from "./electrum.js";
 import type { Network } from "./config.js";
 import type { WalletData } from "./storage.js";
-import { listCoinMeta } from "./coin-store.js";
 import {
   decodePsbtDetail,
   fetchPendingTransactions,
@@ -41,8 +40,6 @@ export interface CoinDetail {
   confirmations: number;
   status: CoinStatus;
   isChange: boolean;
-  memo: string | null;
-  locked: boolean;
 }
 
 const STATUS_RANK: Record<CoinStatus, number> = {
@@ -63,7 +60,6 @@ function outpointKey(txid: string, vout: number): string {
 }
 
 export async function listCoins(args: {
-  email: string;
   wallet: WalletData;
   network: Network;
   electrum: ElectrumClient;
@@ -90,8 +86,6 @@ export async function listCoins(args: {
       confirmations: utxo.height > 0 ? Math.max(0, tipHeight - utxo.height + 1) : 0,
       status,
       isChange: utxo.chain === 1,
-      memo: null,
-      locked: false,
     });
   }
 
@@ -131,14 +125,6 @@ export async function listCoins(args: {
         coin.status = raiseStatus(coin.status, candidate);
       }
     }
-  }
-
-  const metas = listCoinMeta(args.email, args.network, args.wallet.walletId);
-  for (const meta of metas) {
-    const coin = coins.get(outpointKey(meta.txid, meta.vout));
-    if (!coin) continue;
-    coin.memo = meta.memo;
-    coin.locked = meta.locked;
   }
 
   return [...coins.values()].sort((a, b) =>

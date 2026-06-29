@@ -400,7 +400,7 @@ describe("wallet storage", () => {
     const stored = JSON.parse(
       decrypt(Buffer.from(row.encrypted), getOrCreateMasterKey()),
     ) as Record<string, unknown>;
-    expect(version.value).toBe("5");
+    expect(version.value).toBe("4");
     expect(stored.descriptor).toBe(wallet.descriptor);
     expect(stored.m).toBeUndefined();
     expect(stored.n).toBeUndefined();
@@ -628,7 +628,7 @@ describe("encrypted storage properties", () => {
       | undefined;
     db.close();
 
-    expect(row?.value).toBe("5");
+    expect(row?.value).toBe("4");
   });
 
   it("stores encrypted profile blobs in meta", () => {

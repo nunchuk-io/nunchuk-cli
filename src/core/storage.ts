@@ -14,7 +14,7 @@ import {
 } from "./paths.js";
 
 const ENCRYPTION_VERSION = 0x01;
-const STORAGE_SCHEMA_VERSION = 5;
+const STORAGE_SCHEMA_VERSION = 4;
 const STORAGE_SCHEMA_VERSION_KEY = "schema_version";
 const PROFILE_META_KEY = "profile";
 const HKDF_INFO = "nunchuk-cli/storage/v1";
@@ -238,15 +238,6 @@ function createSchemaTables(db: Database.Database): void {
       encrypted BLOB NOT NULL,
       created_at TEXT NOT NULL,
       PRIMARY KEY (nonce_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS coins (
-      wallet_id TEXT NOT NULL,
-      txid      TEXT NOT NULL,
-      vout      INTEGER NOT NULL,
-      memo      TEXT,
-      locked    INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (wallet_id, txid, vout)
     );
   `);
 }
