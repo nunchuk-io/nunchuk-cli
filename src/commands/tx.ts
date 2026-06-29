@@ -401,6 +401,10 @@ txCommand
     `Fee level for auto-estimate: ${FEE_LEVELS.join(", ")} (overrides saved default; ignored with --fee-rate)`,
     parseFeeLevelOption,
   )
+  .option(
+    "--anti-fee-sniping",
+    "Pin nLockTime to the current block height (a spending path's own locktime takes precedence)",
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -437,6 +441,7 @@ txCommand
           // Manual fee rate (sat/kvB) when --fee-rate is given; else auto-estimate.
           feeRateSatPerKvB: options.feeRate,
           feeLevel,
+          antiFeeSniping: Boolean(options.antiFeeSniping),
         });
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
@@ -456,6 +461,8 @@ txCommand
               feeRateSatPerKvB: result.feeRateSatPerKvB.toString(),
               feeRateManual: Boolean(options.feeRate),
               feeLevel: result.feeLevel ?? null,
+              antiFeeSniping: Boolean(options.antiFeeSniping),
+              lockTime: result.lockTime,
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
@@ -480,6 +487,9 @@ txCommand
         console.log(`  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})`);
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
+        }
+        if (options.antiFeeSniping) {
+          console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
         }
         const selectedMiniscriptPath = result.miniscriptPath ?? detail?.miniscriptPath;
         printMiniscriptPathSummary(selectedMiniscriptPath);

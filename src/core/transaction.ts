@@ -834,6 +834,10 @@ export interface CreateTransactionParams {
   // Fee level for the auto-estimate path (priority / standard / economy).
   // Ignored when a manual `feeRateSatPerKvB` is supplied. Defaults to economy.
   feeLevel?: FeeLevel;
+  // Pin nLockTime to the current block height to deter fee sniping. A spending
+  // path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY
+  // condition) always takes precedence.
+  antiFeeSniping?: boolean;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -848,6 +852,9 @@ export interface CreateTransactionResult {
   // The fee level used for the auto-estimate, or undefined when a manual rate
   // was supplied. Lets the command label output (e.g. "3 sat/vB (economy)").
   feeLevel?: FeeLevel;
+  // The transaction's nLockTime (0 when none was applied). Reflects a spending
+  // path's absolute locktime or the anti-fee-sniping chain-tip height.
+  lockTime: number;
   changeAddress: string | null;
   miniscriptPath?: MiniscriptPathSummary;
 }
@@ -1667,6 +1674,7 @@ export async function createTransaction(
     preimages = [],
     feeRateSatPerKvB,
     feeLevel = DEFAULT_FEE_LEVEL,
+    antiFeeSniping = false,
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1710,7 +1718,17 @@ export async function createTransaction(
       ? selectMiniscriptSpendingPlan(parsed.miniscript!, undefined, miniscriptPath)
       : null;
   const inputSequence = miniscriptPlan?.sequence || MAX_BIP125_RBF_SEQUENCE;
-  const txLockTime = miniscriptPlan?.lockTime || 0;
+  // Anti-fee sniping: pin nLockTime to the current block height so this
+  // transaction has no fee-sniping advantage over a competitor at the same
+  // height. A spending path's own absolute locktime (an `after` /
+  // OP_CHECKLOCKTIMEVERIFY condition) takes precedence; we only fill in a tip
+  // height when the locktime would otherwise be 0. The default input sequence
+  // (MAX_BIP125_RBF_SEQUENCE) is < 0xFFFFFFFF, so the locktime is enforced.
+  // Reference: nunchukimpl.cpp CreateTransaction (`locktime == 0 && anti_fee_sniping`).
+  let txLockTime = miniscriptPlan?.lockTime || 0;
+  if (txLockTime === 0 && antiFeeSniping) {
+    txLockTime = (await electrum.headersSubscribe()).height;
+  }
 
   // Step 1: Scan UTXOs
   const { utxos, nextChangeIndex } = await scanUtxos(wallet, network, electrum);
@@ -1932,6 +1950,7 @@ export async function createTransaction(
     fee,
     feeRateSatPerKvB: feeRate,
     feeLevel: usingManualFeeRate ? undefined : feeLevel,
+    lockTime: txLockTime,
     changeAddress: txChangeAddress,
     miniscriptPath: miniscriptPlan
       ? {

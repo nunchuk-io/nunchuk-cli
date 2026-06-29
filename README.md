@@ -290,9 +290,12 @@ nunchuk tx create --wallet <id> --to <address> --amount <sats> --miniscript-path
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --taproot-script-path  # taproot script-path spend
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --fee-rate 1.5          # manual fee rate (sat/vB, fractional ok)
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --fee-level priority    # auto-estimate at a fee level
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --anti-fee-sniping      # pin nLockTime to the chain tip
 ```
 
 Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. When auto-estimating, the **level** is `--fee-level <economy|standard|priority>` (one-shot), else the account's saved default (`config fee-rate set`), else `economy`; `--fee-rate` overrides the level. Run [`tx fees`](#tx-fees) to see the current rates for each level. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
+
+`--anti-fee-sniping` pins the transaction's `nLockTime` to the current block height so the transaction has no fee-sniping advantage over a competitor at the same height. A spending path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY condition) always takes precedence; the flag only fills a locktime that would otherwise be 0.
 
 #### `tx fees`
 

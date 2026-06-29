@@ -916,6 +916,131 @@ describe("createTransaction fee level", () => {
   });
 });
 
+describe("createTransaction anti-fee sniping", () => {
+  const offline = () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return () => {
+      globalThis.fetch = originalFetch;
+    };
+  };
+
+  it("pins nLockTime to the chain tip when no path locktime exists", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        antiFeeSniping: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(headersSubscribe).toHaveBeenCalled();
+      expect(result.lockTime).toBe(850_000);
+      expect(tx.lockTime).toBe(850_000);
+      // Default Replace-By-Fee sequence (< 0xFFFFFFFF) keeps the locktime enforced.
+      expect(tx.getInput(0).sequence).toBe(0xfffffffd);
+    } finally {
+      restore();
+    }
+  });
+
+  it("leaves nLockTime at 0 when anti-fee sniping is off", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      expect(headersSubscribe).not.toHaveBeenCalled();
+      expect(result.lockTime).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps a path's absolute locktime instead of the chain tip", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[0]],
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        antiFeeSniping: true,
+      });
+      // The path's absolute locktime wins; the chain tip is never consulted.
+      expect(headersSubscribe).not.toHaveBeenCalled();
+      expect(result.lockTime).toBe(144);
+    } finally {
+      restore();
+    }
+  });
+
+  it("still fills the chain-tip locktime for a relative-timelock-only path", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[0]],
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        antiFeeSniping: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      // A relative timelock sets the input sequence, not the locktime, so
+      // anti-fee sniping still fills the locktime.
+      expect(result.lockTime).toBe(850_000);
+      expect(tx.lockTime).toBe(850_000);
+      expect(tx.getInput(0).sequence).toBe(10);
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
