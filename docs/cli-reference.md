@@ -860,10 +860,13 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 | `--fee-rate <sat/vB>`       | No       | Manual fee rate in sat/vB; overrides the auto-estimate              |
 | `--fee-level <level>`       | No       | Fee level for the auto-estimate: `economy`, `standard`, or `priority` |
 | `--anti-fee-sniping`        | No       | Pin `nLockTime` to the current block height (a path's own locktime wins) |
+| `--subtract-fee`            | No       | Subtract the network fee from the amount (recipient receives amount minus fee) |
 
 Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback), unless `--fee-rate <sat/vB>` is given to set it manually. The value is a positive number in sat/vB and may be fractional (e.g. `1.5`); it is applied at sat/kvB precision.
 
 When auto-estimating, the fee **level** is resolved by precedence: `--fee-level <economy|standard|priority>` (one-shot) > the account's saved default (`nunchuk config fee-rate set <level>`) > the built-in default `economy`. A manual `--fee-rate` overrides the level entirely. The three levels map to the API's `hourFee` (economy), `halfHourFee` (standard), and `fastestFee` (priority); on the Electrum fallback they use `conf_target` 6 / 3 / 2. See [`tx fees`](#nunchuk-tx-fees) to view the current rate for each level.
+
+**Subtract fee from amount.** `--subtract-fee` takes the network fee out of the recipient amount instead of adding it on top of the inputs. The recipient receives `amount - fee`, while the wallet's total spend stays at `amount`. With a change output the recipient gets `amount - fee` and change holds the remainder; without change the would-be change folds into the recipient, which then receives `total inputs - fee`. The send is rejected when the amount cannot cover the fee (`The transaction amount is too small to pay the fee.`) or the reduced recipient output would fall below the dust threshold (`The transaction amount is too small to send after the fee has been deducted.`). The output reports the reduced value (`Recipient receives: <btc>`) and the `recipientAmount` / `subtractFee` JSON fields.
 
 **Anti-fee sniping.** `--anti-fee-sniping` pins the transaction's `nLockTime` to the current block height so the transaction offers no advantage to a miner who might reorganize recent blocks to claim its fee. A spending path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY condition) always takes precedence — the flag only fills a locktime that would otherwise be 0, so a path with a relative timelock (an `older` / OP_CHECKSEQUENCEVERIFY condition, which sets the input sequence instead) still receives a chain-tip locktime. The default input sequence enforces the locktime, and it adds no virtual size, so fees are unchanged. The effective locktime is shown in the output (`Anti-fee sniping: locktime <height>`) and the `lockTime` JSON field. It costs one extra Electrum call (`headersSubscribe`) on the connection `tx create` already holds open.
 
@@ -881,6 +884,7 @@ nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --preimage <32-byte
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --fee-rate 1.5
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --fee-level priority
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --anti-fee-sniping
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --subtract-fee
 ```
 
 ### `nunchuk tx fees`

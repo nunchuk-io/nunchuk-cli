@@ -405,6 +405,10 @@ txCommand
     "--anti-fee-sniping",
     "Pin nLockTime to the current block height (a spending path's own locktime takes precedence)",
   )
+  .option(
+    "--subtract-fee",
+    "Subtract the network fee from the amount so the recipient receives amount minus fee",
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -442,6 +446,7 @@ txCommand
           feeRateSatPerKvB: options.feeRate,
           feeLevel,
           antiFeeSniping: Boolean(options.antiFeeSniping),
+          subtractFeeFromAmount: Boolean(options.subtractFee),
         });
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
@@ -463,6 +468,8 @@ txCommand
               feeLevel: result.feeLevel ?? null,
               antiFeeSniping: Boolean(options.antiFeeSniping),
               lockTime: result.lockTime,
+              subtractFee: result.subtractFee,
+              recipientAmount: result.recipientAmount.toString(),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
@@ -485,6 +492,13 @@ txCommand
         console.log(`  Fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})`);
         console.log(`  Recipient: ${options.to}`);
         console.log(`  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})`);
+        if (result.subtractFee) {
+          console.log(
+            `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
+              result.recipientAmount,
+            )})`,
+          );
+        }
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
         }

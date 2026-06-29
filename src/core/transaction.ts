@@ -829,7 +829,7 @@ export interface CreateTransactionParams {
   preimages?: string[];
   // Manual fee rate in sat/kvB (Bitcoin Core's CFeeRate unit; e.g. 1.5 sat/vB =
   // 1500). When > 0 it overrides the auto-estimate; otherwise the rate is
-  // estimated. Mirrors libnunchuk's `fee_rate > 0 ? manual : EstimateFee`.
+  // estimated.
   feeRateSatPerKvB?: bigint;
   // Fee level for the auto-estimate path (priority / standard / economy).
   // Ignored when a manual `feeRateSatPerKvB` is supplied. Defaults to economy.
@@ -838,6 +838,10 @@ export interface CreateTransactionParams {
   // path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY
   // condition) always takes precedence.
   antiFeeSniping?: boolean;
+  // Subtract the network fee from the recipient amount instead of adding it on
+  // top, so the recipient receives `amount - fee`. The wallet's total spend
+  // stays at `amount`.
+  subtractFeeFromAmount?: boolean;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -855,6 +859,11 @@ export interface CreateTransactionResult {
   // The transaction's nLockTime (0 when none was applied). Reflects a spending
   // path's absolute locktime or the anti-fee-sniping chain-tip height.
   lockTime: number;
+  // True when the fee was subtracted from the recipient amount.
+  subtractFee: boolean;
+  // The amount actually sent to the recipient. Equals the requested amount
+  // unless the fee was subtracted from it, in which case it is reduced by the fee.
+  recipientAmount: bigint;
   changeAddress: string | null;
   miniscriptPath?: MiniscriptPathSummary;
 }
@@ -1675,6 +1684,7 @@ export async function createTransaction(
     feeRateSatPerKvB,
     feeLevel = DEFAULT_FEE_LEVEL,
     antiFeeSniping = false,
+    subtractFeeFromAmount = false,
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1829,7 +1839,7 @@ export async function createTransaction(
     changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, discardFeerate),
     txNoinputsSize,
     paymentValue: amount,
-    subtractFeeOutputs: false,
+    subtractFeeOutputs: subtractFeeFromAmount,
     rng,
   });
 
@@ -1843,7 +1853,13 @@ export async function createTransaction(
     }),
   );
 
-  const notInputFees = selectionParams.effectiveFeerate.getFee(txNoinputsSize);
+  // When the fee is subtracted from the recipient amount, inputs only need to
+  // cover the amount itself — the fee comes out of the recipient output, so the
+  // not-input fees drop out of the selection target (spender.cpp: not_input_fees
+  // = getFee(subtract_fee_outputs ? 0 : tx_noinputs_size)).
+  const notInputFees = selectionParams.effectiveFeerate.getFee(
+    subtractFeeFromAmount ? 0 : txNoinputsSize,
+  );
   const selectionTarget = amount + notInputFees;
   const candidateOutputs = availableCandidates(
     coOutputs,
@@ -1864,59 +1880,106 @@ export async function createTransaction(
 
   // Step 7: Settle change + fee against the actual signed vsize (spender.cpp CreateTransaction).
   const totalIn = selected.reduce((s, p) => s + p.utxo.value, 0n);
-  let txChangeAddress: string | null =
-    sel.result.getChange(selectionParams.minViableChange, selectionParams.changeFee) > 0n
-      ? changeAddress
-      : null;
-  let changeAmount =
-    txChangeAddress != null
-      ? totalIn -
-        amount -
-        selectionParams.effectiveFeerate.getFee(
-          estimateSignedTxVsize({
-            selected,
-            wallet,
-            network,
-            toAddress,
-            amount,
-            changeAddress,
-            changeAmount: sel.result.getChange(
-              selectionParams.minViableChange,
-              selectionParams.changeFee,
-            ),
-            txLockTime,
-            miniscriptPlan: miniscriptPlan ?? null,
-            taprootKeyPath,
-          }),
-        )
-      : 0n;
-
-  if (txChangeAddress != null && changeAmount < selectionParams.minViableChange) {
-    // Change fell below the dust/viability threshold after the fee adjustment.
-    txChangeAddress = null;
-    changeAmount = 0n;
-  }
-
+  // Amount placed in the recipient output. Differs from the requested `amount`
+  // only when the fee is subtracted from it, where the recipient absorbs the fee.
+  let recipientOutputAmount = amount;
+  let txChangeAddress: string | null;
+  let changeAmount: bigint;
   let fee: bigint;
-  if (txChangeAddress != null) {
-    fee = totalIn - amount - changeAmount;
-  } else {
-    const vsizeNoChange = estimateSignedTxVsize({
+
+  if (subtractFeeFromAmount) {
+    // The recipient pays the fee. Inputs only covered the recipient amount, so
+    // change = totalIn - amount (independent of the fee), and the recipient
+    // output is then reduced by the fee. Reference: spender.cpp CreateTransaction
+    // (reduce output values for subtract-fee-from-amount).
+    const rawChange = totalIn - amount;
+    if (rawChange >= selectionParams.minViableChange) {
+      txChangeAddress = changeAddress;
+      changeAmount = rawChange;
+    } else {
+      txChangeAddress = null;
+      changeAmount = 0n;
+    }
+    const vsize = estimateSignedTxVsize({
       selected,
       wallet,
       network,
       toAddress,
       amount,
-      changeAddress: null,
-      changeAmount: 0n,
+      changeAddress: txChangeAddress,
+      changeAmount,
       txLockTime,
       miniscriptPlan: miniscriptPlan ?? null,
       taprootKeyPath,
     });
-    if (totalIn < amount + selectionParams.effectiveFeerate.getFee(vsizeNoChange)) {
-      throw new Error("Insufficient funds to cover amount + fee.");
+    fee = selectionParams.effectiveFeerate.getFee(vsize);
+    // The recipient receives everything not going to change or fees. With change
+    // this is amount - fee; without change the would-be change folds in.
+    recipientOutputAmount = totalIn - changeAmount - fee;
+    if (recipientOutputAmount < 0n) {
+      throw new Error("The transaction amount is too small to pay the fee.");
     }
-    fee = totalIn - amount;
+    if (recipientOutputAmount < getRecipientDust(recipientScript, discardFeerate)) {
+      throw new Error(
+        "The transaction amount is too small to send after the fee has been deducted.",
+      );
+    }
+  } else {
+    // Default path: the sender adds the fee on top. Recompute the signed vsize
+    // and adjust the change output to absorb any fee overpayment.
+    txChangeAddress =
+      sel.result.getChange(selectionParams.minViableChange, selectionParams.changeFee) > 0n
+        ? changeAddress
+        : null;
+    changeAmount =
+      txChangeAddress != null
+        ? totalIn -
+          amount -
+          selectionParams.effectiveFeerate.getFee(
+            estimateSignedTxVsize({
+              selected,
+              wallet,
+              network,
+              toAddress,
+              amount,
+              changeAddress,
+              changeAmount: sel.result.getChange(
+                selectionParams.minViableChange,
+                selectionParams.changeFee,
+              ),
+              txLockTime,
+              miniscriptPlan: miniscriptPlan ?? null,
+              taprootKeyPath,
+            }),
+          )
+        : 0n;
+
+    if (txChangeAddress != null && changeAmount < selectionParams.minViableChange) {
+      // Change fell below the dust/viability threshold after the fee adjustment.
+      txChangeAddress = null;
+      changeAmount = 0n;
+    }
+
+    if (txChangeAddress != null) {
+      fee = totalIn - amount - changeAmount;
+    } else {
+      const vsizeNoChange = estimateSignedTxVsize({
+        selected,
+        wallet,
+        network,
+        toAddress,
+        amount,
+        changeAddress: null,
+        changeAmount: 0n,
+        txLockTime,
+        miniscriptPlan: miniscriptPlan ?? null,
+        taprootKeyPath,
+      });
+      if (totalIn < amount + selectionParams.effectiveFeerate.getFee(vsizeNoChange)) {
+        throw new Error("Insufficient funds to cover amount + fee.");
+      }
+      fee = totalIn - amount;
+    }
   }
 
   const tx: Transaction = buildUnifiedTransaction({
@@ -1925,7 +1988,7 @@ export async function createTransaction(
     wallet,
     network,
     toAddress,
-    amount,
+    amount: recipientOutputAmount,
     changeAddress: txChangeAddress,
     changeAmount,
     changeIndex: nextChangeIndex,
@@ -1951,6 +2014,8 @@ export async function createTransaction(
     feeRateSatPerKvB: feeRate,
     feeLevel: usingManualFeeRate ? undefined : feeLevel,
     lockTime: txLockTime,
+    subtractFee: subtractFeeFromAmount,
+    recipientAmount: recipientOutputAmount,
     changeAddress: txChangeAddress,
     miniscriptPath: miniscriptPlan
       ? {
