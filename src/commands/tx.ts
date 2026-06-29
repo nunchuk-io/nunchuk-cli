@@ -1,7 +1,18 @@
 import { Command, InvalidArgumentError } from "commander";
 import { Transaction } from "@scure/btc-signer";
-import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
-import type { Network } from "../core/config.js";
+import {
+  requireApiKey,
+  requireEmail,
+  getNetwork,
+  getElectrumServer,
+  loadConfig,
+  getDefaultFeeLevel,
+  isFeeLevel,
+  DEFAULT_FEE_LEVEL,
+  FEE_LEVELS,
+} from "../core/config.js";
+import type { FeeLevel, Network } from "../core/config.js";
+import { estimateFeeRateLevels } from "../core/fees.js";
 import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/electrum.js";
 import { deriveDescriptorAddresses } from "../core/address.js";
@@ -74,6 +85,13 @@ function formatFeeRateSatPerVb(satPerKvB: bigint): string {
   const whole = satPerKvB / 1000n;
   const frac = (satPerKvB % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
   return frac.length > 0 ? `${whole}.${frac}` : whole.toString();
+}
+
+function parseFeeLevelOption(value: string): FeeLevel {
+  if (!isFeeLevel(value)) {
+    throw new InvalidArgumentError(`--fee-level must be one of: ${FEE_LEVELS.join(", ")}`);
+  }
+  return value;
 }
 
 function parsePreimageOption(value: string, previous: string[]): string[] {
@@ -378,6 +396,11 @@ txCommand
     "Manual fee rate in sat/vB (default: auto-estimate)",
     parseFeeRateOption,
   )
+  .option(
+    "--fee-level <level>",
+    `Fee level for auto-estimate: ${FEE_LEVELS.join(", ")} (overrides saved default; ignored with --fee-rate)`,
+    parseFeeLevelOption,
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -397,6 +420,11 @@ txCommand
         if (sendAmount <= 0n) {
           throw new Error("Amount must convert to at least 1 sat");
         }
+        // Effective fee level for the auto-estimate: one-shot --fee-level wins,
+        // else the account's saved default, else the built-in default (economy).
+        const feeLevel =
+          options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
+
         const result = await createTransaction({
           wallet,
           network,
@@ -408,6 +436,7 @@ txCommand
           preimages: options.preimage,
           // Manual fee rate (sat/kvB) when --fee-rate is given; else auto-estimate.
           feeRateSatPerKvB: options.feeRate,
+          feeLevel,
         });
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
@@ -426,6 +455,7 @@ txCommand
               feeRate: formatFeeRateSatPerVb(result.feeRateSatPerKvB),
               feeRateSatPerKvB: result.feeRateSatPerKvB.toString(),
               feeRateManual: Boolean(options.feeRate),
+              feeLevel: result.feeLevel ?? null,
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
@@ -442,7 +472,7 @@ txCommand
         console.log(`  Transaction ID: ${result.txId}`);
         console.log(
           `  Fee rate: ${formatFeeRateSatPerVb(result.feeRateSatPerKvB)} sat/vB${
-            options.feeRate ? " (manual)" : ""
+            options.feeRate ? " (manual)" : result.feeLevel ? ` (${result.feeLevel})` : ""
           }`,
         );
         console.log(`  Fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})`);
@@ -1143,6 +1173,59 @@ txCommand
 
         console.error(`Transaction ${options.txId} not found.`);
         process.exit(1);
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+txCommand
+  .command("fees")
+  .description("Show current recommended fee rates (priority / standard / economy)")
+  .action(async (_options, cmd) => {
+    try {
+      const globals = cmd.optsWithGlobals();
+      const network = getNetwork(globals.network);
+      const email = requireEmail(globals.network);
+
+      const server = getElectrumServer(network);
+      const electrum = new ElectrumClient();
+      try {
+        await electrum.connect(server.host, server.port, server.protocol);
+        await electrum.serverVersion("nunchuk-cli", "1.4");
+
+        const levels = await estimateFeeRateLevels(network, electrum);
+        const defaultLevel = getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
+
+        if (globals.json) {
+          print(
+            {
+              priority: formatFeeRateSatPerVb(levels.priority),
+              standard: formatFeeRateSatPerVb(levels.standard),
+              economy: formatFeeRateSatPerVb(levels.economy),
+              prioritySatPerKvB: levels.priority.toString(),
+              standardSatPerKvB: levels.standard.toString(),
+              economySatPerKvB: levels.economy.toString(),
+              defaultFeeLevel: defaultLevel,
+            },
+            cmd,
+          );
+          return;
+        }
+
+        console.log("Recommended fee rates:");
+        const rows: [FeeLevel, bigint][] = [
+          ["priority", levels.priority],
+          ["standard", levels.standard],
+          ["economy", levels.economy],
+        ];
+        for (const [level, rate] of rows) {
+          const label = level.charAt(0).toUpperCase() + level.slice(1);
+          const marker = level === defaultLevel ? "  (default)" : "";
+          console.log(`  ${label.padEnd(9)}${formatFeeRateSatPerVb(rate)} sat/vB${marker}`);
+        }
+      } finally {
+        electrum.close();
       }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);

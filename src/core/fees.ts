@@ -62,3 +62,43 @@ export async function estimateFeeRate(
   }
   return BigInt(Math.ceil(btcPerKb * 100_000_000)); // BTC/kvB → sat/kvB
 }
+
+// The three user-facing recommended rates in sat/kvB. Mirrors the mobile app's
+// "Processing speed" panel; `minimumFee` is intentionally omitted (it is a
+// network floor, not a selectable speed).
+export interface FeeRateLevels {
+  priority: bigint;
+  standard: bigint;
+  economy: bigint;
+}
+
+// Fetch all three recommended levels at once. Uses a single Nunchuk API call
+// when available; on failure (or any non-positive rate) falls back to per-level
+// Electrum estimates via estimateFeeRate.
+export async function estimateFeeRateLevels(
+  network: Network,
+  electrum: ElectrumClient,
+): Promise<FeeRateLevels> {
+  try {
+    const fees = await fetchRecommendedFees(network);
+    const priority = fees[FEE_FIELD.priority];
+    const standard = fees[FEE_FIELD.standard];
+    const economy = fees[FEE_FIELD.economy];
+    if (priority > 0 && standard > 0 && economy > 0) {
+      return {
+        priority: BigInt(Math.ceil(priority)),
+        standard: BigInt(Math.ceil(standard)),
+        economy: BigInt(Math.ceil(economy)),
+      };
+    }
+  } catch {
+    // API unavailable — fall through to per-level Electrum estimates.
+  }
+
+  const [priority, standard, economy] = await Promise.all([
+    estimateFeeRate(network, electrum, "priority"),
+    estimateFeeRate(network, electrum, "standard"),
+    estimateFeeRate(network, electrum, "economy"),
+  ]);
+  return { priority, standard, economy };
+}

@@ -844,6 +844,78 @@ describe("createTransaction manual fee rate", () => {
   });
 });
 
+describe("createTransaction fee level", () => {
+  const offlineFetch = () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return () => {
+      globalThis.fetch = originalFetch;
+    };
+  };
+
+  it("estimates with the requested level's conf_target and reports it", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const restore = offlineFetch();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        feeLevel: "priority",
+      });
+      // priority → Electrum conf_target 2 on the API-offline fallback path.
+      expect(electrum.estimateFee).toHaveBeenCalledWith(2);
+      expect(result.feeLevel).toBe("priority");
+    } finally {
+      restore();
+    }
+  });
+
+  it("defaults to economy (conf_target 6) when no level is given", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const restore = offlineFetch();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      expect(electrum.estimateFee).toHaveBeenCalledWith(6);
+      expect(result.feeLevel).toBe("economy");
+    } finally {
+      restore();
+    }
+  });
+
+  it("ignores the level and reports no level when a manual rate is supplied", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const restore = offlineFetch();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        feeRateSatPerKvB: 5_000n,
+        feeLevel: "priority",
+      });
+      // Manual rate wins: no estimate, and no level reported back.
+      expect(electrum.estimateFee).not.toHaveBeenCalled();
+      expect(result.feeRateSatPerKvB).toBe(5_000n);
+      expect(result.feeLevel).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);

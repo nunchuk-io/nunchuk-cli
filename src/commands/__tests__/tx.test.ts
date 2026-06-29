@@ -6,8 +6,10 @@ const {
   mockCombinePendingPsbt,
   mockCreateTransaction,
   mockDecodePsbtDetail,
+  mockEstimateFeeRateLevels,
   mockFetchPsbtInputTimelockMetadata,
   mockFetchPendingTransaction,
+  mockGetDefaultFeeLevel,
   mockHeadersSubscribe,
   mockLoadWallet,
   mockRemoveMusigNonce,
@@ -16,8 +18,10 @@ const {
   mockCombinePendingPsbt: vi.fn(),
   mockCreateTransaction: vi.fn(),
   mockDecodePsbtDetail: vi.fn(),
+  mockEstimateFeeRateLevels: vi.fn(),
   mockFetchPsbtInputTimelockMetadata: vi.fn(),
   mockFetchPendingTransaction: vi.fn(),
+  mockGetDefaultFeeLevel: vi.fn(),
   mockHeadersSubscribe: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockRemoveMusigNonce: vi.fn(),
@@ -29,6 +33,15 @@ vi.mock("../../core/config.js", () => ({
   getNetwork: vi.fn(() => "mainnet"),
   requireApiKey: vi.fn(() => "api-key"),
   requireEmail: vi.fn(() => "user@example.com"),
+  loadConfig: vi.fn(() => ({})),
+  getDefaultFeeLevel: mockGetDefaultFeeLevel,
+  isFeeLevel: (value: string) => ["economy", "standard", "priority"].includes(value),
+  DEFAULT_FEE_LEVEL: "economy",
+  FEE_LEVELS: ["economy", "standard", "priority"],
+}));
+
+vi.mock("../../core/fees.js", () => ({
+  estimateFeeRateLevels: mockEstimateFeeRateLevels,
 }));
 
 vi.mock("../../core/api-client.js", () => ({
@@ -90,6 +103,10 @@ const TEST_PSBT_B64 =
 describe("tx create", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Commander persists parsed option values on the (singleton) command
+    // instance; reset modules so each test gets a fresh txCommand and stale
+    // option values (e.g. --fee-level) don't leak between tests.
+    vi.resetModules();
     mockLoadWallet.mockReturnValue(TEST_WALLET);
     mockHeadersSubscribe.mockResolvedValue({ height: 900_000, hex: "tip-header" });
     mockCreateTransaction.mockResolvedValue({
@@ -247,6 +264,147 @@ describe("tx create", () => {
     expect(mockCreateTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ feeRateSatPerKvB: 1_500n }),
     );
+  });
+
+  it("forwards --fee-level as the auto-estimate level", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--fee-level",
+        "priority",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ feeLevel: "priority" }),
+    );
+  });
+
+  it("falls back to the saved default fee level when no flag is given", async () => {
+    mockGetDefaultFeeLevel.mockReturnValueOnce("standard");
+
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ feeLevel: "standard" }),
+    );
+  });
+
+  it("rejects an invalid --fee-level", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    // Suppress commander's stderr output for the invalid option.
+    txCommand.configureOutput({ writeErr: () => {} });
+
+    // Invalid enum is rejected at parse time, before the action runs.
+    await expect(
+      root.parseAsync(["tx", "create", "--fee-level", "turbo"], { from: "user" }),
+    ).rejects.toThrow();
+    expect(mockCreateTransaction).not.toHaveBeenCalled();
+  });
+});
+
+describe("tx fees", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockEstimateFeeRateLevels.mockResolvedValue({
+      priority: 6_000n,
+      standard: 5_000n,
+      economy: 1_000n,
+    });
+    mockGetDefaultFeeLevel.mockReset();
+    mockGetDefaultFeeLevel.mockReturnValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("lists the three recommended rates in sat/vB, marking the default", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(["tx", "fees"], { from: "user" });
+
+    const lines = logSpy.mock.calls.map((c) => c[0]).join("\n");
+    expect(lines).toContain("Priority");
+    expect(lines).toContain("6 sat/vB");
+    expect(lines).toContain("Standard");
+    expect(lines).toContain("5 sat/vB");
+    expect(lines).toContain("Economy");
+    expect(lines).toContain("1 sat/vB");
+    // Default (economy when unset) is marked.
+    expect(lines).toMatch(/Economy\s+1 sat\/vB {2}\(default\)/);
+    // minimumFee is not surfaced.
+    expect(lines.toLowerCase()).not.toContain("minimum");
+  });
+
+  it("emits the three rates as JSON with raw sat/kvB values", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.option("--json", "Output as JSON");
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(["--json", "tx", "fees"], { from: "user" });
+
+    const payload = JSON.parse(logSpy.mock.calls.at(-1)?.[0] as string);
+    expect(payload).toMatchObject({
+      priority: "6",
+      standard: "5",
+      economy: "1",
+      prioritySatPerKvB: "6000",
+      standardSatPerKvB: "5000",
+      economySatPerKvB: "1000",
+      defaultFeeLevel: "economy",
+    });
   });
 });
 

@@ -858,8 +858,11 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 | `--taproot-script-path`     | No       | Spend a taproot wallet through its script path instead of the key path |
 | `--preimage <hex>`          | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
 | `--fee-rate <sat/vB>`       | No       | Manual fee rate in sat/vB; overrides the auto-estimate              |
+| `--fee-level <level>`       | No       | Fee level for the auto-estimate: `economy`, `standard`, or `priority` |
 
 Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback), unless `--fee-rate <sat/vB>` is given to set it manually. The value is a positive number in sat/vB and may be fractional (e.g. `1.5`); it is applied at sat/kvB precision.
+
+When auto-estimating, the fee **level** is resolved by precedence: `--fee-level <economy|standard|priority>` (one-shot) > the account's saved default (`nunchuk config fee-rate set <level>`) > the built-in default `economy`. A manual `--fee-rate` overrides the level entirely. The three levels map to the API's `hourFee` (economy), `halfHourFee` (standard), and `fastestFee` (priority); on the Electrum fallback they use `conf_target` 6 / 3 / 2. See [`tx fees`](#nunchuk-tx-fees) to view the current rate for each level.
 
 For miniscript wallets, the CLI selects the first satisfiable supported path with the fewest preimage requirements unless `--miniscript-path` is provided. The selected path sets transaction locktime and input sequence when required.
 
@@ -872,7 +875,22 @@ nunchuk tx create --wallet w123 --to bc1q... --amount 50 --currency USD
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --miniscript-path 0
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --taproot-script-path
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --preimage <32-byte-hex>
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --fee-rate 1.5
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --fee-level priority
 ```
+
+### `nunchuk tx fees`
+
+Show the current recommended fee rates from the Nunchuk API (with Electrum fallback) — the same source as the `tx create` auto-estimate. Read-only; no wallet or signing required.
+
+Prints three levels in sat/vB — **priority** (`fastestFee`), **standard** (`halfHourFee`), and **economy** (`hourFee`) — and marks the account's default level. The network floor (`minimumFee`) is not shown, matching the mobile app's three-level panel.
+
+```bash
+nunchuk tx fees
+nunchuk --json tx fees
+```
+
+JSON mode adds the raw sat/kvB values (`prioritySatPerKvB`, `standardSatPerKvB`, `economySatPerKvB`) and `defaultFeeLevel` for scripting.
 
 ### `nunchuk tx sign`
 

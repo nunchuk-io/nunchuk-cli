@@ -4,8 +4,8 @@
 import { Transaction, bip32Path, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
 import { RawPSBTV0, TaprootControlBlock } from "@scure/btc-signer/psbt.js";
 import { base58 } from "@scure/base";
-import { getElectrumServer } from "./config.js";
-import type { Network } from "./config.js";
+import { DEFAULT_FEE_LEVEL, getElectrumServer } from "./config.js";
+import type { FeeLevel, Network } from "./config.js";
 import { ApiClient } from "./api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "./electrum.js";
 import type { HistoryItem } from "./electrum.js";
@@ -831,6 +831,9 @@ export interface CreateTransactionParams {
   // 1500). When > 0 it overrides the auto-estimate; otherwise the rate is
   // estimated. Mirrors libnunchuk's `fee_rate > 0 ? manual : EstimateFee`.
   feeRateSatPerKvB?: bigint;
+  // Fee level for the auto-estimate path (priority / standard / economy).
+  // Ignored when a manual `feeRateSatPerKvB` is supplied. Defaults to economy.
+  feeLevel?: FeeLevel;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -842,6 +845,9 @@ export interface CreateTransactionResult {
   fee: bigint;
   // Effective fee rate in sat/kvB (CFeeRate unit). Display as sat/vB by /1000.
   feeRateSatPerKvB: bigint;
+  // The fee level used for the auto-estimate, or undefined when a manual rate
+  // was supplied. Lets the command label output (e.g. "3 sat/vB (economy)").
+  feeLevel?: FeeLevel;
   changeAddress: string | null;
   miniscriptPath?: MiniscriptPathSummary;
 }
@@ -1660,6 +1666,7 @@ export async function createTransaction(
     taprootScriptPath = false,
     preimages = [],
     feeRateSatPerKvB,
+    feeLevel = DEFAULT_FEE_LEVEL,
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1767,7 +1774,9 @@ export async function createTransaction(
   // estimate from the Nunchuk API (hourFee) with Electrum fallback.
   // Reference: nunchukimpl.cpp CreateTransaction (`if (fee_rate <= 0) fee_rate = EstimateFee()`).
   const usingManualFeeRate = feeRateSatPerKvB != null && feeRateSatPerKvB > 0n;
-  const feeRate = usingManualFeeRate ? feeRateSatPerKvB : await estimateFeeRate(network, electrum);
+  const feeRate = usingManualFeeRate
+    ? feeRateSatPerKvB
+    : await estimateFeeRate(network, electrum, feeLevel);
 
   // Step 6: Coin selection (BnB / Knapsack / SRD) + transaction building.
   // Reference: libnunchuk wallet::CreateTransaction (spender.cpp),
@@ -1922,6 +1931,7 @@ export async function createTransaction(
     txId,
     fee,
     feeRateSatPerKvB: feeRate,
+    feeLevel: usingManualFeeRate ? undefined : feeLevel,
     changeAddress: txChangeAddress,
     miniscriptPath: miniscriptPlan
       ? {

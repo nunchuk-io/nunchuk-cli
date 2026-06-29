@@ -280,6 +280,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | `tx broadcast` | Broadcast a fully signed transaction                                                          |
 | `tx list`      | List transactions for a wallet                                                                |
 | `tx get`       | Get transaction details                                                                       |
+| `tx fees`      | Show current recommended fee rates (priority / standard / economy)                            |
 
 #### `tx create`
 
@@ -288,9 +289,18 @@ nunchuk tx create --wallet <id> --to <address> --amount <sats>
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --miniscript-path 0
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --taproot-script-path  # taproot script-path spend
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --fee-rate 1.5          # manual fee rate (sat/vB, fractional ok)
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --fee-level priority    # auto-estimate at a fee level
 ```
 
-Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
+Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. When auto-estimating, the **level** is `--fee-level <economy|standard|priority>` (one-shot), else the account's saved default (`config fee-rate set`), else `economy`; `--fee-rate` overrides the level. Run [`tx fees`](#tx-fees) to see the current rates for each level. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
+
+#### `tx fees`
+
+```bash
+nunchuk tx fees
+```
+
+Shows the current recommended fee rates (priority / standard / economy) from the Nunchuk API, in sat/vB, marking the account's default level. Same source as the auto-estimate; no wallet required.
 
 #### `tx sign`
 
