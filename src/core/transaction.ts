@@ -865,6 +865,10 @@ export interface CreateTransactionResult {
   // unless the fee was subtracted from it, in which case it is reduced by the fee.
   recipientAmount: bigint;
   changeAddress: string | null;
+  // The change output value in sats (0 when there is no change output).
+  changeAmount: bigint;
+  // The UTXOs selected as inputs, in selection order (before any shuffle).
+  selectedInputs: Array<{ txid: string; vout: number; value: bigint }>;
   miniscriptPath?: MiniscriptPathSummary;
 }
 
@@ -2017,6 +2021,12 @@ export async function createTransaction(
     subtractFee: subtractFeeFromAmount,
     recipientAmount: recipientOutputAmount,
     changeAddress: txChangeAddress,
+    changeAmount,
+    selectedInputs: selected.map((p) => ({
+      txid: p.utxo.txHash,
+      vout: p.utxo.txPos,
+      value: p.utxo.value,
+    })),
     miniscriptPath: miniscriptPlan
       ? {
           index: miniscriptPlan.index,

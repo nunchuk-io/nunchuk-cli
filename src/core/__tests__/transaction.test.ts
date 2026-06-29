@@ -1165,6 +1165,66 @@ describe("createTransaction subtract fee from amount", () => {
   });
 });
 
+describe("createTransaction result inputs and change", () => {
+  it("reports selectedInputs (the chosen UTXOs) and changeAmount", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [200_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 50_000n,
+        feeRateSatPerKvB: 5_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // selectedInputs match the PSBT inputs (same outpoints + values).
+      expect(result.selectedInputs.length).toBe(tx.inputsLength);
+      const inputSum = result.selectedInputs.reduce((s, i) => s + i.value, 0n);
+      let psbtInputSum = 0n;
+      for (let i = 0; i < tx.inputsLength; i++) psbtInputSum += tx.getInput(i).witnessUtxo!.amount;
+      expect(inputSum).toBe(psbtInputSum);
+
+      // changeAmount matches the on-chain change and conserves value.
+      expect(result.changeAddress).not.toBeNull();
+      expect(result.changeAmount).toBeGreaterThan(0n);
+      expect(inputSum).toBe(50_000n + result.changeAmount + result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports changeAmount 0 when there is no change output", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [60_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 60_000n,
+        feeRateSatPerKvB: 5_000n,
+        subtractFeeFromAmount: true,
+      });
+      expect(result.changeAddress).toBeNull();
+      expect(result.changeAmount).toBe(0n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);

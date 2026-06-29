@@ -116,6 +116,8 @@ describe("tx create", () => {
       lockTime: 0,
       subtractFee: false,
       recipientAmount: 20_000_000n,
+      changeAmount: 5_000_000n,
+      selectedInputs: [{ txid: "funding-txid", vout: 0, value: 25_000_308n }],
       miniscriptPath: {
         index: 0,
         lockTime: 0,
@@ -523,6 +525,102 @@ describe("tx fees", () => {
       economySatPerKvB: "1000",
       defaultFeeLevel: "economy",
     });
+  });
+});
+
+describe("tx draft", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockHeadersSubscribe.mockResolvedValue({ height: 900_000, hex: "tip-header" });
+    mockGetDefaultFeeLevel.mockReturnValue(undefined);
+    mockCreateTransaction.mockResolvedValue({
+      changeAddress: "bc1qchangeaddress0000000000000000000000000000000000000000",
+      fee: 308n,
+      feeRateSatPerKvB: 1_000n,
+      feeLevel: "economy",
+      lockTime: 0,
+      subtractFee: false,
+      recipientAmount: 20_000_000n,
+      changeAmount: 5_000_000n,
+      selectedInputs: [{ txid: "funding-txid", vout: 0, value: 25_000_308n }],
+      psbtB64: TEST_PSBT_B64,
+      txId: "f05830ac99fb27096ddd4b1c05352830b9bbf5462cb2807116baf1ab8b0282e5",
+    });
+    mockFetchPsbtInputTimelockMetadata.mockResolvedValue([
+      { blocktime: 1_891_360_074, height: 880_000, txHash: "funding-txid", txPos: 0 },
+    ]);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const baseArgs = [
+    "tx",
+    "draft",
+    "--wallet",
+    "jk74e3up",
+    "--to",
+    "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+    "--amount",
+    "0.2",
+    "--currency",
+    "btc",
+  ];
+
+  it("previews the transaction without uploading it", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(baseArgs, { from: "user" });
+
+    // The draft never creates the real transaction.
+    expect(mockUploadTransaction).not.toHaveBeenCalled();
+    expect(mockCreateTransaction).toHaveBeenCalledTimes(1);
+
+    const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
+    expect(out).toContain("Draft transaction (not created)");
+    expect(out).toContain("Estimated fee:");
+    // Total amount = recipientAmount + fee = 20000000 + 308.
+    expect(out).toContain("Total amount:");
+    expect(out).toContain("20000308 sat");
+    expect(out).toContain("Change: bc1qchangeaddress");
+    expect(out).toContain("Input coins:");
+    expect(out).toContain("funding-txid:0");
+    // Auto-estimate caveat shown when no --fee-rate.
+    expect(out).toContain("pass --fee-rate");
+  });
+
+  it("forwards the same options as tx create and omits the caveat with --fee-rate", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [...baseArgs, "--fee-rate", "2", "--subtract-fee", "--anti-fee-sniping"],
+      {
+        from: "user",
+      },
+    );
+
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        feeRateSatPerKvB: 2_000n,
+        subtractFeeFromAmount: true,
+        antiFeeSniping: true,
+      }),
+    );
+    const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
+    expect(out).not.toContain("pass --fee-rate");
   });
 });
 

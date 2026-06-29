@@ -276,6 +276,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | Command        | Description                                                                                   |
 | -------------- | --------------------------------------------------------------------------------------------- |
 | `tx create`    | Create a new transaction, optionally selecting miniscript path/preimages                      |
+| `tx draft`     | Preview a transaction (fee, total, change, input coins) without creating it                    |
 | `tx sign`      | Sign a transaction locally, attach miniscript preimages, or merge a signed PSBT with `--psbt` |
 | `tx broadcast` | Broadcast a fully signed transaction                                                          |
 | `tx list`      | List transactions for a wallet                                                                |
@@ -307,6 +308,15 @@ nunchuk tx fees
 ```
 
 Shows the current recommended fee rates (priority / standard / economy) from the Nunchuk API, in sat/vB, marking the account's default level. Same source as the auto-estimate; no wallet required.
+
+#### `tx draft`
+
+```bash
+nunchuk tx draft --wallet <id> --to <address> --amount <sats>
+nunchuk tx draft --wallet <id> --to <address> --amount <sats> --fiat USD
+```
+
+Previews a transaction the way `tx create` would build it — recipient, estimated fee, total amount, change, and the input coins (value + block date) — **without** creating or uploading anything. Takes the same options as `tx create`, plus `--fiat <code>` to show fiat values alongside BTC. It calls the same builder as `tx create`, so the numbers match; when no `--fee-rate` is given the fee is auto-estimated and may change before you run `tx create` (pass `--fee-rate` to lock it).
 
 #### `tx sign`
 

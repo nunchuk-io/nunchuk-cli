@@ -54,7 +54,14 @@ import {
   getOutputAddress,
   statusFromHeight,
 } from "../core/format.js";
-import { convertAmountInputToSats, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
+import {
+  convertAmount,
+  convertAmountInputToSats,
+  fetchMarketRates,
+  formatAmount,
+  normalizeCurrency,
+  type MarketRates,
+} from "../core/currency.js";
 import { print, printError } from "../output.js";
 
 function parseMiniscriptPathOption(value: string): number {
@@ -512,6 +519,246 @@ txCommand
         console.log(
           `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId}`,
         );
+      } finally {
+        electrum.close();
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+// tx draft — Build the same PSBT as `tx create` and show the confirm screen,
+// without uploading anything. Mirrors libnunchuk DraftTransaction.
+txCommand
+  .command("draft")
+  .description("Preview a transaction (fee, total, change, input coins) without creating it")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--to <address>", "Recipient address")
+  .requiredOption("--amount <value>", "Amount to send")
+  .option(
+    "--currency <code>",
+    "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
+  )
+  .option(
+    "--preimage <hex>",
+    "Attach a 32-byte miniscript hash preimage (repeat or comma-separate)",
+    parsePreimageOption,
+    [],
+  )
+  .option(
+    "--miniscript-path <index>",
+    "Select a miniscript signing path by index",
+    parseMiniscriptPathOption,
+  )
+  .option(
+    "--taproot-script-path",
+    "Spend a taproot wallet through its script path; key path is the default when available",
+  )
+  .option(
+    "--fee-rate <sat/vB>",
+    "Manual fee rate in sat/vB (default: auto-estimate)",
+    parseFeeRateOption,
+  )
+  .option(
+    "--fee-level <level>",
+    `Fee level for auto-estimate: ${FEE_LEVELS.join(", ")} (overrides saved default; ignored with --fee-rate)`,
+    parseFeeLevelOption,
+  )
+  .option(
+    "--anti-fee-sniping",
+    "Pin nLockTime to the current block height (a spending path's own locktime takes precedence)",
+  )
+  .option(
+    "--subtract-fee",
+    "Subtract the network fee from the amount so the recipient receives amount minus fee",
+  )
+  .option("--fiat <code>", "Show fiat values alongside BTC (e.g. --fiat USD)")
+  .action(async (options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const server = getElectrumServer(network);
+      const electrum = new ElectrumClient();
+      try {
+        await electrum.connect(server.host, server.port, server.protocol);
+        await electrum.serverVersion("nunchuk-cli", "1.4");
+
+        const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
+        const rates =
+          currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
+        const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
+        if (sendAmount <= 0n) {
+          throw new Error("Amount must convert to at least 1 sat");
+        }
+
+        const feeLevel =
+          options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
+
+        // Build the transaction exactly as `tx create` would — but never upload.
+        const result = await createTransaction({
+          wallet,
+          network,
+          electrum,
+          toAddress: options.to,
+          amount: sendAmount,
+          miniscriptPath: options.miniscriptPath,
+          taprootScriptPath: options.taprootScriptPath,
+          preimages: options.preimage,
+          feeRateSatPerKvB: options.feeRate,
+          feeLevel,
+          antiFeeSniping: Boolean(options.antiFeeSniping),
+          subtractFeeFromAmount: Boolean(options.subtractFee),
+        });
+
+        // Join selected inputs with their block date + confirmations.
+        const inputMeta = await fetchPsbtInputTimelockMetadata(result.psbtB64, electrum, network);
+        let tipHeight = 0;
+        try {
+          tipHeight = (await electrum.headersSubscribe()).height;
+        } catch {
+          // tip unavailable → confirmations stay 0
+        }
+        const metaByOutpoint = new Map(inputMeta.map((m) => [`${m.txHash}:${m.txPos}`, m]));
+        const inputs = result.selectedInputs.map((i) => {
+          const m = metaByOutpoint.get(`${i.txid}:${i.vout}`);
+          const height = m?.height ?? 0;
+          return {
+            txid: i.txid,
+            vout: i.vout,
+            value: i.value,
+            height,
+            confirmations: height > 0 ? Math.max(0, tipHeight - height + 1) : 0,
+            blocktime: m?.blocktime ?? 0,
+          };
+        });
+
+        // Total spend on the payment side: recipient + fee (= amount + fee, or
+        // just `amount` under --subtract-fee since the fee comes out of it).
+        const total = result.recipientAmount + result.fee;
+
+        // Optional fiat display.
+        let fiatCode: string | null = null;
+        let fiatRates: MarketRates | undefined;
+        if (options.fiat) {
+          const code = normalizeCurrency(options.fiat);
+          if (code !== "sat" && code !== "BTC") {
+            fiatCode = code;
+            try {
+              fiatRates = await fetchMarketRates();
+            } catch {
+              fiatRates = undefined;
+            }
+          }
+        }
+        const fiat = (sats: bigint): string => {
+          if (!fiatCode || !fiatRates) return "";
+          const v = convertAmount(Number(sats), "sat", fiatCode, fiatRates).converted;
+          return ` ~ ${formatAmount(v, fiatCode)} ${fiatCode}`;
+        };
+        const fiatValue = (sats: bigint): string | undefined => {
+          if (!fiatCode || !fiatRates) return undefined;
+          return formatAmount(
+            convertAmount(Number(sats), "sat", fiatCode, fiatRates).converted,
+            fiatCode,
+          );
+        };
+
+        const globals = cmd.optsWithGlobals();
+        if (globals.json) {
+          print(
+            {
+              recipient: options.to,
+              amount: sendAmount.toString(),
+              amountBtc: formatBtc(sendAmount),
+              recipientAmount: result.recipientAmount.toString(),
+              fee: result.fee.toString(),
+              feeBtc: formatBtc(result.fee),
+              feeRate: formatFeeRateSatPerVb(result.feeRateSatPerKvB),
+              feeRateSatPerKvB: result.feeRateSatPerKvB.toString(),
+              feeRateManual: Boolean(options.feeRate),
+              feeLevel: result.feeLevel ?? null,
+              total: total.toString(),
+              totalBtc: formatBtc(total),
+              changeAddress: result.changeAddress,
+              changeAmount: result.changeAmount.toString(),
+              changeAmountBtc: formatBtc(result.changeAmount),
+              subtractFee: result.subtractFee,
+              antiFeeSniping: Boolean(options.antiFeeSniping),
+              lockTime: result.lockTime,
+              inputs: inputs.map((i) => ({
+                txid: i.txid,
+                vout: i.vout,
+                amount: i.value.toString(),
+                amountBtc: formatBtc(i.value),
+                height: i.height,
+                confirmations: i.confirmations,
+                blocktime: i.blocktime,
+              })),
+              miniscriptPath: result.miniscriptPath,
+              fiat:
+                fiatCode && fiatRates
+                  ? {
+                      code: fiatCode,
+                      amount: fiatValue(sendAmount),
+                      fee: fiatValue(result.fee),
+                      total: fiatValue(total),
+                      change: fiatValue(result.changeAmount),
+                    }
+                  : null,
+            },
+            cmd,
+          );
+          return;
+        }
+
+        console.log("Draft transaction (not created)");
+        console.log(`  Recipient: ${options.to}`);
+        console.log(
+          `  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})${fiat(sendAmount)}`,
+        );
+        if (result.subtractFee) {
+          console.log(
+            `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
+              result.recipientAmount,
+            )})${fiat(result.recipientAmount)}`,
+          );
+        }
+        console.log(
+          `  Fee rate: ${formatFeeRateSatPerVb(result.feeRateSatPerKvB)} sat/vB${
+            options.feeRate ? " (manual)" : result.feeLevel ? ` (${result.feeLevel})` : ""
+          }`,
+        );
+        console.log(
+          `  Estimated fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})${fiat(result.fee)}`,
+        );
+        console.log(`  Total amount: ${formatBtc(total)} (${formatSats(total)})${fiat(total)}`);
+        if (result.changeAddress) {
+          console.log(
+            `  Change: ${result.changeAddress} - ${formatBtc(result.changeAmount)} (${formatSats(
+              result.changeAmount,
+            )})${fiat(result.changeAmount)}`,
+          );
+        }
+        if (options.antiFeeSniping) {
+          console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
+        }
+        console.log("  Input coins:");
+        inputs.forEach((i) => {
+          const date = i.blocktime > 0 ? formatDate(i.blocktime) : "unconfirmed";
+          console.log(
+            `    ${i.txid}:${i.vout}  ${formatBtc(i.value)} (${formatSats(i.value)})${fiat(
+              i.value,
+            )}  ${date} (${i.confirmations} confs)`,
+          );
+        });
+        if (options.fiat && fiatCode && !fiatRates) {
+          console.log("  (fiat values unavailable: market rate fetch failed)");
+        }
+        if (!options.feeRate) {
+          console.log(
+            "  Note: fee is auto-estimated and may change; pass --fee-rate <sat/vB> to lock it.",
+          );
+        }
       } finally {
         electrum.close();
       }

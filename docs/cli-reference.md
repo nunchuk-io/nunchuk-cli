@@ -900,6 +900,28 @@ nunchuk --json tx fees
 
 JSON mode adds the raw sat/kvB values (`prioritySatPerKvB`, `standardSatPerKvB`, `economySatPerKvB`) and `defaultFeeLevel` for scripting.
 
+### `nunchuk tx draft`
+
+Preview a transaction without creating it. Builds the same PSBT that `tx create` would (coin selection, fee, change), shows the "confirm" details, and **never uploads to the group server or writes storage**.
+
+Takes the **same options as [`tx create`](#nunchuk-tx-create)** — `--wallet`, `--to`, `--amount`, `--currency`, `--fee-rate`, `--fee-level`, `--anti-fee-sniping`, `--subtract-fee`, `--miniscript-path`, `--taproot-script-path`, `--preimage` — plus one extra:
+
+| Option           | Required | Description                                                       |
+| ---------------- | -------- | ----------------------------------------------------------------- |
+| `--fiat <code>`  | No       | Show fiat values alongside BTC for each line (e.g. `--fiat USD`)  |
+
+Because it calls the same builder as `tx create`, the fee/selection are identical. The output shows the recipient and amount, the fee rate and **estimated fee**, the **total amount** (`recipient amount + fee`), the **change** address and value, and the **input coins** (value + block date + confirmations). With `--subtract-fee` it also shows `Recipient receives`; with `--anti-fee-sniping` it shows the effective locktime.
+
+When `--fee-rate` is omitted the fee is auto-estimated from the live API and may change before you run `tx create` — pass `--fee-rate <sat/vB>` to lock the previewed rate. The fiat lines are best-effort: if the market-rate fetch fails, BTC/sats are still shown and a note is printed.
+
+```bash
+nunchuk tx draft --wallet w123 --to bc1q... --amount 100000
+nunchuk tx draft --wallet w123 --to bc1q... --amount 0.002 --currency BTC --fiat USD
+nunchuk --json tx draft --wallet w123 --to bc1q... --amount 100000 --fee-rate 2
+```
+
+JSON mode returns `recipient`, `amount`, `recipientAmount`, `fee`, `feeRate`/`feeLevel`, `total`, `changeAddress`/`changeAmount`, `subtractFee`, `antiFeeSniping`, `lockTime`, an `inputs` array (`txid`, `vout`, `amount`, `height`, `confirmations`, `blocktime`), `miniscriptPath`, and `fiat` (or `null`).
+
 ### `nunchuk tx sign`
 
 Sign a transaction. By default, this fetches the PSBT from the group server, signs matching inputs locally, and re-uploads the merged result. You can also pass `--psbt <base64>` to merge an externally signed PSBT into the current pending transaction. Upload only happens when the merge adds new data.
