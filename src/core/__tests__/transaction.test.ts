@@ -27,6 +27,7 @@ import {
   fetchPsbtInputTimelockMetadata,
 } from "../transaction.js";
 import { CFeeRate, makeCOutput, type COutput } from "../coin-selection.js";
+import { SeededRng } from "../coin-selection-params.js";
 import { createDummyPsbt } from "../platform-key.js";
 import {
   buildWalletDescriptor,
@@ -413,6 +414,27 @@ function removeInputWitnessUtxo(psbtB64: string): string {
   return Buffer.from(tx.toPSBT()).toString("base64");
 }
 
+// Locate the wallet's change output regardless of its (randomized) position:
+// only the change output carries wallet derivation metadata — recipient outputs
+// are added via addOutputAddress with no bip32/taproot metadata.
+function findChangeOutputIndex(tx: Transaction): number {
+  for (let i = 0; i < tx.outputsLength; i++) {
+    const out = tx.getOutput(i);
+    if (
+      out.tapInternalKey ||
+      (out.bip32Derivation?.length ?? 0) > 0 ||
+      (out.tapBip32Derivation?.length ?? 0) > 0
+    ) {
+      return i;
+    }
+  }
+  throw new Error("No wallet change output found");
+}
+
+function findChangeOutput(tx: Transaction) {
+  return tx.getOutput(findChangeOutputIndex(tx));
+}
+
 function createMiniscriptElectrumMock(
   descriptor: string,
   fundingAmount: bigint,
@@ -695,6 +717,72 @@ describe("createTransaction coin selection (multi-UTXO end-to-end)", () => {
   });
 });
 
+describe("createTransaction privacy (input shuffle + change position)", () => {
+  it("places the change output at both positions across RNG seeds", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const positions = new Set<number>();
+      for (let seed = 0; seed < 16; seed++) {
+        const result = await createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          rng: new SeededRng(seed),
+        });
+        const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+        expect(tx.outputsLength).toBe(2);
+        positions.add(findChangeOutputIndex(tx));
+      }
+      // Change must appear at both index 0 and index 1 — not a fixed position.
+      expect([...positions].sort()).toEqual([0, 1]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("shuffles the input order across RNG seeds", async () => {
+    // Amounts chosen so all three coins are always required (no two cover 60k),
+    // fixing the selected set — only the input order can vary, via the shuffle.
+    const amounts = [30_000n, 28_000n, 26_000n];
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, amounts);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const orderings = new Set<string>();
+      for (let seed = 0; seed < 16; seed++) {
+        const result = await createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 60_000n,
+          rng: new SeededRng(seed),
+        });
+        const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+        expect(tx.inputsLength).toBe(amounts.length);
+        const order = Array.from({ length: tx.inputsLength }, (_, i) =>
+          tx.getInput(i).witnessUtxo!.amount.toString(),
+        ).join(",");
+        orderings.add(order);
+      }
+      // At least two distinct input orderings → inputs are shuffled, not fixed.
+      expect(orderings.size).toBeGreaterThan(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
@@ -749,7 +837,7 @@ describe("createTransaction multisig", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(tx.inputsLength).toBe(1);
       expect(tx.outputsLength).toBe(2);
@@ -943,7 +1031,7 @@ describe("createTransaction multisig", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(input.tapInternalKey).toHaveLength(32);
       expect(input.tapMerkleRoot).toHaveLength(32);
@@ -992,7 +1080,7 @@ describe("createTransaction multisig", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(input.tapInternalKey).toHaveLength(32);
       expect(input.tapMerkleRoot).toHaveLength(32);
@@ -1190,8 +1278,12 @@ describe("createTransaction multisig", () => {
       const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
         allowUnknown: true,
       });
-      const changeOutput = tx.getOutput(1);
-      tx.updateOutput(0, {
+      // Pollute the recipient output's metadata with the change output's keys,
+      // to prove classification is by address ownership, not PSBT metadata.
+      const changeIndex = findChangeOutputIndex(tx);
+      const recipientIndex = changeIndex === 0 ? 1 : 0;
+      const changeOutput = tx.getOutput(changeIndex);
+      tx.updateOutput(recipientIndex, {
         tapInternalKey: changeOutput.tapInternalKey,
         tapBip32Derivation: changeOutput.tapBip32Derivation,
       });
@@ -1206,8 +1298,8 @@ describe("createTransaction multisig", () => {
 
       expect(detail?.subAmount).toBe("10000 sat");
       expect(detail?.subAmountBtc).toBe("0.00010000 BTC");
-      expect(detail?.outputs[0].isChange).toBe(false);
-      expect(detail?.outputs[1].isChange).toBe(true);
+      expect(detail?.outputs[recipientIndex].isChange).toBe(false);
+      expect(detail?.outputs[changeIndex].isChange).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -1271,7 +1363,7 @@ describe("createTransaction miniscript", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(tx.inputsLength).toBe(1);
       expect(tx.outputsLength).toBe(2);
@@ -1332,7 +1424,7 @@ describe("createTransaction miniscript", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(input.tapInternalKey).toHaveLength(32);
       expect(input.tapMerkleRoot).toHaveLength(32);

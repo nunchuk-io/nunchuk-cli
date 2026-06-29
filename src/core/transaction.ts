@@ -60,6 +60,7 @@ import {
   type COutput,
   type CoinInput,
   type SelectionError,
+  type SelectionRng,
 } from "./coin-selection.js";
 import {
   CryptoRng,
@@ -826,6 +827,9 @@ export interface CreateTransactionParams {
   taprootKeyPath?: boolean;
   taprootScriptPath?: boolean;
   preimages?: string[];
+  // Randomness for selection shuffles, change target, input order, and change
+  // position. Defaults to crypto-random; tests inject a seeded RNG.
+  rng?: SelectionRng;
 }
 
 export interface CreateTransactionResult {
@@ -1501,6 +1505,7 @@ function buildUnifiedTransaction(args: {
   changeIndex: number;
   txLockTime: number;
   taprootKeyPath: boolean;
+  rng: SelectionRng;
 }): Transaction {
   const { parsed } = args;
   const btcNet = args.network === "mainnet" ? NETWORK : TEST_NETWORK;
@@ -1510,11 +1515,34 @@ function buildUnifiedTransaction(args: {
     disableScriptCheck: true,
   });
 
-  for (const prepared of args.selected) tx.addInput(prepared.input);
-  tx.addOutputAddress(args.toAddress, args.amount, btcNet);
-
+  // Recipients first, then insert change at a random position so it isn't a
+  // fixed-index fingerprint (rng.randrange(n + 1)). libnunchuk draws the change
+  // position before shuffling inputs, so keep that RNG order here.
+  const outputs: Array<{ address: string; amount: bigint; isChange: boolean }> = [
+    { address: args.toAddress, amount: args.amount, isChange: false },
+  ];
   if (args.changeAddress && args.changeAmount > 0n) {
-    tx.addOutputAddress(args.changeAddress, args.changeAmount, btcNet);
+    const pos = Number(args.rng.randrange(BigInt(outputs.length + 1)));
+    outputs.splice(pos, 0, {
+      address: args.changeAddress,
+      amount: args.changeAmount,
+      isChange: true,
+    });
+  }
+
+  // Shuffle the final input order so it doesn't leak the selection algorithm
+  // (GetShuffledInputVector). A single input is a no-op.
+  const shuffledInputs = [...args.selected];
+  args.rng.shuffle(shuffledInputs);
+  for (const prepared of shuffledInputs) tx.addInput(prepared.input);
+
+  let changeOutputIndex = -1;
+  outputs.forEach((out, i) => {
+    tx.addOutputAddress(out.address, out.amount, btcNet);
+    if (out.isChange) changeOutputIndex = i;
+  });
+
+  if (changeOutputIndex >= 0) {
     const changePayment =
       parsed.kind === "multisig"
         ? deriveMultisigPayment(
@@ -1528,7 +1556,7 @@ function buildUnifiedTransaction(args: {
           )
         : deriveDescriptorPayment(args.wallet.descriptor, args.network, 1, args.changeIndex);
     tx.updateOutput(
-      tx.outputsLength - 1,
+      changeOutputIndex,
       buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath: args.taprootKeyPath }),
     );
   }
@@ -1626,6 +1654,7 @@ export async function createTransaction(
     taprootKeyPath: requestedTaprootKeyPath,
     taprootScriptPath = false,
     preimages = [],
+    rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
   if (parsed.kind !== "miniscript" && miniscriptPath != null) {
@@ -1766,7 +1795,7 @@ export async function createTransaction(
     txNoinputsSize,
     paymentValue: amount,
     subtractFeeOutputs: false,
-    rng: new CryptoRng(),
+    rng,
   });
 
   // All wallet coins are our own (from_me) and the eligibility ladder only needs
@@ -1868,6 +1897,7 @@ export async function createTransaction(
     changeIndex: nextChangeIndex,
     txLockTime,
     taprootKeyPath,
+    rng,
   });
 
   // Step 8: Add global xpubs
