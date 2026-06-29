@@ -459,6 +459,164 @@ function createMiniscriptElectrumMock(
   };
 }
 
+// Funds the wallet's first receive address with several independent UTXOs so
+// coin selection actually has a set to choose from. Amounts must be distinct
+// (createFundingHex derives the txid from the output, so equal amounts collide).
+function createMultiUtxoElectrumMock(
+  descriptor: string,
+  amounts: bigint[],
+  height = 200,
+  blocktime = 1_700_000_000,
+): { electrum: ElectrumClient; txids: string[] } {
+  const receiveAddress = deriveDescriptorAddresses(descriptor, "testnet", 0, 0, 1)[0];
+  const scripthash = addressToScripthash(receiveAddress, "testnet");
+  const funding = amounts.map((amount) => createFundingHex(receiveAddress, amount));
+  const hexByTxid = new Map(funding.map((f) => [f.txid, f.rawHex]));
+  const utxos = funding.map((f, i) => ({
+    tx_hash: f.txid,
+    tx_pos: 0,
+    height,
+    value: Number(amounts[i]),
+  }));
+  const getTransaction = vi.fn(async (hash: string) => {
+    const rawHex = hexByTxid.get(hash);
+    if (!rawHex) throw new Error("unknown tx");
+    return rawHex;
+  });
+  const listUnspent = vi.fn(async (hash: string) => (hash === scripthash ? utxos : []));
+  const getHistory = vi.fn(async (hash: string) =>
+    hash === scripthash ? utxos.map((u) => ({ tx_hash: u.tx_hash, height })) : [],
+  );
+  const getBlockHeader = vi.fn(async (requestedHeight: number) => {
+    if (requestedHeight !== height) throw new Error("unknown block");
+    return createBlockHeaderHex(blocktime);
+  });
+
+  return {
+    txids: funding.map((f) => f.txid),
+    electrum: {
+      estimateFee: vi.fn(async () => 0.00001),
+      getTransaction,
+      getTransactionBatch: vi.fn(async (hashes: string[]) =>
+        Promise.all(hashes.map(getTransaction)),
+      ),
+      listUnspent,
+      listUnspentBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(listUnspent))),
+      getHistory,
+      getHistoryBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(getHistory))),
+      getBlockHeader,
+      getBlockHeaderBatch: vi.fn(async (heights: number[]) =>
+        Promise.all(heights.map(getBlockHeader)),
+      ),
+    } as unknown as ElectrumClient,
+  };
+}
+
+describe("createTransaction coin selection (multi-UTXO end-to-end)", () => {
+  // Sum of every input's value and every output's value, read off the PSBT.
+  function sumInOut(tx: Transaction): { totalIn: bigint; totalOut: bigint } {
+    let totalIn = 0n;
+    for (let i = 0; i < tx.inputsLength; i++) {
+      totalIn += tx.getInput(i).witnessUtxo!.amount;
+    }
+    let totalOut = 0n;
+    for (let i = 0; i < tx.outputsLength; i++) {
+      totalOut += tx.getOutput(i).amount!;
+    }
+    return { totalIn, totalOut };
+  }
+
+  it("selects a subset and balances inputs = outputs + fee (segwit multisig)", async () => {
+    const amounts = [40_000n, 35_000n, 30_000n, 25_000n, 22_000n, 18_000n];
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, amounts);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Selection chose a proper subset of the available UTXOs (not all of them).
+      expect(tx.inputsLength).toBeGreaterThanOrEqual(1);
+      expect(tx.inputsLength).toBeLessThan(amounts.length);
+
+      // Every selected input is one of our funded UTXOs (amounts are distinct).
+      const fundedAmounts = new Set(amounts);
+      for (let i = 0; i < tx.inputsLength; i++) {
+        expect(fundedAmounts.has(tx.getInput(i).witnessUtxo!.amount)).toBe(true);
+      }
+
+      // The recipient is paid exactly, and inputs cover amount + fee.
+      const { totalIn, totalOut } = sumInOut(tx);
+      expect([...Array(tx.outputsLength).keys()].map((i) => tx.getOutput(i).amount)).toContain(
+        10_000n,
+      );
+      expect(result.fee).toBeGreaterThan(0n);
+      expect(totalIn - totalOut).toBe(result.fee); // value conservation
+      expect(totalIn).toBeGreaterThanOrEqual(10_000n + result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("selects a subset for a taproot key-path multisig wallet", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 2);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 2,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const amounts = [40_000n, 33_000n, 27_000n, 21_000n, 16_000n];
+    const { electrum } = createMultiUtxoElectrumMock(descriptor, amounts);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+
+      expect(tx.inputsLength).toBeGreaterThanOrEqual(1);
+      expect(tx.inputsLength).toBeLessThan(amounts.length);
+
+      // Key-path spend: every input carries a taproot internal key, no leaf script.
+      for (let i = 0; i < tx.inputsLength; i++) {
+        const input = tx.getInput(i);
+        expect(input.tapInternalKey).toHaveLength(32);
+        expect(input.tapLeafScript ?? []).toEqual([]);
+      }
+
+      const { totalIn, totalOut } = sumInOut(tx);
+      expect(result.fee).toBeGreaterThan(0n);
+      expect(totalIn - totalOut).toBe(result.fee);
+      expect(totalIn).toBeGreaterThanOrEqual(10_000n + result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
