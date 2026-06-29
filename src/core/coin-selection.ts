@@ -271,7 +271,7 @@ export class SelectionResult {
 
   // std::min_element-compatible: returns < 0 if `this` is better, > 0 if `other`
   // is better, 0 if tied. Tie-break: prefer more inputs (matches
-  // coinselection.cpp:948-954).
+  // coinselection.cpp SelectionResult::operator<).
   compare(other: SelectionResult): number {
     const a = this.getWaste();
     const b = other.getWaste();
@@ -299,7 +299,7 @@ function descending(a: OutputGroup, b: OutputGroup): number {
 }
 
 // -- Branch and Bound --
-// coinselection.cpp:93-201
+// coinselection.cpp SelectCoinsBnB
 export function selectCoinsBnB(
   utxoPool: OutputGroup[],
   selectionTarget: bigint,
@@ -400,7 +400,7 @@ export function selectCoinsBnB(
 }
 
 // -- Knapsack + ApproximateBestSubset --
-// coinselection.cpp:602-650 (ApproximateBestSubset), :652-747 (KnapsackSolver)
+// coinselection.cpp ApproximateBestSubset / KnapsackSolver
 
 export function approximateBestSubset(
   rng: SelectionRng,
@@ -526,7 +526,7 @@ export function knapsackSolver(
 }
 
 // -- Single Random Draw --
-// coinselection.cpp:536-588
+// coinselection.cpp SelectCoinsSRD
 
 export function selectCoinsSRD(
   utxoPool: OutputGroup[],
@@ -586,7 +586,7 @@ export function selectCoinsSRD(
 }
 
 // -- Change target --
-// coinselection.cpp:809-818
+// coinselection.cpp GenerateChangeTarget
 export function generateChangeTarget(
   paymentValue: bigint,
   changeFee: bigint,
@@ -600,7 +600,7 @@ export function generateChangeTarget(
 }
 
 // -- Group outputs (avoidPartialSpends=false simplification) --
-// selector.cpp:165-302
+// selector.cpp GroupOutputs
 
 export interface Groups {
   positive: OutputGroup[];
@@ -657,7 +657,7 @@ export function groupOutputs(
 }
 
 // -- ChooseSelectionResult --
-// selector.cpp:39-128
+// selector.cpp ChooseSelectionResult
 
 export function chooseSelectionResult(
   target: bigint,
@@ -715,7 +715,7 @@ export function chooseSelectionResult(
 }
 
 // -- AttemptSelection --
-// selector.cpp:130-163 — collapses to chooseSelectionResult for a single
+// selector.cpp AttemptSelection — collapses to chooseSelectionResult for a single
 // output type (libnunchuk wallets have one addressType).
 export function attemptSelection(
   target: bigint,
@@ -726,7 +726,7 @@ export function attemptSelection(
 }
 
 // -- AutomaticCoinSelection --
-// selector.cpp:304-428 (eligibility filter ladder)
+// selector.cpp AutomaticCoinSelection (eligibility filter ladder)
 export function automaticCoinSelection(
   availableCoins: COutput[],
   valueToSelect: bigint,
@@ -821,7 +821,7 @@ export function automaticCoinSelection(
 }
 
 // -- selectCoins --
-// selector.cpp:430-489 — top-level entry, no preset inputs (libnunchuk's
+// selector.cpp SelectCoins — top-level entry, no preset inputs (libnunchuk's
 // CreateTransaction does not preselect).
 export function selectCoins(
   availableCoins: COutput[],

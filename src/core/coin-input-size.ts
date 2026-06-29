@@ -1,6 +1,6 @@
 // Per-coin signed input vsize estimation + change-output size / dust helpers.
 // Feeds CoinInput.inputVBytes for the coin-selection port, mirroring
-// libnunchuk's spender.cpp:62-130 (MaxInputWeight / GetVirtualTransactionInputSize).
+// libnunchuk's spender.cpp MaxInputWeight / GetVirtualTransactionInputSize.
 
 import { TaprootControlBlock } from "@scure/btc-signer/psbt.js";
 import { CFeeRate } from "./coin-selection.js";
@@ -19,7 +19,7 @@ const SCHNORR_SIG_BYTES = 64;
 
 // Build the witness items for a script-path spend of `witnessScript` along
 // `plan`. Used by both fee estimation and input-size estimation. Mirrors
-// libnunchuk spender.cpp:166-198 (GetStackAndWitnessSize).
+// libnunchuk spender.cpp GetStackAndWitnessSize.
 //
 // When `controlBlock` is provided the spend is a taproot script-path: signatures
 // are 64-byte Schnorr and the control block is pushed as the final witness item

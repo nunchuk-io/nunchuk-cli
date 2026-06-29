@@ -1,5 +1,5 @@
 // CoinSelectionParams factory + RNG implementations.
-// Mirrors libnunchuk spender.cpp:200-371 setup. The pure algorithm lives in
+// Mirrors libnunchuk spender.cpp CreateTransaction setup. The pure algorithm lives in
 // coin-selection.ts; this module composes the inputs it consumes.
 
 import { randomBytes } from "node:crypto";
@@ -13,10 +13,10 @@ import {
 // libnunchuk pins this for change_spend_size — the assumed virtual size of a
 // future input that spends the change output. Not the wallet's real input size:
 // Bitcoin Core uses a nested-segwit estimate as a conservative proxy.
-// Source: contrib/bitcoin/src/wallet/wallet.h:144.
+// Source: contrib/bitcoin/src/wallet/wallet.h DUMMY_NESTED_P2WPKH_INPUT_SIZE.
 export const DUMMY_NESTED_P2WPKH_INPUT_SIZE = 91;
 
-// libnunchuk pins: spender.cpp:267 (long-term) and :285 (discard).
+// libnunchuk pins these in spender.cpp CreateTransaction (long-term and discard feerates).
 export const DEFAULT_LONG_TERM_FEERATE_SAT_PER_KVB = 10_000n;
 export const DEFAULT_DISCARD_FEERATE_SAT_PER_KVB = 3_000n;
 
@@ -113,7 +113,7 @@ export function compactSizeBytes(n: number): number {
   return 9;
 }
 
-// Mirrors spender.cpp:318-332:
+// Mirrors spender.cpp CreateTransaction (tx_noinputs_size):
 //   tx_noinputs_size = 10 (header) + compactSize(n_recipients) + Σ serialize(output)
 // Each recipient output is serialized as 8 (value) + compactSize(scriptLen) + scriptLen.
 // Caller passes the script lengths.
@@ -145,7 +145,7 @@ export interface BuildCoinSelectionParamsArgs {
   // tx_noinputs_size (header + output overhead + Σ recipient outputs).
   txNoinputsSize: number;
   // Average payment value, used to randomize the minimum change target.
-  // libnunchuk passes floor(recipients_sum / n_recipients) (spender.cpp:302-304).
+  // libnunchuk passes floor(recipients_sum / n_recipients) (spender.cpp CreateTransaction).
   paymentValue: bigint;
   subtractFeeOutputs?: boolean;
   rng: SelectionRng;
@@ -164,16 +164,16 @@ export function buildCoinSelectionParams(args: BuildCoinSelectionParamsArgs): Co
   const changeOutputSize = args.changeOutputSize;
   const changeSpendSize = args.changeSpendSize ?? DUMMY_NESTED_P2WPKH_INPUT_SIZE;
 
-  // spender.cpp:294-300
+  // spender.cpp CreateTransaction (change_fee, cost_of_change)
   const changeFee = effectiveFeerate.getFee(changeOutputSize);
   const costOfChange = discardFeerate.getFee(changeSpendSize) + changeFee;
 
-  // spender.cpp:309-314
+  // spender.cpp CreateTransaction (min_viable_change)
   const changeSpendFee = discardFeerate.getFee(changeSpendSize);
   const dust = args.changeOutputDust;
   const minViableChange = changeSpendFee + 1n > dust ? changeSpendFee + 1n : dust;
 
-  // spender.cpp:302-304
+  // spender.cpp CreateTransaction (min_change_target)
   const minChangeTarget = generateChangeTarget(args.paymentValue, changeFee, args.rng);
 
   return {

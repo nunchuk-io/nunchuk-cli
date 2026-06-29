@@ -4,7 +4,7 @@
 //
 // Schema: coins(wallet_id, txid, vout, memo, locked) — see storage.ts.
 // Reference (data model only, not on-chain): libnunchuk UnspentOutput::get_memo /
-// is_locked (include/nunchuk.h:684-686).
+// is_locked (include/nunchuk.h).
 
 import type { Network } from "./config.js";
 import { getDatabase } from "./storage.js";

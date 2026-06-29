@@ -1,7 +1,7 @@
 // Coin (UTXO) listing with status derivation + memo/lock join.
 // Source-of-truth references:
-//   libnunchuk include/nunchuk.h:130-137 (CoinStatus enum)
-//   libnunchuk src/storage/walletdb.cpp:2120-2207 (status derivation)
+//   libnunchuk include/nunchuk.h (CoinStatus enum)
+//   libnunchuk src/storage/walletdb.cpp NunchukWalletDb::GetCoinsFromTransactions (status derivation)
 //
 // Status priority (monotonic, only raise):
 //   INCOMING_PENDING_CONFIRMATION (0)
