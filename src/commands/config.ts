@@ -206,7 +206,6 @@ feeRateCommand
 
     print(
       {
-        email,
         defaultFeeLevel: level ?? DEFAULT_FEE_LEVEL,
         source: level ? "custom" : "default",
       },
@@ -237,7 +236,6 @@ feeRateCommand
 
     print(
       {
-        email,
         defaultFeeLevel: level,
         source: "custom",
         message: `Default fee rate set to ${level} for ${email}`,
@@ -258,7 +256,6 @@ feeRateCommand
 
     print(
       {
-        email,
         defaultFeeLevel: DEFAULT_FEE_LEVEL,
         source: "default",
         message: `Default fee rate reset for ${email}`,
