@@ -101,6 +101,32 @@ function parseFeeLevelOption(value: string): FeeLevel {
   return value;
 }
 
+// Resolve the recipient amount for `tx create` / `tx draft`. With --send-all the
+// engine sweeps the whole balance, so no amount is needed (and any --amount is
+// ignored with a warning). Otherwise exactly one --amount is required, converted
+// from its --currency to sats.
+async function resolveSendAmount(
+  options: { amount?: string; currency?: string },
+  sendAll: boolean,
+): Promise<bigint> {
+  if (sendAll) {
+    if (options.amount != null) {
+      console.error("Warning: --amount is ignored when --send-all is set.");
+    }
+    return 0n; // ignored by createTransaction when sendAll is true
+  }
+  if (options.amount == null) {
+    throw new Error("Provide --amount, or use --send-all to send the entire balance.");
+  }
+  const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
+  const rates = currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
+  const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
+  if (sendAmount <= 0n) {
+    throw new Error("Amount must convert to at least 1 sat");
+  }
+  return sendAmount;
+}
+
 function parsePreimageOption(value: string, previous: string[]): string[] {
   const next = value
     .split(",")
@@ -378,7 +404,11 @@ txCommand
   .description("Create a new transaction")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
   .requiredOption("--to <address>", "Recipient address")
-  .requiredOption("--amount <value>", "Amount to send")
+  .option("--amount <value>", "Amount to send (required unless --send-all)")
+  .option(
+    "--send-all",
+    "Send the entire wallet balance (the fee is subtracted from the amount; overrides --amount)",
+  )
   .option(
     "--currency <code>",
     "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
@@ -428,13 +458,8 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
-        const rates =
-          currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
-        const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
-        if (sendAmount <= 0n) {
-          throw new Error("Amount must convert to at least 1 sat");
-        }
+        const sendAll = Boolean(options.sendAll);
+        const sendAmount = await resolveSendAmount(options, sendAll);
         // Effective fee level for the auto-estimate: one-shot --fee-level wins,
         // else the account's saved default, else the built-in default (economy).
         const feeLevel =
@@ -446,6 +471,7 @@ txCommand
           electrum,
           toAddress: options.to,
           amount: sendAmount,
+          sendAll,
           miniscriptPath: options.miniscriptPath,
           taprootScriptPath: options.taprootScriptPath,
           preimages: options.preimage,
@@ -455,6 +481,10 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
         });
+        // Under send-all there is no requested amount; the gross amount sent is
+        // the swept balance (recipient + fee). recipientAmount + fee also equals
+        // the requested amount in the normal subtract case, so this is uniform.
+        const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
         const detail = await decodePsbtDetailWithTimelockMetadata(
@@ -475,7 +505,9 @@ txCommand
               feeLevel: result.feeLevel ?? null,
               antiFeeSniping: Boolean(options.antiFeeSniping),
               lockTime: result.lockTime,
+              sendAll,
               subtractFee: result.subtractFee,
+              amount: grossAmount.toString(),
               recipientAmount: result.recipientAmount.toString(),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
@@ -498,7 +530,11 @@ txCommand
         );
         console.log(`  Fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})`);
         console.log(`  Recipient: ${options.to}`);
-        console.log(`  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})`);
+        console.log(
+          `  Amount: ${formatBtc(grossAmount)} (${formatSats(grossAmount)})${
+            sendAll ? " (send all)" : ""
+          }`,
+        );
         if (result.subtractFee) {
           console.log(
             `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
@@ -534,7 +570,11 @@ txCommand
   .description("Preview a transaction (fee, total, change, input coins) without creating it")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
   .requiredOption("--to <address>", "Recipient address")
-  .requiredOption("--amount <value>", "Amount to send")
+  .option("--amount <value>", "Amount to send (required unless --send-all)")
+  .option(
+    "--send-all",
+    "Send the entire wallet balance (the fee is subtracted from the amount; overrides --amount)",
+  )
   .option(
     "--currency <code>",
     "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
@@ -583,13 +623,8 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
-        const rates =
-          currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
-        const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
-        if (sendAmount <= 0n) {
-          throw new Error("Amount must convert to at least 1 sat");
-        }
+        const sendAll = Boolean(options.sendAll);
+        const sendAmount = await resolveSendAmount(options, sendAll);
 
         const feeLevel =
           options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
@@ -601,6 +636,7 @@ txCommand
           electrum,
           toAddress: options.to,
           amount: sendAmount,
+          sendAll,
           miniscriptPath: options.miniscriptPath,
           taprootScriptPath: options.taprootScriptPath,
           preimages: options.preimage,
@@ -609,6 +645,9 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
         });
+        // Under send-all the gross amount sent is the swept balance (recipient +
+        // fee); otherwise it is the requested amount.
+        const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
 
         // Join selected inputs with their block date + confirmations.
         const inputMeta = await fetchPsbtInputTimelockMetadata(result.psbtB64, electrum, network);
@@ -668,8 +707,9 @@ txCommand
           print(
             {
               recipient: options.to,
-              amount: sendAmount.toString(),
-              amountBtc: formatBtc(sendAmount),
+              sendAll,
+              amount: grossAmount.toString(),
+              amountBtc: formatBtc(grossAmount),
               recipientAmount: result.recipientAmount.toString(),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
@@ -699,7 +739,7 @@ txCommand
                 fiatCode && fiatRates
                   ? {
                       code: fiatCode,
-                      amount: fiatValue(sendAmount),
+                      amount: fiatValue(grossAmount),
                       fee: fiatValue(result.fee),
                       total: fiatValue(total),
                       change: fiatValue(result.changeAmount),
@@ -714,7 +754,9 @@ txCommand
         console.log("Draft transaction (not created)");
         console.log(`  Recipient: ${options.to}`);
         console.log(
-          `  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})${fiat(sendAmount)}`,
+          `  Amount: ${formatBtc(grossAmount)} (${formatSats(grossAmount)})${fiat(grossAmount)}${
+            sendAll ? " (send all)" : ""
+          }`,
         );
         if (result.subtractFee) {
           console.log(

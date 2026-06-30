@@ -1165,6 +1165,95 @@ describe("createTransaction subtract fee from amount", () => {
   });
 });
 
+describe("createTransaction send all", () => {
+  it("sweeps every coin with no change; recipient = balance - fee", async () => {
+    const balances = [200_000n, 150_000n, 99_255n];
+    const total = balances.reduce((s, v) => s + v, 0n);
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, balances);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n, // ignored under sendAll
+        feeRateSatPerKvB: 5_000n,
+        sendAll: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Send-all forces subtract-fee on.
+      expect(result.subtractFee).toBe(true);
+      // Every coin is swept.
+      expect(result.selectedInputs.length).toBe(balances.length);
+      expect(tx.inputsLength).toBe(balances.length);
+      const inputSum = result.selectedInputs.reduce((s, i) => s + i.value, 0n);
+      expect(inputSum).toBe(total);
+      // No change; single recipient output = balance - fee.
+      expect(result.changeAddress).toBeNull();
+      expect(tx.outputsLength).toBe(1);
+      expect(result.recipientAmount).toBe(total - result.fee);
+      expect(tx.getOutput(0).amount).toBe(result.recipientAmount);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("forces subtract-fee even when subtractFeeFromAmount is not passed", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [120_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        feeRateSatPerKvB: 5_000n,
+        sendAll: true,
+        // subtractFeeFromAmount intentionally omitted
+      });
+      expect(result.subtractFee).toBe(true);
+      expect(result.recipientAmount).toBe(120_000n - result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("rejects a dust-sized wallet that cannot cover the fee", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [600n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 0n,
+          feeRateSatPerKvB: 50_000n,
+          sendAll: true,
+        }),
+      ).rejects.toThrow(/too small/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("createTransaction result inputs and change", () => {
   it("reports selectedInputs (the chosen UTXOs) and changeAmount", async () => {
     const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [200_000n]);

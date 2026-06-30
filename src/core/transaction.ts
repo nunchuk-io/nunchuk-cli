@@ -842,6 +842,11 @@ export interface CreateTransactionParams {
   // top, so the recipient receives `amount - fee`. The wallet's total spend
   // stays at `amount`.
   subtractFeeFromAmount?: boolean;
+  // Sweep the entire wallet balance to the recipient. Overrides `amount` (set to
+  // the full balance) and forces `subtractFeeFromAmount` on, so the recipient
+  // receives `balance - fee` with no change. libnunchuk has no send-all
+  // primitive — this mirrors the app (amount = balance + subtract_fee).
+  sendAll?: boolean;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -1680,7 +1685,7 @@ export async function createTransaction(
     network,
     electrum,
     toAddress,
-    amount,
+    amount: requestedAmount,
     miniscriptPath,
     taprootKeyPath: requestedTaprootKeyPath,
     taprootScriptPath = false,
@@ -1688,7 +1693,8 @@ export async function createTransaction(
     feeRateSatPerKvB,
     feeLevel = DEFAULT_FEE_LEVEL,
     antiFeeSniping = false,
-    subtractFeeFromAmount = false,
+    subtractFeeFromAmount: requestedSubtractFee = false,
+    sendAll = false,
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1749,6 +1755,15 @@ export async function createTransaction(
   if (utxos.length === 0) {
     throw new Error("No UTXOs found. Wallet has no funds.");
   }
+
+  // Send all funds (sweep): spend every available coin to the recipient with the
+  // fee taken out of the amount, so the recipient receives balance - fee and
+  // there is no change. libnunchuk has no send-all primitive — the app does it as
+  // amount = wallet balance + subtract_fee_from_amount. Selecting all coins makes
+  // the timelock oldest-first cap a no-op (the target equals the full balance).
+  const totalBalance = utxos.reduce((sum, utxo) => sum + utxo.value, 0n);
+  const subtractFeeFromAmount = sendAll ? true : requestedSubtractFee;
+  const amount = sendAll ? totalBalance : requestedAmount;
 
   // Step 2: Fetch full previous transactions for nonWitnessUtxo
   // Reference: FillPsbt adds non_witness_utxo from database (walletdb.cpp:1074-1089)

@@ -463,6 +463,126 @@ describe("tx create", () => {
       expect.objectContaining({ antiFeeSniping: false }),
     );
   });
+
+  it("sweeps the balance with --send-all (no --amount) and marks it", async () => {
+    mockCreateTransaction.mockResolvedValueOnce({
+      changeAddress: null,
+      fee: 308n,
+      feeRateSatPerKvB: 1_000n,
+      lockTime: 0,
+      subtractFee: true,
+      recipientAmount: 24_999_692n,
+      changeAmount: 0n,
+      selectedInputs: [{ txid: "funding-txid", vout: 0, value: 25_000_000n }],
+      psbtB64: TEST_PSBT_B64,
+      txId: "f05830ac99fb27096ddd4b1c05352830b9bbf5462cb2807116baf1ab8b0282e5",
+    });
+
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--send-all",
+      ],
+      { from: "user" },
+    );
+
+    // sendAll forwarded; amount is a placeholder the engine ignores.
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ sendAll: true, amount: 0n }),
+    );
+    const lines = logSpy.mock.calls.map((c) => c[0]).join("\n");
+    // Gross amount = recipientAmount + fee = 25000000, marked "(send all)".
+    expect(lines).toContain("25000000 sat");
+    expect(lines).toContain("(send all)");
+    expect(lines).toContain("Recipient receives:");
+    expect(lines).toContain("24999692 sat");
+  });
+
+  it("ignores --amount with a warning when --send-all is set", async () => {
+    mockCreateTransaction.mockResolvedValueOnce({
+      changeAddress: null,
+      fee: 308n,
+      feeRateSatPerKvB: 1_000n,
+      lockTime: 0,
+      subtractFee: true,
+      recipientAmount: 24_999_692n,
+      changeAmount: 0n,
+      selectedInputs: [{ txid: "funding-txid", vout: 0, value: 25_000_000n }],
+      psbtB64: TEST_PSBT_B64,
+      txId: "f05830ac99fb27096ddd4b1c05352830b9bbf5462cb2807116baf1ab8b0282e5",
+    });
+
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--send-all",
+      ],
+      { from: "user" },
+    );
+
+    expect(errSpy).toHaveBeenCalledWith("Warning: --amount is ignored when --send-all is set.");
+    expect(mockCreateTransaction).toHaveBeenCalledWith(expect.objectContaining({ sendAll: true }));
+  });
+
+  it("errors when neither --amount nor --send-all is given", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // The action throws, printError reports it and calls process.exit(1) (which
+    // surfaces as a rejection in tests).
+    await expect(
+      root.parseAsync(
+        [
+          "tx",
+          "create",
+          "--wallet",
+          "jk74e3up",
+          "--to",
+          "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        ],
+        { from: "user" },
+      ),
+    ).rejects.toThrow();
+
+    expect(mockCreateTransaction).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Provide --amount, or use --send-all"),
+    );
+  });
 });
 
 describe("tx fees", () => {
@@ -621,6 +741,52 @@ describe("tx draft", () => {
     );
     const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
     expect(out).not.toContain("pass --fee-rate");
+  });
+
+  it("previews a send-all sweep without uploading", async () => {
+    mockCreateTransaction.mockResolvedValueOnce({
+      changeAddress: null,
+      fee: 308n,
+      feeRateSatPerKvB: 1_000n,
+      feeLevel: "economy",
+      lockTime: 0,
+      subtractFee: true,
+      recipientAmount: 24_999_692n,
+      changeAmount: 0n,
+      selectedInputs: [{ txid: "funding-txid", vout: 0, value: 25_000_000n }],
+      psbtB64: TEST_PSBT_B64,
+      txId: "f05830ac99fb27096ddd4b1c05352830b9bbf5462cb2807116baf1ab8b0282e5",
+    });
+
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "draft",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--send-all",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockUploadTransaction).not.toHaveBeenCalled();
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ sendAll: true, amount: 0n }),
+    );
+    const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
+    expect(out).toContain("Draft transaction (not created)");
+    expect(out).toContain("(send all)");
+    expect(out).toContain("Recipient receives:");
+    expect(out).toContain("24999692 sat");
   });
 });
 
