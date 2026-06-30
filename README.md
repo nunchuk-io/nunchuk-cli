@@ -336,6 +336,20 @@ Taproot multisig spends use **MuSig2** and need two signing rounds: the first `t
 nunchuk tx broadcast --wallet <id> --tx-id <txid>
 ```
 
+### `coin`
+
+| Command     | Description                                          |
+| ----------- | --------------------------------------------------- |
+| `coin list` | List a wallet's UTXOs (coins) with their status      |
+
+```bash
+nunchuk coin list --wallet <id>
+nunchuk coin list --wallet <id> --status CONFIRMED
+nunchuk --json coin list --wallet <id>
+```
+
+Lists the wallet's unspent outputs from Electrum with a derived status (`CONFIRMED`, `INCOMING_PENDING_CONFIRMATION`, `OUTGOING_PENDING_SIGNATURES`, `OUTGOING_PENDING_BROADCAST`) — outgoing statuses come from pending PSBTs on the group server. Each coin shows its outpoint, address, amount, status, confirmations, and a change flag. Filter with `--status <status>`. Coin memo and lock annotations arrive in a later release.
+
 ### `config`
 
 | Command                        | Description                                                                             |
@@ -344,6 +358,9 @@ nunchuk tx broadcast --wallet <id> --tx-id <txid>
 | `config electrum get`          | Show the active Electrum server for the selected network                                |
 | `config electrum set <server>` | Persist a custom Electrum server (`host:port`, `tcp://host:port`, or `ssl://host:port`) |
 | `config electrum reset`        | Reset the Electrum server to the selected network default                               |
+| `config fee-rate get`          | Show the active account's default fee level (`economy`/`standard`/`priority`)           |
+| `config fee-rate set <level>`  | Save the default fee level for the active account (per account, network-independent)    |
+| `config fee-rate reset`        | Remove the saved default fee level (falls back to `economy`)                            |
 
 Mainnet now defaults to `ssl://mainnet.nunchuk.io:52002`.
 When the protocol is omitted, the CLI tries `ssl://` first, then `tcp://`, and only saves the server if the Electrum connection succeeds.

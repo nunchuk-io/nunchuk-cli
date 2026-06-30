@@ -998,6 +998,34 @@ nunchuk tx get --wallet w123 --tx-id tx456
 
 ---
 
+## Coin Commands
+
+### `nunchuk coin list`
+
+List a wallet's UTXOs (coins) with a derived status. Read-only; queries Electrum for the unspent set and the group server for pending transactions — no local state is stored.
+
+| Option                 | Required | Description                                              |
+| ---------------------- | -------- | -------------------------------------------------------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID                                                |
+| `--status <status>`    | No       | Filter by status (see below)                             |
+
+Status is derived per coin, not stored on-chain:
+
+- `CONFIRMED` / `INCOMING_PENDING_CONFIRMATION` — from the Electrum unspent set (confirmed vs unconfirmed).
+- `OUTGOING_PENDING_SIGNATURES` / `OUTGOING_PENDING_BROADCAST` — raised when the coin is an input of a pending PSBT on the group server (still unspent on-chain, but reserved by an unsigned/unbroadcast transaction).
+
+Each coin shows its outpoint (`txid:vout`), address, amount, status, confirmations, and a `change` flag. Human output marks change coins with `[change]`; JSON returns `{ coins: [{ txid, vout, address, amount, amountBtc, height, confirmations, status, isChange }] }`.
+
+> Coin **memo** and **lock** annotations (and `coin lock` / `unlock` / `memo`) are not in this release — they ship with the local coin store in a later version. This `coin list` is Electrum-derived only.
+
+```bash
+nunchuk coin list --wallet w123
+nunchuk coin list --wallet w123 --status CONFIRMED
+nunchuk --json coin list --wallet w123
+```
+
+---
+
 ## Key Commands
 
 Generate and manage software signing keys (BIP39 mnemonics).
@@ -1160,6 +1188,40 @@ Remove the custom Electrum override for the selected network and fall back to th
 ```bash
 nunchuk config electrum reset
 ```
+
+### `nunchuk config fee-rate get`
+
+Show the active account's default fee level — the level `tx create` uses when no `--fee-rate` / `--fee-level` is given. Output includes the `email`, the `defaultFeeLevel`, and the `source` (`custom` if saved, `default` if falling back to the built-in `economy`).
+
+The preference is stored **per account (email)** and is **network-independent** — the same email shares one value across mainnet and testnet. It lives in `config.json` under `accounts["<email>"].defaultFeeLevel`.
+
+```bash
+nunchuk config fee-rate get
+```
+
+### `nunchuk config fee-rate set <level>`
+
+Save the default fee level for the active account.
+
+| Argument  | Description                                  |
+| --------- | -------------------------------------------- |
+| `<level>` | One of `economy`, `standard`, or `priority`  |
+
+An invalid level is rejected (`INVALID_FEE_LEVEL` / `Fee level must be one of: economy, standard, priority`). The levels map to the recommended-fees fields `hourFee` / `halfHourFee` / `fastestFee`.
+
+```bash
+nunchuk config fee-rate set priority
+```
+
+### `nunchuk config fee-rate reset`
+
+Remove the saved default and fall back to the built-in default (`economy`).
+
+```bash
+nunchuk config fee-rate reset
+```
+
+See [`nunchuk tx create`](#nunchuk-tx-create) for how the saved default fits the fee precedence (`--fee-rate` > `--fee-level` > saved default > `economy`).
 
 ---
 

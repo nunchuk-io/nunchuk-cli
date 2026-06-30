@@ -58,7 +58,7 @@ export class CryptoRng implements SelectionRng {
 
 // Mulberry32-based deterministic RNG for tests. Same API as CryptoRng; given
 // the same seed, produces the same stream. Byte-for-byte parity with C++
-// FastRandomContext is NOT a goal (per docs/03-cli-implementation-plan.md).
+// FastRandomContext is not a goal — only reproducibility within these tests.
 export class SeededRng implements SelectionRng {
   private state: number;
 
