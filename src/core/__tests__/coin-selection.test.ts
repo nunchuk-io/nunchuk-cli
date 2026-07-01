@@ -10,6 +10,7 @@ import {
   approximateBestSubset,
   attemptSelection,
   automaticCoinSelection,
+  chooseSelectionResult,
   eligibleForSpending,
   generateChangeTarget,
   getSelectionAmount,
@@ -23,6 +24,7 @@ import {
   selectCoinsSRD,
   type CoinInput,
   type CoinSelectionParams,
+  type Groups,
   type SelectionRng,
 } from "../coin-selection.js";
 import { SeededRng } from "../coin-selection-params.js";
@@ -557,5 +559,42 @@ describe("attemptSelection + automaticCoinSelection", () => {
     const g = group({ value: 100n, fee: 0n, longTermFee: 0n, effectiveValue: 100n });
     const res = attemptSelection(1_000n, { positive: [g], mixed: [g] }, mkParams());
     expect("error" in res && res.error).toBe("no_solution");
+  });
+});
+
+// -- SFFO does NOT skip BnB (libnunchuk selector.cpp parity) --
+//
+// Upstream Bitcoin Core's ChooseSelectionResult (contrib/.../spend.cpp) skips BnB
+// when subtract-fee-from-outputs is active ("SFFO frequently causes issues in the
+// context of changeless input sets"). libnunchuk's own selector.cpp — the code the
+// driver actually invokes — predates that guard and runs BnB UNCONDITIONALLY, so the
+// port must too. This test pins that divergence: it fails if someone "fixes" the port
+// toward upstream Core by gating BnB on subtractFeeOutputs (the winner would flip from
+// bnb to knapsack for the same coins).
+describe("SFFO does not skip BnB", () => {
+  it("runs BnB and selects its changeless exact match when subtractFeeOutputs is on", () => {
+    // pool 10/5/3, target 8 → BnB finds the exact changeless match {5,3}=8 and, being
+    // pushed first, wins the waste tie. If BnB were skipped, Knapsack would return the
+    // same coins but labelled "knapsack".
+    const mkGroups = (): Groups => ({
+      positive: [
+        group({ value: 10n, txid: "a", subtractFeeOutputs: true }),
+        group({ value: 5n, txid: "b", subtractFeeOutputs: true }),
+        group({ value: 3n, txid: "c", subtractFeeOutputs: true }),
+      ],
+      mixed: [
+        group({ value: 10n, txid: "a", subtractFeeOutputs: true }),
+        group({ value: 5n, txid: "b", subtractFeeOutputs: true }),
+        group({ value: 3n, txid: "c", subtractFeeOutputs: true }),
+      ],
+    });
+    const params = mkParams({ subtractFeeOutputs: true, costOfChange: 1n });
+    const res = chooseSelectionResult(8n, mkGroups(), params);
+    expect("result" in res).toBe(true);
+    if ("result" in res) {
+      expect(res.result.algo).toBe(SelectionAlgorithm.BNB);
+      const txids = res.result.inputs.map((i) => i.coin.txid).sort();
+      expect(txids).toEqual(["b", "c"]);
+    }
   });
 });
