@@ -101,6 +101,20 @@ function parseFeeLevelOption(value: string): FeeLevel {
   return value;
 }
 
+// Parse a repeatable --coin <txid:vout> into a preset outpoint list.
+function parseCoinOption(
+  value: string,
+  previous: Array<{ txid: string; vout: number }>,
+): Array<{ txid: string; vout: number }> {
+  const match = /^([0-9a-fA-F]{64}):(\d+)$/.exec(value);
+  if (!match) {
+    throw new InvalidArgumentError(
+      "--coin must be <txid>:<vout> (64-character hex transaction ID, then the output index)",
+    );
+  }
+  return [...previous, { txid: match[1].toLowerCase(), vout: Number(match[2]) }];
+}
+
 // Resolve the recipient amount for `tx create` / `tx draft`. With --send-all the
 // engine sweeps the whole balance, so no amount is needed (and any --amount is
 // ignored with a warning). Otherwise exactly one --amount is required, converted
@@ -446,6 +460,12 @@ txCommand
     "--subtract-fee",
     "Subtract the network fee from the amount so the recipient receives amount minus fee",
   )
+  .option(
+    "--coin <txid:vout>",
+    "Spend exactly this coin; repeat to select multiple (manual coin selection)",
+    parseCoinOption,
+    [] as Array<{ txid: string; vout: number }>,
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -480,11 +500,13 @@ txCommand
           feeLevel,
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
+          presetCoins: options.coin,
         });
         // Under send-all there is no requested amount; the gross amount sent is
         // the swept balance (recipient + fee). recipientAmount + fee also equals
         // the requested amount in the normal subtract case, so this is uniform.
         const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
+        const manualSelection = options.coin.length > 0;
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
         const detail = await decodePsbtDetailWithTimelockMetadata(
@@ -506,6 +528,12 @@ txCommand
               antiFeeSniping: Boolean(options.antiFeeSniping),
               lockTime: result.lockTime,
               sendAll,
+              coinSelection: manualSelection ? "manual" : "auto",
+              inputs: result.selectedInputs.map((i) => ({
+                txid: i.txid,
+                vout: i.vout,
+                amount: i.value.toString(),
+              })),
               subtractFee: result.subtractFee,
               amount: grossAmount.toString(),
               recipientAmount: result.recipientAmount.toString(),
@@ -544,6 +572,12 @@ txCommand
         }
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
+        }
+        if (manualSelection) {
+          console.log(`  Coins: ${result.selectedInputs.length} selected manually`);
+          for (const i of result.selectedInputs) {
+            console.log(`    ${i.txid}:${i.vout} (${formatSats(i.value)})`);
+          }
         }
         if (options.antiFeeSniping) {
           console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
@@ -612,6 +646,12 @@ txCommand
     "--subtract-fee",
     "Subtract the network fee from the amount so the recipient receives amount minus fee",
   )
+  .option(
+    "--coin <txid:vout>",
+    "Spend exactly this coin; repeat to select multiple (manual coin selection)",
+    parseCoinOption,
+    [] as Array<{ txid: string; vout: number }>,
+  )
   .option("--fiat <code>", "Show fiat values alongside BTC (e.g. --fiat USD)")
   .action(async (options, cmd) => {
     try {
@@ -644,10 +684,12 @@ txCommand
           feeLevel,
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
+          presetCoins: options.coin,
         });
         // Under send-all the gross amount sent is the swept balance (recipient +
         // fee); otherwise it is the requested amount.
         const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
+        const manualSelection = options.coin.length > 0;
 
         // Join selected inputs with their block date + confirmations.
         const inputMeta = await fetchPsbtInputTimelockMetadata(result.psbtB64, electrum, network);
@@ -725,6 +767,7 @@ txCommand
               subtractFee: result.subtractFee,
               antiFeeSniping: Boolean(options.antiFeeSniping),
               lockTime: result.lockTime,
+              coinSelection: manualSelection ? "manual" : "auto",
               inputs: inputs.map((i) => ({
                 txid: i.txid,
                 vout: i.vout,
@@ -784,7 +827,7 @@ txCommand
         if (options.antiFeeSniping) {
           console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
         }
-        console.log("  Input coins:");
+        console.log(`  Input coins${manualSelection ? " (selected manually)" : ""}:`);
         inputs.forEach((i) => {
           const date = i.blocktime > 0 ? formatDate(i.blocktime) : "unconfirmed";
           console.log(

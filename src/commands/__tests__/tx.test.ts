@@ -271,6 +271,80 @@ describe("tx create", () => {
     );
   });
 
+  it("forwards repeated --coin outpoints as preset coins and labels manual selection", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const txidA = "a".repeat(64);
+    const txidB = "B".repeat(64); // uppercase hex is accepted and lowercased
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--coin",
+        `${txidA}:0`,
+        "--coin",
+        `${txidB}:3`,
+      ],
+      { from: "user" },
+    );
+
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        presetCoins: [
+          { txid: txidA, vout: 0 },
+          { txid: "b".repeat(64), vout: 3 },
+        ],
+      }),
+    );
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("selected manually");
+  });
+
+  it("rejects a malformed --coin outpoint", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+    // Parse errors surface in the subcommand, which needs its own exit override.
+    for (const sub of txCommand.commands) sub.exitOverride();
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    await expect(
+      root.parseAsync(
+        [
+          "tx",
+          "create",
+          "--wallet",
+          "jk74e3up",
+          "--to",
+          "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+          "--amount",
+          "0.2",
+          "--coin",
+          "nothex:0",
+        ],
+        { from: "user" },
+      ),
+    ).rejects.toThrow(/--coin must be/);
+    expect(mockCreateTransaction).not.toHaveBeenCalled();
+  });
+
   it("forwards --fee-level as the auto-estimate level", async () => {
     const { txCommand } = await import("../tx.js");
     const root = new Command();
@@ -741,6 +815,24 @@ describe("tx draft", () => {
     );
     const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
     expect(out).not.toContain("pass --fee-rate");
+  });
+
+  it("forwards --coin outpoints and marks the input list as manually selected", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const txidA = "a".repeat(64);
+    await root.parseAsync([...baseArgs, "--coin", `${txidA}:1`], { from: "user" });
+
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ presetCoins: [{ txid: txidA, vout: 1 }] }),
+    );
+    const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
+    expect(out).toContain("Input coins (selected manually):");
   });
 
   it("previews a send-all sweep without uploading", async () => {
