@@ -171,9 +171,7 @@ export function insertIntoGroup(
   }
 }
 
-// Wraps one COutput in a one-coin OutputGroup so preset coins can go through
-// SelectionResult.addInput (mirrors SelectionResult::AddInputs, which appends
-// pre-selected coins one by one).
+// Wraps one COutput in a one-coin OutputGroup for SelectionResult.addInput.
 export function singleCoinGroup(output: COutput, params: CoinSelectionParams): OutputGroup {
   const group = makeOutputGroup(params.subtractFeeOutputs);
   insertIntoGroup(group, output);
@@ -832,13 +830,9 @@ export function automaticCoinSelection(
 // -- selectCoins --
 // selector.cpp SelectCoins — top-level entry.
 //
-// Preset inputs are EXACT-SET: NunchukImpl::CreatePsbt passes the user's chosen
-// coins as the entire available pool, so the automatic pool is empty and the
-// preset either covers the target by itself (MANUAL result with every preset
-// coin — no subset optimization, mirroring SelectionResult::AddInputs on
-// PreSelectedInputs) or the spend fails with insufficient funds. The upstream
-// Bitcoin Core Merge / m_allow_other_inputs auto-top-up branches are dead code
-// in the libnunchuk integration and are intentionally not ported.
+// Preset inputs are exact-set: every preset coin is spent (no subset
+// optimization) and a shortfall is insufficient funds — there is no automatic
+// top-up.
 export function selectCoins(
   availableCoins: COutput[],
   targetValue: bigint,
@@ -847,12 +841,11 @@ export function selectCoins(
 ): { result: SelectionResult } | { error: SelectionError } {
   if (presetInputs.length > 0) {
     if (availableCoins.length > 0) {
-      // Exact-set semantics leave no role for an automatic pool; a caller
-      // passing both is a bug, not a selection failure.
+      // An automatic pool alongside presets is a caller bug, not a selection failure.
       throw new Error("selectCoins: presetInputs requires an empty availableCoins pool");
     }
-    // FetchSelectedInputs: total is effective value, or raw value under
-    // subtract-fee-from-outputs.
+    // Preset total: effective value, or raw value when subtracting the fee
+    // from outputs.
     let presetTotal = 0n;
     for (const c of presetInputs) {
       presetTotal += params.subtractFeeOutputs ? c.coin.value : c.effectiveValue;

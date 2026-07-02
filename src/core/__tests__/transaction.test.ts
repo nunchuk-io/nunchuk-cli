@@ -717,6 +717,153 @@ describe("createTransaction coin selection (multi-UTXO end-to-end)", () => {
   });
 });
 
+describe("createTransaction manual coin selection (presetCoins)", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n, 25_000n, 22_000n, 18_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("spends exactly the preset coins and nothing else", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 50_000n,
+        presetCoins: [
+          { txid: txids[1], vout: 0 }, // 35_000
+          { txid: txids[3], vout: 0 }, // 25_000
+        ],
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(tx.inputsLength).toBe(2);
+      const inputAmounts = [...Array(tx.inputsLength).keys()]
+        .map((i) => tx.getInput(i).witnessUtxo!.amount)
+        .sort((a, b) => Number(a - b));
+      expect(inputAmounts).toEqual([25_000n, 35_000n]);
+      expect(result.selectedInputs.map((s) => s.txid).sort()).toEqual([txids[1], txids[3]].sort());
+
+      // Recipient paid exactly; inputs = outputs + fee.
+      let totalOut = 0n;
+      const outAmounts: bigint[] = [];
+      for (let i = 0; i < tx.outputsLength; i++) {
+        outAmounts.push(tx.getOutput(i).amount!);
+        totalOut += tx.getOutput(i).amount!;
+      }
+      expect(outAmounts).toContain(50_000n);
+      expect(60_000n - totalOut).toBe(result.fee);
+    });
+  });
+
+  it("includes every preset coin even when one alone would cover (no subset optimization)", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        presetCoins: [
+          { txid: txids[0], vout: 0 }, // 40_000 — alone would cover
+          { txid: txids[4], vout: 0 }, // 22_000
+          { txid: txids[5], vout: 0 }, // 18_000
+        ],
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(tx.inputsLength).toBe(3);
+    });
+  });
+
+  it("fails with insufficient funds when the preset cannot cover amount + fee (no auto top-up)", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Wallet holds plenty (170k total) — but the preset alone must cover.
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 20_000n,
+          presetCoins: [{ txid: txids[5], vout: 0 }], // 18_000
+        }),
+      ).rejects.toThrow(/insufficient funds/i);
+    });
+  });
+
+  it("rejects an outpoint that is not a spendable UTXO of the wallet", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [{ txid: txids[0], vout: 7 }],
+        }),
+      ).rejects.toThrow(/not a spendable UTXO/);
+    });
+  });
+
+  it("rejects a duplicate preset outpoint", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [
+            { txid: txids[0], vout: 0 },
+            { txid: txids[0], vout: 0 },
+          ],
+        }),
+      ).rejects.toThrow(/Duplicate coin/);
+    });
+  });
+
+  it("send-all with presets sweeps only the preset coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        presetCoins: [
+          { txid: txids[2], vout: 0 }, // 30_000
+          { txid: txids[3], vout: 0 }, // 25_000
+        ],
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Only the two preset coins are swept — not the wallet's other four.
+      expect(tx.inputsLength).toBe(2);
+      expect(tx.outputsLength).toBe(1); // no change on a sweep
+      expect(result.changeAddress).toBeNull();
+      expect(tx.getOutput(0).amount).toBe(55_000n - result.fee);
+      expect(result.recipientAmount).toBe(55_000n - result.fee);
+    });
+  });
+});
+
 describe("createTransaction privacy (input shuffle + change position)", () => {
   it("places the change output at both positions across RNG seeds", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);

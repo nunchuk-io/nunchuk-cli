@@ -846,7 +846,11 @@ export interface CreateTransactionParams {
   // the full balance) and forces `subtractFeeFromAmount` on, so the recipient
   // receives `balance - fee` with no change. libnunchuk has no send-all
   // primitive — this mirrors the app (amount = balance + subtract_fee).
+  // Combined with `presetCoins`, sweeps only the preset coins.
   sendAll?: boolean;
+  // Manual coin selection: spend exactly these outpoints. Every preset coin is
+  // spent — no subset optimization, no automatic top-up.
+  presetCoins?: Array<{ txid: string; vout: number }>;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -1695,6 +1699,7 @@ export async function createTransaction(
     antiFeeSniping = false,
     subtractFeeFromAmount: requestedSubtractFee = false,
     sendAll = false,
+    presetCoins = [],
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1751,9 +1756,27 @@ export async function createTransaction(
   }
 
   // Step 1: Scan UTXOs
-  const { utxos, nextChangeIndex } = await scanUtxos(wallet, network, electrum);
-  if (utxos.length === 0) {
+  const { utxos: scannedUtxos, nextChangeIndex } = await scanUtxos(wallet, network, electrum);
+  if (scannedUtxos.length === 0) {
     throw new Error("No UTXOs found. Wallet has no funds.");
+  }
+
+  // Manual coin selection: validate the preset outpoints and restrict the
+  // working set to exactly those coins.
+  let utxos = scannedUtxos;
+  if (presetCoins.length > 0) {
+    const presetKeys = new Set<string>();
+    for (const p of presetCoins) {
+      const key = `${p.txid}:${p.vout}`;
+      if (presetKeys.has(key)) {
+        throw new Error(`Duplicate coin ${key}.`);
+      }
+      presetKeys.add(key);
+      if (!scannedUtxos.some((u) => u.txHash === p.txid && u.txPos === p.vout)) {
+        throw new Error(`Coin ${key} is not a spendable UTXO of this wallet.`);
+      }
+    }
+    utxos = scannedUtxos.filter((u) => presetKeys.has(`${u.txHash}:${u.txPos}`));
   }
 
   // Send all funds (sweep): spend every available coin to the recipient with the
@@ -1761,6 +1784,8 @@ export async function createTransaction(
   // there is no change. libnunchuk has no send-all primitive — the app does it as
   // amount = wallet balance + subtract_fee_from_amount. Selecting all coins makes
   // the timelock oldest-first cap a no-op (the target equals the full balance).
+  // With preset coins the working set is already restricted, so the sweep covers
+  // only the chosen coins (app behavior: select coins → send max).
   const totalBalance = utxos.reduce((sum, utxo) => sum + utxo.value, 0n);
   const subtractFeeFromAmount = sendAll ? true : requestedSubtractFee;
   const amount = sendAll ? totalBalance : requestedAmount;
@@ -1880,13 +1905,23 @@ export async function createTransaction(
     subtractFeeFromAmount ? 0 : txNoinputsSize,
   );
   const selectionTarget = amount + notInputFees;
-  const candidateOutputs = availableCandidates(
-    coOutputs,
-    inputSequence,
+  // Manual path: no automatic pool. The timelock oldest-first cap only shapes
+  // the automatic pool, so it does not apply.
+  const candidateOutputs =
+    presetCoins.length > 0
+      ? []
+      : availableCandidates(
+          coOutputs,
+          inputSequence,
+          selectionTarget,
+          selectionParams.subtractFeeOutputs,
+        );
+  const sel = selectCoins(
+    candidateOutputs,
     selectionTarget,
-    selectionParams.subtractFeeOutputs,
+    selectionParams,
+    presetCoins.length > 0 ? coOutputs : [],
   );
-  const sel = selectCoins(candidateOutputs, selectionTarget, selectionParams);
   if (!("result" in sel)) throw humanizeSelectionError(sel.error);
 
   const selected: PreparedWalletInput[] = sel.result.inputs.map((co) => {

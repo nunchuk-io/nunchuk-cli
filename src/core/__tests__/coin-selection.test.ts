@@ -600,12 +600,8 @@ describe("SFFO does not skip BnB", () => {
 });
 
 // -- Manual (preset) coin selection: exact-set semantics --
-//
-// NunchukImpl::CreatePsbt passes the user's chosen coins as the entire available
-// pool, so preset selection is exact-set: every preset coin is spent (no subset
-// optimization), and a shortfall is insufficient funds — there is no automatic
-// top-up (Bitcoin Core's Merge / m_allow_other_inputs branches are dead code in
-// the libnunchuk integration).
+// Every preset coin is spent (no subset optimization); a shortfall is
+// insufficient funds — there is no automatic top-up.
 describe("selectCoins preset path (manual selection)", () => {
   it("returns MANUAL with exactly the preset coins when they cover the target", () => {
     const preset = [
