@@ -171,6 +171,15 @@ export function insertIntoGroup(
   }
 }
 
+// Wraps one COutput in a one-coin OutputGroup so preset coins can go through
+// SelectionResult.addInput (mirrors SelectionResult::AddInputs, which appends
+// pre-selected coins one by one).
+export function singleCoinGroup(output: COutput, params: CoinSelectionParams): OutputGroup {
+  const group = makeOutputGroup(params.subtractFeeOutputs);
+  insertIntoGroup(group, output);
+  return group;
+}
+
 export function getSelectionAmount(group: OutputGroup): bigint {
   return group.subtractFeeOutputs ? group.value : group.effectiveValue;
 }
@@ -821,13 +830,43 @@ export function automaticCoinSelection(
 }
 
 // -- selectCoins --
-// selector.cpp SelectCoins — top-level entry, no preset inputs (libnunchuk's
-// CreateTransaction does not preselect).
+// selector.cpp SelectCoins — top-level entry.
+//
+// Preset inputs are EXACT-SET: NunchukImpl::CreatePsbt passes the user's chosen
+// coins as the entire available pool, so the automatic pool is empty and the
+// preset either covers the target by itself (MANUAL result with every preset
+// coin — no subset optimization, mirroring SelectionResult::AddInputs on
+// PreSelectedInputs) or the spend fails with insufficient funds. The upstream
+// Bitcoin Core Merge / m_allow_other_inputs auto-top-up branches are dead code
+// in the libnunchuk integration and are intentionally not ported.
 export function selectCoins(
   availableCoins: COutput[],
   targetValue: bigint,
   params: CoinSelectionParams,
+  presetInputs: COutput[] = [],
 ): { result: SelectionResult } | { error: SelectionError } {
+  if (presetInputs.length > 0) {
+    if (availableCoins.length > 0) {
+      // Exact-set semantics leave no role for an automatic pool; a caller
+      // passing both is a bug, not a selection failure.
+      throw new Error("selectCoins: presetInputs requires an empty availableCoins pool");
+    }
+    // FetchSelectedInputs: total is effective value, or raw value under
+    // subtract-fee-from-outputs.
+    let presetTotal = 0n;
+    for (const c of presetInputs) {
+      presetTotal += params.subtractFeeOutputs ? c.coin.value : c.effectiveValue;
+    }
+    if (targetValue - presetTotal > 0n) {
+      return { error: "insufficient_funds" };
+    }
+    const result = new SelectionResult(targetValue, SelectionAlgorithm.MANUAL);
+    for (const c of presetInputs) {
+      result.addInput(singleCoinGroup(c, params));
+    }
+    result.recalculateWaste(params.minViableChange, params.costOfChange, params.changeFee);
+    return { result };
+  }
   let totalAvailable = 0n;
   for (const c of availableCoins) {
     if (params.subtractFeeOutputs) {

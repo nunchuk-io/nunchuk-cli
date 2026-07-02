@@ -598,3 +598,88 @@ describe("SFFO does not skip BnB", () => {
     }
   });
 });
+
+// -- Manual (preset) coin selection: exact-set semantics --
+//
+// NunchukImpl::CreatePsbt passes the user's chosen coins as the entire available
+// pool, so preset selection is exact-set: every preset coin is spent (no subset
+// optimization), and a shortfall is insufficient funds — there is no automatic
+// top-up (Bitcoin Core's Merge / m_allow_other_inputs branches are dead code in
+// the libnunchuk integration).
+describe("selectCoins preset path (manual selection)", () => {
+  it("returns MANUAL with exactly the preset coins when they cover the target", () => {
+    const preset = [
+      out(coin({ value: 60_000n, txid: "p1" })),
+      out(coin({ value: 50_000n, txid: "p2" })),
+    ];
+    const res = selectCoins([], 100_000n, mkParams(), preset);
+    expect("result" in res).toBe(true);
+    if ("result" in res) {
+      expect(res.result.algo).toBe(SelectionAlgorithm.MANUAL);
+      const txids = res.result.inputs.map((i) => i.coin.txid).sort();
+      expect(txids).toEqual(["p1", "p2"]);
+    }
+  });
+
+  it("includes ALL preset coins even when a subset would cover (no optimization)", () => {
+    const preset = [
+      out(coin({ value: 500_000n, txid: "big" })),
+      out(coin({ value: 1_000n, txid: "small1" })),
+      out(coin({ value: 1_000n, txid: "small2" })),
+    ];
+    const res = selectCoins([], 100_000n, mkParams(), preset);
+    expect("result" in res).toBe(true);
+    if ("result" in res) {
+      expect(res.result.inputs).toHaveLength(3);
+    }
+  });
+
+  it("over-cover produces change (remainder above the change floor)", () => {
+    const preset = [out(coin({ value: 500_000n, txid: "p1" }))];
+    const params = mkParams();
+    const res = selectCoins([], 100_000n, params, preset);
+    expect("result" in res).toBe(true);
+    if ("result" in res) {
+      expect(res.result.getChange(params.minViableChange, params.changeFee)).toBeGreaterThan(0n);
+    }
+  });
+
+  it("under-cover is insufficient_funds — no automatic top-up", () => {
+    const preset = [out(coin({ value: 40_000n, txid: "p1" }))];
+    const res = selectCoins([], 100_000n, mkParams(), preset);
+    expect("error" in res && res.error).toBe("insufficient_funds");
+  });
+
+  it("measures the preset against effective value, not raw value", () => {
+    // Raw value covers the target, but fees push the effective value below it.
+    const preset = [
+      out(coin({ value: 100_000n, txid: "p1", inputVBytes: 1_000 }), {
+        effectiveFeerate: new CFeeRate(10_000n), // fee 10_000 → effective 90_000
+      }),
+    ];
+    const res = selectCoins([], 95_000n, mkParams(), preset);
+    expect("error" in res && res.error).toBe("insufficient_funds");
+  });
+
+  it("uses raw value under subtract-fee-from-outputs", () => {
+    // Same coin, same target: covered once SFFO switches the basis to raw value.
+    const preset = [
+      out(coin({ value: 100_000n, txid: "p1", inputVBytes: 1_000 }), {
+        effectiveFeerate: new CFeeRate(10_000n),
+      }),
+    ];
+    const res = selectCoins([], 95_000n, mkParams({ subtractFeeOutputs: true }), preset);
+    expect("result" in res).toBe(true);
+    if ("result" in res) {
+      expect(res.result.algo).toBe(SelectionAlgorithm.MANUAL);
+    }
+  });
+
+  it("throws if an automatic pool is passed alongside presets (exact-set misuse)", () => {
+    const preset = [out(coin({ value: 500_000n, txid: "p1" }))];
+    const pool = [out(coin({ value: 300_000n, txid: "a1" }))];
+    expect(() => selectCoins(pool, 100_000n, mkParams(), preset)).toThrow(
+      /presetInputs requires an empty availableCoins/,
+    );
+  });
+});
