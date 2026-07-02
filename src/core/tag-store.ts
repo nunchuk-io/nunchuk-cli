@@ -149,6 +149,23 @@ export function removeCoinTag(
   });
 }
 
+// Resolves a tag and returns the outpoint keys of the coins carrying it.
+// Throws (with near-miss suggestions) when the tag does not exist.
+export function getOutpointsByTag(
+  email: string,
+  network: Network,
+  walletId: string,
+  rawName: string,
+): { name: string; outpoints: Set<string> } {
+  const doc = loadCoinControl(email, network, walletId);
+  const tag = getTagByName(doc, rawName);
+  const outpoints = new Set<string>();
+  for (const [key, entry] of Object.entries(doc.coins)) {
+    if (entry.tags.includes(tag.id)) outpoints.add(key);
+  }
+  return { name: tag.name, outpoints };
+}
+
 // Tag names per outpoint key, for display (e.g. the coin list tag column).
 export function getCoinTagNames(
   email: string,

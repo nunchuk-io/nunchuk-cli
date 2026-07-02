@@ -19,6 +19,7 @@ import { deriveDescriptorAddresses } from "../core/address.js";
 import { loadWallet, removeMusigNonce } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { getLockedOutpoints } from "../core/coin-store.js";
+import { getOutpointsByTag } from "../core/tag-store.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
@@ -467,6 +468,10 @@ txCommand
     parseCoinOption,
     [] as Array<{ txid: string; vout: number }>,
   )
+  .option(
+    "--from-tag <name>",
+    "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -503,6 +508,9 @@ txCommand
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
           lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+          fromTag: options.fromTag
+            ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
+            : undefined,
         });
         // Under send-all there is no requested amount; the gross amount sent is
         // the swept balance (recipient + fee). recipientAmount + fee also equals
@@ -654,6 +662,10 @@ txCommand
     parseCoinOption,
     [] as Array<{ txid: string; vout: number }>,
   )
+  .option(
+    "--from-tag <name>",
+    "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
+  )
   .option("--fiat <code>", "Show fiat values alongside BTC (e.g. --fiat USD)")
   .action(async (options, cmd) => {
     try {
@@ -688,6 +700,9 @@ txCommand
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
           lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+          fromTag: options.fromTag
+            ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
+            : undefined,
         });
         // Under send-all the gross amount sent is the swept balance (recipient +
         // fee); otherwise it is the requested amount.

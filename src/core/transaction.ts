@@ -854,6 +854,9 @@ export interface CreateTransactionParams {
   // "<txid>:<vout>" keys of locked coins. Automatic selection (and --send-all)
   // skips them; an explicit preset spends a locked coin anyway.
   lockedOutpoints?: Set<string>;
+  // Restrict automatic selection (and --send-all) to the coins carrying this
+  // tag. Cannot be combined with presetCoins.
+  fromTag?: { name: string; outpoints: Set<string> };
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -1704,8 +1707,14 @@ export async function createTransaction(
     sendAll = false,
     presetCoins = [],
     lockedOutpoints,
+    fromTag,
     rng = new CryptoRng(),
   } = params;
+  if (fromTag && presetCoins.length > 0) {
+    throw new Error(
+      "--from-tag cannot be combined with --coin (manual selection spends exactly the chosen coins).",
+    );
+  }
   const parsed = parseDescriptor(wallet.descriptor);
   if (parsed.kind !== "miniscript" && miniscriptPath != null) {
     throw new Error("Miniscript signing path selection is only supported for miniscript wallets");
@@ -1781,13 +1790,21 @@ export async function createTransaction(
       }
     }
     utxos = scannedUtxos.filter((u) => presetKeys.has(`${u.txHash}:${u.txPos}`));
-  } else if (lockedOutpoints && lockedOutpoints.size > 0) {
-    // Locked coins never enter automatic selection; explicit presets bypass.
-    utxos = scannedUtxos.filter((u) => !lockedOutpoints.has(`${u.txHash}:${u.txPos}`));
-    if (utxos.length === 0) {
-      throw new Error(
-        "All coins are locked. Unlock coins with `coin unlock` or select them explicitly with --coin.",
-      );
+  } else {
+    if (lockedOutpoints && lockedOutpoints.size > 0) {
+      // Locked coins never enter automatic selection; explicit presets bypass.
+      utxos = utxos.filter((u) => !lockedOutpoints.has(`${u.txHash}:${u.txPos}`));
+      if (utxos.length === 0) {
+        throw new Error(
+          "All coins are locked. Unlock coins with `coin unlock` or select them explicitly with --coin.",
+        );
+      }
+    }
+    if (fromTag) {
+      utxos = utxos.filter((u) => fromTag.outpoints.has(`${u.txHash}:${u.txPos}`));
+      if (utxos.length === 0) {
+        throw new Error(`No spendable coins carry tag #${fromTag.name}.`);
+      }
     }
   }
 

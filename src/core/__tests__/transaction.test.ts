@@ -961,6 +961,104 @@ describe("createTransaction locked coins", () => {
   });
 });
 
+describe("createTransaction --from-tag filter", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("restricts automatic selection to coins carrying the tag", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[2]}:0`]) },
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("send-all with --from-tag sweeps only the tagged coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[1]}:0`, `${txids[2]}:0`]) },
+      });
+      expect(result.selectedInputs.map((i) => i.txid).sort()).toEqual([txids[1], txids[2]].sort());
+      expect(result.recipientAmount).toBe(65_000n - result.fee);
+    });
+  });
+
+  it("errors with the tag name when no spendable coin carries it", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          fromTag: { name: "kyc", outpoints: new Set() },
+        }),
+      ).rejects.toThrow(/No spendable coins carry tag #kyc/);
+    });
+  });
+
+  it("locked coins stay excluded inside the tag-filtered pool", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Both large coins carry the tag, but one is locked.
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]) },
+        lockedOutpoints: new Set([`${txids[0]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[1]);
+    });
+  });
+
+  it("rejects combining --from-tag with --coin presets", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [{ txid: txids[0], vout: 0 }],
+          fromTag: { name: "kyc", outpoints: new Set([`${txids[0]}:0`]) },
+        }),
+      ).rejects.toThrow(/--from-tag cannot be combined with --coin/);
+    });
+  });
+});
+
 describe("createTransaction privacy (input shuffle + change position)", () => {
   it("places the change output at both positions across RNG seeds", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);

@@ -11,6 +11,7 @@ const {
   mockFetchPendingTransaction,
   mockGetDefaultFeeLevel,
   mockGetLockedOutpoints,
+  mockGetOutpointsByTag,
   mockHeadersSubscribe,
   mockLoadWallet,
   mockRemoveMusigNonce,
@@ -24,6 +25,7 @@ const {
   mockFetchPendingTransaction: vi.fn(),
   mockGetDefaultFeeLevel: vi.fn(),
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
+  mockGetOutpointsByTag: vi.fn(),
   mockHeadersSubscribe: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockRemoveMusigNonce: vi.fn(),
@@ -57,6 +59,10 @@ vi.mock("../../core/storage.js", () => ({
 
 vi.mock("../../core/coin-store.js", () => ({
   getLockedOutpoints: mockGetLockedOutpoints,
+}));
+
+vi.mock("../../core/tag-store.js", () => ({
+  getOutpointsByTag: mockGetOutpointsByTag,
 }));
 
 vi.mock("../../core/electrum.js", () => ({
@@ -317,6 +323,45 @@ describe("tx create", () => {
     );
     const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toContain("selected manually");
+  });
+
+  it("forwards --from-tag as the resolved tag outpoints", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const resolved = { name: "kyc", outpoints: new Set(["a".repeat(64) + ":0"]) };
+    mockGetOutpointsByTag.mockReturnValue(resolved);
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--from-tag",
+        "kyc",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockGetOutpointsByTag).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "kyc",
+    );
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ fromTag: resolved }),
+    );
   });
 
   it("rejects a malformed --coin outpoint", async () => {
