@@ -14,7 +14,7 @@ import {
 } from "./paths.js";
 
 const ENCRYPTION_VERSION = 0x01;
-const STORAGE_SCHEMA_VERSION = 4;
+const STORAGE_SCHEMA_VERSION = 5;
 const STORAGE_SCHEMA_VERSION_KEY = "schema_version";
 const PROFILE_META_KEY = "profile";
 const HKDF_INFO = "nunchuk-cli/storage/v1";
@@ -239,6 +239,12 @@ function createSchemaTables(db: Database.Database): void {
       created_at TEXT NOT NULL,
       PRIMARY KEY (nonce_id)
     );
+
+    CREATE TABLE IF NOT EXISTS coin_control (
+      wallet_id TEXT NOT NULL,
+      encrypted BLOB NOT NULL,
+      PRIMARY KEY (wallet_id)
+    );
   `);
 }
 
@@ -296,7 +302,7 @@ function initializeSchema(db: Database.Database): void {
   });
 }
 
-function runInTransaction<T>(db: Database.Database, fn: () => T): T {
+export function runInTransaction<T>(db: Database.Database, fn: () => T): T {
   db.exec("BEGIN IMMEDIATE");
   try {
     const result = fn();

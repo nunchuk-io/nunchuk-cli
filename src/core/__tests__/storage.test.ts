@@ -400,12 +400,42 @@ describe("wallet storage", () => {
     const stored = JSON.parse(
       decrypt(Buffer.from(row.encrypted), getOrCreateMasterKey()),
     ) as Record<string, unknown>;
-    expect(version.value).toBe("4");
+    expect(version.value).toBe("5");
     expect(stored.descriptor).toBe(wallet.descriptor);
     expect(stored.m).toBeUndefined();
     expect(stored.n).toBeUndefined();
     expect(stored.addressType).toBeUndefined();
     expect(stored.signers).toBeUndefined();
+  });
+
+  it("migrates a v4 database to v5 (adds the coin_control table)", () => {
+    const email = trackEmail(uniqueEmail("wallet"));
+    const wallet = makeWallet("w1");
+    saveWallet(email, network, wallet);
+    _closeDatabase();
+
+    // Rewind to a v4 database: drop the coin_control table and set the version.
+    const dbFile = storageDbFile(email, network);
+    const db = new Database(dbFile);
+    db.exec("DROP TABLE IF EXISTS coin_control;");
+    db.prepare("UPDATE meta SET value = ? WHERE key = ?").run("4", "schema_version");
+    db.close();
+
+    // Any storage access migrates forward; existing data survives.
+    expect(loadWallet(email, network, wallet.walletId)).toEqual(wallet);
+    _closeDatabase();
+
+    const migratedDb = new Database(dbFile, { readonly: true });
+    const version = migratedDb
+      .prepare("SELECT value FROM meta WHERE key = ?")
+      .get("schema_version") as { value: string };
+    const tables = migratedDb
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    migratedDb.close();
+
+    expect(version.value).toBe("5");
+    expect(tables.map((t) => t.name)).toContain("coin_control");
   });
 
   it("returns null for non-existent wallet", () => {
@@ -628,7 +658,7 @@ describe("encrypted storage properties", () => {
       | undefined;
     db.close();
 
-    expect(row?.value).toBe("4");
+    expect(row?.value).toBe("5");
   });
 
   it("stores encrypted profile blobs in meta", () => {
