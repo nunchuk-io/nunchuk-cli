@@ -2,14 +2,23 @@ import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WalletData } from "../../core/storage.js";
 
-const { mockGetLockedOutpoints, mockListCoins, mockLoadWallet, mockSetCoinLock } = vi.hoisted(
-  () => ({
-    mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
-    mockListCoins: vi.fn(),
-    mockLoadWallet: vi.fn(),
-    mockSetCoinLock: vi.fn(),
-  }),
-);
+const {
+  mockAddCoinTag,
+  mockCreateTag,
+  mockGetCoinTagNames,
+  mockGetLockedOutpoints,
+  mockListCoins,
+  mockLoadWallet,
+  mockSetCoinLock,
+} = vi.hoisted(() => ({
+  mockAddCoinTag: vi.fn(),
+  mockCreateTag: vi.fn(),
+  mockGetCoinTagNames: vi.fn(() => new Map<string, string[]>()),
+  mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
+  mockListCoins: vi.fn(),
+  mockLoadWallet: vi.fn(),
+  mockSetCoinLock: vi.fn(),
+}));
 
 vi.mock("../../core/config.js", () => ({
   getElectrumServer: vi.fn(() => ({ host: "electrum.example.com", port: 50002, protocol: "ssl" })),
@@ -35,6 +44,16 @@ vi.mock("../../core/coin-store.js", () => ({
   setCoinLock: mockSetCoinLock,
 }));
 
+vi.mock("../../core/tag-store.js", () => ({
+  addCoinTag: mockAddCoinTag,
+  createTag: mockCreateTag,
+  deleteTag: vi.fn(),
+  getCoinTagNames: mockGetCoinTagNames,
+  listTags: vi.fn(() => []),
+  removeCoinTag: vi.fn(),
+  renameTag: vi.fn(),
+}));
+
 vi.mock("../../core/electrum.js", () => ({
   ElectrumClient: vi.fn(
     class MockElectrumClient {
@@ -49,6 +68,9 @@ const TEST_WALLET = { walletId: "jk74e3up" } as WalletData;
 const TXID = "ab".repeat(32);
 
 async function runCoin(args: string[]): Promise<void> {
+  // Commander keeps parsed option values on the (singleton) command instance;
+  // re-import per invocation so repeated calls in one test don't leak options.
+  vi.resetModules();
   const { coinCommand } = await import("../coin.js");
   const root = new Command();
   root.exitOverride();
@@ -154,5 +176,61 @@ describe("coin list locked column", () => {
     const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toContain(`${TXID}:1 [locked]`);
     expect(out).not.toContain(`${TXID}:0 [locked]`);
+  });
+
+  it("shows tags and filters with --tag and --untagged", async () => {
+    mockGetCoinTagNames.mockReturnValue(new Map([[`${TXID}:0`, ["kyc"]]]));
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["list", "--wallet", "jk74e3up"]);
+    let out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("Tags: #kyc");
+
+    logSpy.mockClear();
+    await runCoin(["list", "--wallet", "jk74e3up", "--tag", "kyc"]);
+    out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`${TXID}:0`);
+    expect(out).not.toContain(`${TXID}:1`);
+
+    logSpy.mockClear();
+    await runCoin(["list", "--wallet", "jk74e3up", "--untagged"]);
+    out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`${TXID}:1`);
+    expect(out).not.toContain(`${TXID}:0:`);
+  });
+});
+
+describe("coin tag commands", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockCreateTag.mockReturnValue({ id: 1, name: "kyc" });
+    mockAddCoinTag.mockReturnValue({ id: 1, name: "kyc" });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("coin tag create forwards the name", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["tag", "create", "kyc", "--wallet", "jk74e3up"]);
+    expect(mockCreateTag).toHaveBeenCalledWith("user@example.com", "mainnet", "jk74e3up", "kyc");
+    expect(logSpy).toHaveBeenCalledWith("Created tag #kyc");
+  });
+
+  it("coin tag add forwards the outpoint and name", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["tag", "add", "kyc", "--wallet", "jk74e3up", "--coin", `${TXID}:0`]);
+    expect(mockAddCoinTag).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      TXID,
+      0,
+      "kyc",
+    );
+    expect(logSpy).toHaveBeenCalledWith(`Tagged ${TXID}:0 with #kyc`);
   });
 });
