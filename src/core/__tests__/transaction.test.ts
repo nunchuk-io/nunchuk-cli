@@ -864,6 +864,103 @@ describe("createTransaction manual coin selection (presetCoins)", () => {
   });
 });
 
+describe("createTransaction locked coins", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("automatic selection never spends a locked coin", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Lock the two largest coins; only the 30_000 coin remains spendable.
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        lockedOutpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("fails with insufficient funds when the unlocked coins cannot cover", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 50_000n, // total is 105_000, but 75_000 of it is locked
+          lockedOutpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]),
+        }),
+      ).rejects.toThrow(/insufficient funds/i);
+    });
+  });
+
+  it("errors clearly when every coin is locked", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          lockedOutpoints: new Set(txids.map((t) => `${t}:0`)),
+        }),
+      ).rejects.toThrow(/All coins are locked/);
+    });
+  });
+
+  it("an explicit --coin preset spends a locked coin (bypass)", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        presetCoins: [{ txid: txids[0], vout: 0 }],
+        lockedOutpoints: new Set([`${txids[0]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[0]);
+    });
+  });
+
+  it("send-all sweeps only unlocked coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        lockedOutpoints: new Set([`${txids[0]}:0`]), // 40_000 stays behind
+      });
+      expect(result.selectedInputs.map((i) => i.txid).sort()).toEqual([txids[1], txids[2]].sort());
+      expect(result.recipientAmount).toBe(65_000n - result.fee);
+    });
+  });
+});
+
 describe("createTransaction privacy (input shuffle + change position)", () => {
   it("places the change output at both positions across RNG seeds", async () => {
     const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);

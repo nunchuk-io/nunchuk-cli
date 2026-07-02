@@ -10,6 +10,7 @@ const {
   mockFetchPsbtInputTimelockMetadata,
   mockFetchPendingTransaction,
   mockGetDefaultFeeLevel,
+  mockGetLockedOutpoints,
   mockHeadersSubscribe,
   mockLoadWallet,
   mockRemoveMusigNonce,
@@ -22,6 +23,7 @@ const {
   mockFetchPsbtInputTimelockMetadata: vi.fn(),
   mockFetchPendingTransaction: vi.fn(),
   mockGetDefaultFeeLevel: vi.fn(),
+  mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
   mockHeadersSubscribe: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockRemoveMusigNonce: vi.fn(),
@@ -51,6 +53,10 @@ vi.mock("../../core/api-client.js", () => ({
 vi.mock("../../core/storage.js", () => ({
   loadWallet: mockLoadWallet,
   removeMusigNonce: mockRemoveMusigNonce,
+}));
+
+vi.mock("../../core/coin-store.js", () => ({
+  getLockedOutpoints: mockGetLockedOutpoints,
 }));
 
 vi.mock("../../core/electrum.js", () => ({

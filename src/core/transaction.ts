@@ -851,6 +851,9 @@ export interface CreateTransactionParams {
   // Manual coin selection: spend exactly these outpoints. Every preset coin is
   // spent — no subset optimization, no automatic top-up.
   presetCoins?: Array<{ txid: string; vout: number }>;
+  // "<txid>:<vout>" keys of locked coins. Automatic selection (and --send-all)
+  // skips them; an explicit preset spends a locked coin anyway.
+  lockedOutpoints?: Set<string>;
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -1700,6 +1703,7 @@ export async function createTransaction(
     subtractFeeFromAmount: requestedSubtractFee = false,
     sendAll = false,
     presetCoins = [],
+    lockedOutpoints,
     rng = new CryptoRng(),
   } = params;
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1777,6 +1781,14 @@ export async function createTransaction(
       }
     }
     utxos = scannedUtxos.filter((u) => presetKeys.has(`${u.txHash}:${u.txPos}`));
+  } else if (lockedOutpoints && lockedOutpoints.size > 0) {
+    // Locked coins never enter automatic selection; explicit presets bypass.
+    utxos = scannedUtxos.filter((u) => !lockedOutpoints.has(`${u.txHash}:${u.txPos}`));
+    if (utxos.length === 0) {
+      throw new Error(
+        "All coins are locked. Unlock coins with `coin unlock` or select them explicitly with --coin.",
+      );
+    }
   }
 
   // Send all funds (sweep): spend every available coin to the recipient with the

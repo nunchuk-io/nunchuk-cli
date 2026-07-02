@@ -6,6 +6,7 @@ import { ElectrumClient } from "../core/electrum.js";
 import { loadWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { listCoins, type CoinStatus } from "../core/coins.js";
+import { getLockedOutpoints, setCoinLock } from "../core/coin-store.js";
 import { formatBtc, formatSats } from "../core/format.js";
 import { print, printError } from "../output.js";
 
@@ -24,6 +25,16 @@ function parseStatusOption(value: string): CoinStatus {
     throw new InvalidArgumentError(`--status must be one of: ${COIN_STATUSES.join(", ")}`);
   }
   return upper as CoinStatus;
+}
+
+function parseCoinOption(value: string): { txid: string; vout: number } {
+  const match = /^([0-9a-fA-F]{64}):(\d+)$/.exec(value);
+  if (!match) {
+    throw new InvalidArgumentError(
+      "--coin must be <txid>:<vout> (64-character hex transaction ID, then the output index)",
+    );
+  }
+  return { txid: match[1].toLowerCase(), vout: Number(match[2]) };
 }
 
 function getGlobals(cmd: Command): { apiKey: string; network: Network; email: string } {
@@ -46,7 +57,9 @@ function requireWallet(email: string, network: Network, walletId: string): Walle
   return wallet;
 }
 
-export const coinCommand = new Command("coin").description("List wallet UTXOs (coins)");
+export const coinCommand = new Command("coin").description(
+  "Inspect and manage wallet UTXOs (coins)",
+);
 
 coinCommand
   .command("list")
@@ -78,6 +91,10 @@ coinCommand
         filtered = filtered.filter((c) => c.status === options.status);
       }
 
+      const locked = getLockedOutpoints(email, network, wallet.walletId);
+      const isLocked = (c: { txid: string; vout: number }): boolean =>
+        locked.has(`${c.txid}:${c.vout}`);
+
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
@@ -92,6 +109,7 @@ coinCommand
               confirmations: c.confirmations,
               status: c.status,
               isChange: c.isChange,
+              locked: isLocked(c),
             })),
           },
           cmd,
@@ -105,13 +123,59 @@ coinCommand
       }
 
       filtered.forEach((c, i) => {
-        const label = c.isChange ? " [change]" : "";
+        const label = `${c.isChange ? " [change]" : ""}${isLocked(c) ? " [locked]" : ""}`;
         console.log(`  ${i}: ${c.txid}:${c.vout}${label}`);
         console.log(`     Address: ${c.address}`);
         console.log(`     Amount: ${formatBtc(c.amount)} (${formatSats(c.amount)})`);
         console.log(`     Status: ${c.status}`);
         console.log(`     Confirmations: ${c.confirmations}`);
       });
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+coinCommand
+  .command("lock")
+  .description("Lock a coin so automatic coin selection skips it (spend it explicitly with --coin)")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .action((options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const { txid, vout } = options.coin as { txid: string; vout: number };
+      setCoinLock(email, network, wallet.walletId, txid, vout, true);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print({ txid, vout, locked: true }, cmd);
+        return;
+      }
+      console.log(`Locked ${txid}:${vout}`);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+coinCommand
+  .command("unlock")
+  .description("Unlock a coin so automatic coin selection can use it again")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .action((options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const { txid, vout } = options.coin as { txid: string; vout: number };
+      setCoinLock(email, network, wallet.walletId, txid, vout, false);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print({ txid, vout, locked: false }, cmd);
+        return;
+      }
+      console.log(`Unlocked ${txid}:${vout}`);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }

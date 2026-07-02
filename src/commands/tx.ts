@@ -18,6 +18,7 @@ import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/ele
 import { deriveDescriptorAddresses } from "../core/address.js";
 import { loadWallet, removeMusigNonce } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
+import { getLockedOutpoints } from "../core/coin-store.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
@@ -501,6 +502,7 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
+          lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
         });
         // Under send-all there is no requested amount; the gross amount sent is
         // the swept balance (recipient + fee). recipientAmount + fee also equals
@@ -685,6 +687,7 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
+          lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
         });
         // Under send-all the gross amount sent is the swept balance (recipient +
         // fee); otherwise it is the requested amount.
