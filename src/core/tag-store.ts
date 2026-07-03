@@ -9,6 +9,7 @@
 import type { Network } from "./config.js";
 import type { CoinControlDoc, CoinTag } from "./coin-store.js";
 import { ensureCoinEntry, loadCoinControl, mutateCoinControl, outpointKey } from "./coin-store.js";
+import { applyTagAddedRules } from "./coin-rules.js";
 
 const MAX_TAG_NAME_LENGTH = 64;
 
@@ -126,6 +127,9 @@ export function addCoinTag(
     const entry = ensureCoinEntry(doc, txid, vout);
     if (!entry.tags.includes(tag.id)) {
       entry.tags.push(tag.id);
+      // The coin joins collections whose rule list has this tag. Fires only on
+      // a fresh insert, so re-tagging cannot re-lock an unlocked member.
+      applyTagAddedRules(doc, entry, tag.id);
     }
     return tag;
   });

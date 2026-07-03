@@ -19,6 +19,7 @@ import { deriveDescriptorAddresses } from "../core/address.js";
 import { loadWallet, removeMusigNonce } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { getLockedOutpoints } from "../core/coin-store.js";
+import { reconcileNewCoins } from "../core/coin-rules.js";
 import { getOutpointsByTag } from "../core/tag-store.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
@@ -507,7 +508,12 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
-          lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+          // Reconcile coin-control state against the scan (first-seen collection
+          // rules can lock a coin), then hand back the fresh locked set.
+          reconcileScan: (scanned) => {
+            reconcileNewCoins(email, network, wallet.walletId, scanned);
+            return { lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId) };
+          },
           fromTag: options.fromTag
             ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
             : undefined,
@@ -699,7 +705,12 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
-          lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+          // Reconcile coin-control state against the scan (first-seen collection
+          // rules can lock a coin), then hand back the fresh locked set.
+          reconcileScan: (scanned) => {
+            reconcileNewCoins(email, network, wallet.walletId, scanned);
+            return { lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId) };
+          },
           fromTag: options.fromTag
             ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
             : undefined,

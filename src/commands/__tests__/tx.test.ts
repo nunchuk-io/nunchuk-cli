@@ -12,6 +12,7 @@ const {
   mockGetDefaultFeeLevel,
   mockGetLockedOutpoints,
   mockGetOutpointsByTag,
+  mockReconcileNewCoins,
   mockHeadersSubscribe,
   mockLoadWallet,
   mockRemoveMusigNonce,
@@ -26,6 +27,7 @@ const {
   mockGetDefaultFeeLevel: vi.fn(),
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
   mockGetOutpointsByTag: vi.fn(),
+  mockReconcileNewCoins: vi.fn(),
   mockHeadersSubscribe: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockRemoveMusigNonce: vi.fn(),
@@ -63,6 +65,10 @@ vi.mock("../../core/coin-store.js", () => ({
 
 vi.mock("../../core/tag-store.js", () => ({
   getOutpointsByTag: mockGetOutpointsByTag,
+}));
+
+vi.mock("../../core/coin-rules.js", () => ({
+  reconcileNewCoins: mockReconcileNewCoins,
 }));
 
 vi.mock("../../core/electrum.js", () => ({
@@ -361,6 +367,52 @@ describe("tx create", () => {
     );
     expect(mockCreateTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ fromTag: resolved }),
+    );
+  });
+
+  it("passes a reconcileScan hook that runs the rules and returns the fresh locked set", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+      ],
+      { from: "user" },
+    );
+
+    const { reconcileScan } = mockCreateTransaction.mock.calls[0][0] as {
+      reconcileScan: (scanned: Array<{ txid: string; vout: number }>) => {
+        lockedOutpoints: Set<string>;
+      };
+    };
+    const scanned = [{ txid: "a".repeat(64), vout: 0 }];
+    const locked = new Set(["a".repeat(64) + ":0"]);
+    mockGetLockedOutpoints.mockReturnValue(locked);
+
+    expect(reconcileScan(scanned)).toEqual({ lockedOutpoints: locked });
+    expect(mockReconcileNewCoins).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      scanned,
+    );
+    // The locked set is read AFTER reconciliation, so rule-applied locks count.
+    expect(mockReconcileNewCoins.mock.invocationCallOrder[0]).toBeLessThan(
+      mockGetLockedOutpoints.mock.invocationCallOrder[0],
     );
   });
 

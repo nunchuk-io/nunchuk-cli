@@ -854,6 +854,13 @@ export interface CreateTransactionParams {
   // "<txid>:<vout>" keys of locked coins. Automatic selection (and --send-all)
   // skips them; an explicit preset spends a locked coin anyway.
   lockedOutpoints?: Set<string>;
+  // Coin-control reconciliation hook, called with the scanned outpoints right
+  // after the UTXO scan (collection rules can lock a coin the moment it is
+  // first seen). Its returned locked set replaces `lockedOutpoints`, so this
+  // very transaction already respects rule-applied locks.
+  reconcileScan?: (scanned: Array<{ txid: string; vout: number }>) => {
+    lockedOutpoints: Set<string>;
+  };
   // Restrict automatic selection (and --send-all) to the coins carrying this
   // tag. Cannot be combined with presetCoins.
   fromTag?: { name: string; outpoints: Set<string> };
@@ -1707,6 +1714,7 @@ export async function createTransaction(
     sendAll = false,
     presetCoins = [],
     lockedOutpoints,
+    reconcileScan,
     fromTag,
     rng = new CryptoRng(),
   } = params;
@@ -1773,6 +1781,9 @@ export async function createTransaction(
   if (scannedUtxos.length === 0) {
     throw new Error("No UTXOs found. Wallet has no funds.");
   }
+  const effectiveLocked = reconcileScan
+    ? reconcileScan(scannedUtxos.map((u) => ({ txid: u.txHash, vout: u.txPos }))).lockedOutpoints
+    : lockedOutpoints;
 
   // Manual coin selection: validate the preset outpoints and restrict the
   // working set to exactly those coins.
@@ -1791,9 +1802,9 @@ export async function createTransaction(
     }
     utxos = scannedUtxos.filter((u) => presetKeys.has(`${u.txHash}:${u.txPos}`));
   } else {
-    if (lockedOutpoints && lockedOutpoints.size > 0) {
+    if (effectiveLocked && effectiveLocked.size > 0) {
       // Locked coins never enter automatic selection; explicit presets bypass.
-      utxos = utxos.filter((u) => !lockedOutpoints.has(`${u.txHash}:${u.txPos}`));
+      utxos = utxos.filter((u) => !effectiveLocked.has(`${u.txHash}:${u.txPos}`));
       if (utxos.length === 0) {
         throw new Error(
           "All coins are locked. Unlock coins with `coin unlock` or select them explicitly with --coin.",

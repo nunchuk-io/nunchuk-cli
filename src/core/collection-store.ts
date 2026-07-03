@@ -11,6 +11,7 @@
 import type { Network } from "./config.js";
 import type { CoinCollection, CoinControlDoc } from "./coin-store.js";
 import { ensureCoinEntry, loadCoinControl, mutateCoinControl, outpointKey } from "./coin-store.js";
+import { applyRulesToExistingCoins, joinCollection } from "./coin-rules.js";
 import { getTagByName } from "./tag-store.js";
 
 const MAX_COLLECTION_NAME_LENGTH = 64;
@@ -179,12 +180,22 @@ export function addCoinToCollection(
 ): CoinCollection {
   return mutateCoinControl(email, network, walletId, (doc) => {
     const collection = getCollectionByName(doc, rawName);
-    const entry = ensureCoinEntry(doc, txid, vout);
-    if (!entry.collections.includes(collection.id)) {
-      entry.collections.push(collection.id);
-      if (collection.autoLock) entry.locked = true;
-    }
+    joinCollection(ensureCoinEntry(doc, txid, vout), collection);
     return collection;
+  });
+}
+
+// One-shot --apply-to-existing: run the collection's rules over every known
+// coin. Returns the number of coins that newly joined.
+export function applyCollectionToExisting(
+  email: string,
+  network: Network,
+  walletId: string,
+  rawName: string,
+): { name: string; joined: number } {
+  return mutateCoinControl(email, network, walletId, (doc) => {
+    const collection = getCollectionByName(doc, rawName);
+    return { name: collection.name, joined: applyRulesToExistingCoins(doc, collection) };
   });
 }
 

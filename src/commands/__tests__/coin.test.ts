@@ -5,6 +5,7 @@ import type { WalletData } from "../../core/storage.js";
 const {
   mockAddCoinTag,
   mockAddCoinToCollection,
+  mockApplyCollectionToExisting,
   mockCreateCollection,
   mockCreateTag,
   mockGetCoinCollectionNames,
@@ -12,11 +13,13 @@ const {
   mockGetLockedOutpoints,
   mockListCoins,
   mockLoadWallet,
+  mockReconcileNewCoins,
   mockSetCoinLock,
   mockUpdateCollection,
 } = vi.hoisted(() => ({
   mockAddCoinTag: vi.fn(),
   mockAddCoinToCollection: vi.fn(),
+  mockApplyCollectionToExisting: vi.fn(),
   mockCreateCollection: vi.fn(),
   mockCreateTag: vi.fn(),
   mockGetCoinCollectionNames: vi.fn(() => new Map<string, string[]>()),
@@ -24,6 +27,7 @@ const {
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
   mockListCoins: vi.fn(),
   mockLoadWallet: vi.fn(),
+  mockReconcileNewCoins: vi.fn(),
   mockSetCoinLock: vi.fn(),
   mockUpdateCollection: vi.fn(),
 }));
@@ -64,12 +68,17 @@ vi.mock("../../core/tag-store.js", () => ({
 
 vi.mock("../../core/collection-store.js", () => ({
   addCoinToCollection: mockAddCoinToCollection,
+  applyCollectionToExisting: mockApplyCollectionToExisting,
   createCollection: mockCreateCollection,
   deleteCollection: vi.fn(),
   getCoinCollectionNames: mockGetCoinCollectionNames,
   listCollections: vi.fn(() => []),
   removeCoinFromCollection: vi.fn(),
   updateCollection: mockUpdateCollection,
+}));
+
+vi.mock("../../core/coin-rules.js", () => ({
+  reconcileNewCoins: mockReconcileNewCoins,
 }));
 
 vi.mock("../../core/electrum.js", () => ({
@@ -426,5 +435,85 @@ describe("coin list --collection", () => {
     out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toContain(`${TXID}:0`);
     expect(out).not.toContain(`${TXID}:1`);
+  });
+
+  it("reconciles first-seen rules over the scanned coins before rendering", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["list", "--wallet", "jk74e3up"]);
+    expect(mockReconcileNewCoins).toHaveBeenCalledWith("user@example.com", "mainnet", "jk74e3up", [
+      { txid: TXID, vout: 0 },
+      { txid: TXID, vout: 1 },
+    ]);
+    // The rule pass runs before the lock/tag/collection state is loaded.
+    expect(mockReconcileNewCoins.mock.invocationCallOrder[0]).toBeLessThan(
+      mockGetLockedOutpoints.mock.invocationCallOrder[0],
+    );
+  });
+});
+
+describe("coin collection --apply-to-existing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockCreateCollection.mockReturnValue({
+      id: 1,
+      name: "quarantine",
+      addUntagged: true,
+      autoLock: true,
+      addTags: [],
+    });
+    mockApplyCollectionToExisting.mockReturnValue({ name: "quarantine", joined: 2 });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("create --apply-to-existing runs the one-shot walk and reports the count", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin([
+      "collection",
+      "create",
+      "quarantine",
+      "--wallet",
+      "jk74e3up",
+      "--add-untagged",
+      "--auto-lock",
+      "--apply-to-existing",
+    ]);
+    expect(mockApplyCollectionToExisting).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "quarantine",
+    );
+    expect(logSpy).toHaveBeenCalledWith("Added 2 existing coins.");
+  });
+
+  it("update with only --apply-to-existing skips the patch and applies", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin([
+      "collection",
+      "update",
+      "quarantine",
+      "--wallet",
+      "jk74e3up",
+      "--apply-to-existing",
+    ]);
+    expect(mockUpdateCollection).not.toHaveBeenCalled();
+    expect(mockApplyCollectionToExisting).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "quarantine",
+    );
+    expect(logSpy).toHaveBeenCalledWith("Added 2 existing coins.");
+  });
+
+  it("create without the flag does not run the walk", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["collection", "create", "quarantine", "--wallet", "jk74e3up"]);
+    expect(mockApplyCollectionToExisting).not.toHaveBeenCalled();
   });
 });

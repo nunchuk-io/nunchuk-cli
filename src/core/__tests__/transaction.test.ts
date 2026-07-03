@@ -961,6 +961,65 @@ describe("createTransaction locked coins", () => {
   });
 });
 
+describe("createTransaction reconcileScan hook", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("receives every scanned outpoint and its locked set replaces lockedOutpoints", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const seen: Array<{ txid: string; vout: number }> = [];
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        lockedOutpoints: new Set(), // superseded by the hook's result
+        reconcileScan: (scanned) => {
+          seen.push(...scanned);
+          // A first-seen rule locked the two largest coins mid-scan.
+          return { lockedOutpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]) };
+        },
+      });
+      expect(seen.map((c) => c.txid).sort()).toEqual([...txids].sort());
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("runs with preset coins too, and presets still bypass hook-applied locks", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      let seenCount = 0;
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        presetCoins: [{ txid: txids[0], vout: 0 }],
+        reconcileScan: (scanned) => {
+          seenCount = scanned.length;
+          return { lockedOutpoints: new Set([`${txids[0]}:0`]) };
+        },
+      });
+      expect(seenCount).toBe(3);
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[0]);
+    });
+  });
+});
+
 describe("createTransaction --from-tag filter", () => {
   const AMOUNTS = [40_000n, 35_000n, 30_000n];
 

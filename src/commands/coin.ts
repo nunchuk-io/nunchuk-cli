@@ -18,6 +18,7 @@ import {
 } from "../core/tag-store.js";
 import {
   addCoinToCollection,
+  applyCollectionToExisting,
   createCollection,
   deleteCollection,
   getCoinCollectionNames,
@@ -25,6 +26,7 @@ import {
   removeCoinFromCollection,
   updateCollection,
 } from "../core/collection-store.js";
+import { reconcileNewCoins } from "../core/coin-rules.js";
 import { formatBtc, formatSats } from "../core/format.js";
 import { print, printError } from "../output.js";
 
@@ -114,6 +116,15 @@ coinCommand
       if (options.status) {
         filtered = filtered.filter((c) => c.status === options.status);
       }
+
+      // First-seen collection rules run before the list is rendered, so a new
+      // coin already shows its rule-applied collections and lock.
+      reconcileNewCoins(
+        email,
+        network,
+        wallet.walletId,
+        coins.map((c) => ({ txid: c.txid, vout: c.vout })),
+      );
 
       const locked = getLockedOutpoints(email, network, wallet.walletId);
       const tagNames = getCoinTagNames(email, network, wallet.walletId);
@@ -410,6 +421,7 @@ collectionCommand
   .option("--add-untagged", "Rule: new coins without tags join this collection")
   .option("--add-tag <tag>", "Rule: coins carrying this tag join (repeatable)", collectTag, [])
   .option("--auto-lock", "Lock coins when they join this collection")
+  .option("--apply-to-existing", "Also run the rules over currently known coins once")
   .action((name, options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
@@ -419,6 +431,9 @@ collectionCommand
         autoLock: Boolean(options.autoLock),
         addTagNames: options.addTag as string[],
       });
+      const joined = options.applyToExisting
+        ? applyCollectionToExisting(email, network, wallet.walletId, collection.name).joined
+        : undefined;
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
@@ -429,12 +444,16 @@ collectionCommand
             addUntagged: collection.addUntagged,
             autoLock: collection.autoLock,
             addTags: options.addTag,
+            ...(joined !== undefined ? { appliedToExisting: joined } : {}),
           },
           cmd,
         );
         return;
       }
       console.log(`Created collection "${collection.name}"`);
+      if (joined !== undefined) {
+        console.log(`Added ${joined} existing coin${joined === 1 ? "" : "s"}.`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -452,6 +471,7 @@ collectionCommand
   .option("--clear-add-tags", "Remove every tag from the join rule")
   .option("--auto-lock", "Rule on: lock coins when they join")
   .option("--no-auto-lock", "Rule off: stop locking joining coins")
+  .option("--apply-to-existing", "Run the rules over currently known coins once")
   .action((name, options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
@@ -460,37 +480,53 @@ collectionCommand
       if (options.clearAddTags && addTagNames.length > 0) {
         throw new Error("--add-tag and --clear-add-tags cannot be combined.");
       }
-      if (
-        options.name === undefined &&
-        options.addUntagged === undefined &&
-        options.autoLock === undefined &&
-        !options.clearAddTags &&
-        addTagNames.length === 0
-      ) {
+      const hasPatch =
+        options.name !== undefined ||
+        options.addUntagged !== undefined ||
+        options.autoLock !== undefined ||
+        Boolean(options.clearAddTags) ||
+        addTagNames.length > 0;
+      if (!hasPatch && !options.applyToExisting) {
         throw new Error("Nothing to update. Pass at least one option.");
       }
-      const collection = updateCollection(email, network, wallet.walletId, name, {
-        name: options.name,
-        addUntagged: options.addUntagged,
-        autoLock: options.autoLock,
-        addTagNames: addTagNames.length > 0 ? addTagNames : undefined,
-        clearAddTags: Boolean(options.clearAddTags),
-      });
+      const collection = hasPatch
+        ? updateCollection(email, network, wallet.walletId, name, {
+            name: options.name,
+            addUntagged: options.addUntagged,
+            autoLock: options.autoLock,
+            addTagNames: addTagNames.length > 0 ? addTagNames : undefined,
+            clearAddTags: Boolean(options.clearAddTags),
+          })
+        : undefined;
+      const currentName = collection?.name ?? name;
+      const joined = options.applyToExisting
+        ? applyCollectionToExisting(email, network, wallet.walletId, currentName).joined
+        : undefined;
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
         print(
           {
-            id: collection.id,
-            name: collection.name,
-            addUntagged: collection.addUntagged,
-            autoLock: collection.autoLock,
+            name: currentName,
+            ...(collection
+              ? {
+                  id: collection.id,
+                  addUntagged: collection.addUntagged,
+                  autoLock: collection.autoLock,
+                }
+              : {}),
+            ...(joined !== undefined ? { appliedToExisting: joined } : {}),
           },
           cmd,
         );
         return;
       }
-      console.log(`Updated collection "${collection.name}"`);
+      if (collection) {
+        console.log(`Updated collection "${collection.name}"`);
+      }
+      if (joined !== undefined) {
+        console.log(`Added ${joined} existing coin${joined === 1 ? "" : "s"}.`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
