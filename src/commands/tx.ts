@@ -21,6 +21,8 @@ import type { WalletData } from "../core/storage.js";
 import { getLockedOutpoints } from "../core/coin-store.js";
 import { reconcileNewCoins } from "../core/coin-rules.js";
 import { getOutpointsByTag } from "../core/tag-store.js";
+import { planChangeTags, storeChangeTagIntent } from "../core/change-intents.js";
+import type { ChangeTagPlan } from "../core/change-intents.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
@@ -142,6 +144,38 @@ async function resolveSendAmount(
     throw new Error("Amount must convert to at least 1 sat");
   }
   return sendAmount;
+}
+
+// Resolve the change coin's inherited tags for a built transaction. Returns
+// undefined when there is no change output (with a warning if tags were
+// explicitly requested).
+function resolveChangeTagPlan(
+  email: string,
+  network: Network,
+  walletId: string,
+  result: {
+    changeAddress: string | null;
+    changeAmount: bigint;
+    selectedInputs: Array<{ txid: string; vout: number }>;
+  },
+  requested?: string,
+): ChangeTagPlan | undefined {
+  if (!result.changeAddress || result.changeAmount <= 0n) {
+    if (requested && requested.trim() !== "none") {
+      console.error(
+        "Warning: --change-tags is ignored because the transaction has no change output.",
+      );
+    }
+    return undefined;
+  }
+  return planChangeTags(email, network, walletId, result.selectedInputs, requested);
+}
+
+function printChangeTagPlan(plan: ChangeTagPlan | undefined, requested?: string): void {
+  if (!plan || (plan.tagNames.length === 0 && !requested)) return;
+  console.log(
+    `  Change tags: ${plan.tagNames.length > 0 ? plan.tagNames.map((n) => `#${n}`).join(" ") : "none"}`,
+  );
 }
 
 function parsePreimageOption(value: string, previous: string[]): string[] {
@@ -473,6 +507,10 @@ txCommand
     "--from-tag <name>",
     "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
   )
+  .option(
+    "--change-tags <tags>",
+    'Tags for the change coin: a comma-separated subset of the input coins\' tags, or "none" (default: inherit all input tags)',
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -524,7 +562,23 @@ txCommand
         const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
         const manualSelection = options.coin.length > 0;
 
+        // Validate the change-tag choice before uploading anything.
+        const changeTagPlan = resolveChangeTagPlan(
+          email,
+          network,
+          wallet.walletId,
+          result,
+          options.changeTags,
+        );
+
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
+        if (changeTagPlan && changeTagPlan.tagIds.length > 0 && result.changeAddress) {
+          storeChangeTagIntent(email, network, wallet.walletId, {
+            address: result.changeAddress,
+            amountSats: result.changeAmount,
+            tagIds: changeTagPlan.tagIds,
+          });
+        }
         const detail = await decodePsbtDetailWithTimelockMetadata(
           result.psbtB64,
           network,
@@ -556,6 +610,7 @@ txCommand
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
+              changeTags: changeTagPlan?.tagNames ?? [],
               miniscriptPath: result.miniscriptPath ?? detail?.miniscriptPath,
               miniscriptPaths: detail?.miniscriptPaths,
               timelockedUntil: detail?.timelockedUntil,
@@ -589,6 +644,7 @@ txCommand
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
         }
+        printChangeTagPlan(changeTagPlan, options.changeTags);
         if (manualSelection) {
           console.log(`  Coins: ${result.selectedInputs.length} selected manually`);
           for (const i of result.selectedInputs) {
@@ -672,6 +728,10 @@ txCommand
     "--from-tag <name>",
     "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
   )
+  .option(
+    "--change-tags <tags>",
+    'Tags for the change coin: a comma-separated subset of the input coins\' tags, or "none" (default: inherit all input tags)',
+  )
   .option("--fiat <code>", "Show fiat values alongside BTC (e.g. --fiat USD)")
   .action(async (options, cmd) => {
     try {
@@ -719,6 +779,15 @@ txCommand
         // fee); otherwise it is the requested amount.
         const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
         const manualSelection = options.coin.length > 0;
+
+        // Preview the change coin's inherited tags; nothing is stored on draft.
+        const changeTagPlan = resolveChangeTagPlan(
+          email,
+          network,
+          wallet.walletId,
+          result,
+          options.changeTags,
+        );
 
         // Join selected inputs with their block date + confirmations.
         const inputMeta = await fetchPsbtInputTimelockMetadata(result.psbtB64, electrum, network);
@@ -793,6 +862,7 @@ txCommand
               changeAddress: result.changeAddress,
               changeAmount: result.changeAmount.toString(),
               changeAmountBtc: formatBtc(result.changeAmount),
+              changeTags: changeTagPlan?.tagNames ?? [],
               subtractFee: result.subtractFee,
               antiFeeSniping: Boolean(options.antiFeeSniping),
               lockTime: result.lockTime,
@@ -853,6 +923,7 @@ txCommand
             )})${fiat(result.changeAmount)}`,
           );
         }
+        printChangeTagPlan(changeTagPlan, options.changeTags);
         if (options.antiFeeSniping) {
           console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
         }

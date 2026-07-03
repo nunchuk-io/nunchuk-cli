@@ -12,7 +12,9 @@ const {
   mockGetDefaultFeeLevel,
   mockGetLockedOutpoints,
   mockGetOutpointsByTag,
+  mockPlanChangeTags,
   mockReconcileNewCoins,
+  mockStoreChangeTagIntent,
   mockHeadersSubscribe,
   mockLoadWallet,
   mockRemoveMusigNonce,
@@ -27,7 +29,9 @@ const {
   mockGetDefaultFeeLevel: vi.fn(),
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
   mockGetOutpointsByTag: vi.fn(),
+  mockPlanChangeTags: vi.fn(() => ({ tagIds: [], tagNames: [] })),
   mockReconcileNewCoins: vi.fn(),
+  mockStoreChangeTagIntent: vi.fn(),
   mockHeadersSubscribe: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockRemoveMusigNonce: vi.fn(),
@@ -69,6 +73,11 @@ vi.mock("../../core/tag-store.js", () => ({
 
 vi.mock("../../core/coin-rules.js", () => ({
   reconcileNewCoins: mockReconcileNewCoins,
+}));
+
+vi.mock("../../core/change-intents.js", () => ({
+  planChangeTags: mockPlanChangeTags,
+  storeChangeTagIntent: mockStoreChangeTagIntent,
 }));
 
 vi.mock("../../core/electrum.js", () => ({
@@ -414,6 +423,127 @@ describe("tx create", () => {
     expect(mockReconcileNewCoins.mock.invocationCallOrder[0]).toBeLessThan(
       mockGetLockedOutpoints.mock.invocationCallOrder[0],
     );
+  });
+
+  it("stores a change-tag intent from the inherited plan and prints it", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockPlanChangeTags.mockReturnValueOnce({ tagIds: [1, 2], tagNames: ["kyc", "cold"] });
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+      ],
+      { from: "user" },
+    );
+
+    // Default (no --change-tags): the plan is computed with requested=undefined.
+    expect(mockPlanChangeTags).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      [{ txid: "funding-txid", vout: 0, value: 25_000_308n }],
+      undefined,
+    );
+    expect(mockStoreChangeTagIntent).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      {
+        address: "bc1qchangeaddress0000000000000000000000000000000000000000",
+        amountSats: 5_000_000n,
+        tagIds: [1, 2],
+      },
+    );
+    expect(logSpy).toHaveBeenCalledWith("  Change tags: #kyc #cold");
+  });
+
+  it("--change-tags none plans nothing and stores no intent", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockPlanChangeTags.mockReturnValueOnce({ tagIds: [], tagNames: [] });
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--change-tags",
+        "none",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockPlanChangeTags).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      expect.any(Array),
+      "none",
+    );
+    expect(mockStoreChangeTagIntent).not.toHaveBeenCalled();
+    // The flag was explicit, so the choice is echoed back.
+    expect(logSpy).toHaveBeenCalledWith("  Change tags: none");
+  });
+
+  it("warns and skips the intent when the transaction has no change output", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const base = await mockCreateTransaction();
+    mockCreateTransaction.mockResolvedValueOnce({ ...base, changeAddress: null, changeAmount: 0n });
+    mockPlanChangeTags.mockClear();
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--change-tags",
+        "kyc",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockPlanChangeTags).not.toHaveBeenCalled();
+    expect(mockStoreChangeTagIntent).not.toHaveBeenCalled();
+    const err = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(err).toContain("--change-tags is ignored because the transaction has no change output");
   });
 
   it("rejects a malformed --coin outpoint", async () => {
@@ -892,6 +1022,28 @@ describe("tx draft", () => {
     expect(out).toContain("funding-txid:0");
     // Auto-estimate caveat shown when no --fee-rate.
     expect(out).toContain("pass --fee-rate");
+  });
+
+  it("previews the change tags without storing an intent", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockPlanChangeTags.mockReturnValueOnce({ tagIds: [1], tagNames: ["kyc"] });
+
+    await root.parseAsync(baseArgs, { from: "user" });
+
+    expect(mockPlanChangeTags).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      expect.any(Array),
+      undefined,
+    );
+    expect(mockStoreChangeTagIntent).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith("  Change tags: #kyc");
   });
 
   it("forwards the same options as tx create and omits the caveat with --fee-rate", async () => {
