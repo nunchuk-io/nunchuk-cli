@@ -12,7 +12,11 @@ import {
 import type { Profile } from "../storage.js";
 import { loadCoinControl } from "../coin-store.js";
 import { addCoinTag, createTag } from "../tag-store.js";
-import { planChangeTags, storeChangeTagIntent } from "../change-intents.js";
+import {
+  getPendingIntentAddresses,
+  planChangeTags,
+  storeChangeTagIntent,
+} from "../change-intents.js";
 
 const TEST_RUN_ID = crypto.randomBytes(4).toString("hex");
 const TEST_HOME = path.join(os.tmpdir(), "nunchuk-cli-change-intents", TEST_RUN_ID);
@@ -149,5 +153,17 @@ describe("storeChangeTagIntent", () => {
     expect(intents).toHaveLength(2);
     expect(intents.find((i) => i.amount === "1000")?.tagIds).toEqual([2]);
     expect(intents.find((i) => i.amount === "2000")?.tagIds).toEqual([1]);
+  });
+
+  it("getPendingIntentAddresses lists the addresses awaiting reconciliation", () => {
+    const email = uniqueEmail();
+    seedTaggedInputs(email);
+    expect(getPendingIntentAddresses(email, NET, WALLET_ID)).toEqual(new Set());
+    storeChangeTagIntent(email, NET, WALLET_ID, {
+      address: "tb1qchange",
+      amountSats: 1_000n,
+      tagIds: [1],
+    });
+    expect(getPendingIntentAddresses(email, NET, WALLET_ID)).toEqual(new Set(["tb1qchange"]));
   });
 });

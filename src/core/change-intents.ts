@@ -60,6 +60,17 @@ export function planChangeTags(
   return { tagIds, tagNames };
 }
 
+// Addresses with a pending intent — used by tx broadcast to spot the change
+// output of the just-broadcast transaction for immediate reconciliation.
+export function getPendingIntentAddresses(
+  email: string,
+  network: Network,
+  walletId: string,
+): Set<string> {
+  const doc = loadCoinControl(email, network, walletId);
+  return new Set(doc.changeTagIntents.map((i) => i.address));
+}
+
 // Record the intent. An identical (address, amount) pair replaces the older
 // intent — re-creating the same transaction must not stack duplicates; distinct
 // amounts on a shared address are kept (concurrent drafts, amount tiebreak).

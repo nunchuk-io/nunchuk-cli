@@ -117,13 +117,19 @@ coinCommand
         filtered = filtered.filter((c) => c.status === options.status);
       }
 
-      // First-seen collection rules run before the list is rendered, so a new
-      // coin already shows its rule-applied collections and lock.
+      // Change-tag intents and first-seen collection rules run before the list
+      // is rendered, so a new coin already shows its inherited tags,
+      // rule-applied collections, and lock.
       reconcileNewCoins(
         email,
         network,
         wallet.walletId,
-        coins.map((c) => ({ txid: c.txid, vout: c.vout })),
+        coins.map((c) => ({
+          txid: c.txid,
+          vout: c.vout,
+          address: c.address,
+          amountSats: c.amount,
+        })),
       );
 
       const locked = getLockedOutpoints(email, network, wallet.walletId);

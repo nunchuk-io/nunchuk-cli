@@ -21,7 +21,11 @@ import type { WalletData } from "../core/storage.js";
 import { getLockedOutpoints } from "../core/coin-store.js";
 import { reconcileNewCoins } from "../core/coin-rules.js";
 import { getOutpointsByTag } from "../core/tag-store.js";
-import { planChangeTags, storeChangeTagIntent } from "../core/change-intents.js";
+import {
+  getPendingIntentAddresses,
+  planChangeTags,
+  storeChangeTagIntent,
+} from "../core/change-intents.js";
 import type { ChangeTagPlan } from "../core/change-intents.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
@@ -1211,6 +1215,37 @@ txCommand
         await deleteTransaction(client, wallet, options.txId);
       } catch {
         // Non-fatal: tx is already broadcast even if server delete fails
+      }
+
+      // Immediate change-tag reconciliation: the change output is known now,
+      // so apply its pending intent without waiting for the next scan. An
+      // optimization only — scans reconcile app/backend broadcasts the same way.
+      try {
+        const intentAddresses = getPendingIntentAddresses(email, network, wallet.walletId);
+        if (intentAddresses.size > 0) {
+          const changeOutputs: Array<{
+            txid: string;
+            vout: number;
+            address: string;
+            amountSats: bigint;
+          }> = [];
+          for (let i = 0; i < tx.outputsLength; i++) {
+            const output = tx.getOutput(i);
+            if (!output.script) continue;
+            const address = getOutputAddress(output.script, network);
+            if (address && intentAddresses.has(address)) {
+              changeOutputs.push({
+                txid: broadcastTxId,
+                vout: i,
+                address,
+                amountSats: output.amount ?? 0n,
+              });
+            }
+          }
+          reconcileNewCoins(email, network, wallet.walletId, changeOutputs);
+        }
+      } catch {
+        // Non-fatal: the next scan reconciles.
       }
 
       const globals = cmd.optsWithGlobals();

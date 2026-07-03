@@ -854,11 +854,14 @@ export interface CreateTransactionParams {
   // "<txid>:<vout>" keys of locked coins. Automatic selection (and --send-all)
   // skips them; an explicit preset spends a locked coin anyway.
   lockedOutpoints?: Set<string>;
-  // Coin-control reconciliation hook, called with the scanned outpoints right
-  // after the UTXO scan (collection rules can lock a coin the moment it is
-  // first seen). Its returned locked set replaces `lockedOutpoints`, so this
-  // very transaction already respects rule-applied locks.
-  reconcileScan?: (scanned: Array<{ txid: string; vout: number }>) => {
+  // Coin-control reconciliation hook, called with the scanned coins right
+  // after the UTXO scan (change-tag intents and collection rules can tag or
+  // lock a coin the moment it is first seen). Its returned locked set replaces
+  // `lockedOutpoints`, so this very transaction already respects rule-applied
+  // locks.
+  reconcileScan?: (
+    scanned: Array<{ txid: string; vout: number; address: string; amountSats: bigint }>,
+  ) => {
     lockedOutpoints: Set<string>;
   };
   // Restrict automatic selection (and --send-all) to the coins carrying this
@@ -1782,7 +1785,14 @@ export async function createTransaction(
     throw new Error("No UTXOs found. Wallet has no funds.");
   }
   const effectiveLocked = reconcileScan
-    ? reconcileScan(scannedUtxos.map((u) => ({ txid: u.txHash, vout: u.txPos }))).lockedOutpoints
+    ? reconcileScan(
+        scannedUtxos.map((u) => ({
+          txid: u.txHash,
+          vout: u.txPos,
+          address: u.address,
+          amountSats: u.value,
+        })),
+      ).lockedOutpoints
     : lockedOutpoints;
 
   // Manual coin selection: validate the preset outpoints and restrict the

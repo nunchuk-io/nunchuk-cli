@@ -977,7 +977,7 @@ describe("createTransaction reconcileScan hook", () => {
   it("receives every scanned outpoint and its locked set replaces lockedOutpoints", async () => {
     const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
     await withOfflineFetch(async () => {
-      const seen: Array<{ txid: string; vout: number }> = [];
+      const seen: Array<{ txid: string; vout: number; address: string; amountSats: bigint }> = [];
       const result = await createTransaction({
         wallet: TEST_WALLET,
         network: "testnet",
@@ -992,6 +992,9 @@ describe("createTransaction reconcileScan hook", () => {
         },
       });
       expect(seen.map((c) => c.txid).sort()).toEqual([...txids].sort());
+      // Each scanned coin carries what intent matching needs.
+      expect(seen.map((c) => c.amountSats).sort()).toEqual([...AMOUNTS].sort());
+      for (const c of seen) expect(c.address).toMatch(/^tb1/);
       expect(result.selectedInputs).toHaveLength(1);
       expect(result.selectedInputs[0].txid).toBe(txids[2]);
     });

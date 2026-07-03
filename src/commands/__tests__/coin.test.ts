@@ -441,8 +441,8 @@ describe("coin list --collection", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     await runCoin(["list", "--wallet", "jk74e3up"]);
     expect(mockReconcileNewCoins).toHaveBeenCalledWith("user@example.com", "mainnet", "jk74e3up", [
-      { txid: TXID, vout: 0 },
-      { txid: TXID, vout: 1 },
+      { txid: TXID, vout: 0, address: "bc1qaddr", amountSats: 10_000n },
+      { txid: TXID, vout: 1, address: "bc1qaddr2", amountSats: 20_000n },
     ]);
     // The rule pass runs before the lock/tag/collection state is loaded.
     expect(mockReconcileNewCoins.mock.invocationCallOrder[0]).toBeLessThan(
