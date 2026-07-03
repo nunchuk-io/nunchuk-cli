@@ -16,6 +16,15 @@ import {
   removeCoinTag,
   renameTag,
 } from "../core/tag-store.js";
+import {
+  addCoinToCollection,
+  createCollection,
+  deleteCollection,
+  getCoinCollectionNames,
+  listCollections,
+  removeCoinFromCollection,
+  updateCollection,
+} from "../core/collection-store.js";
 import { formatBtc, formatSats } from "../core/format.js";
 import { print, printError } from "../output.js";
 
@@ -81,6 +90,7 @@ coinCommand
   )
   .option("--tag <name>", "Only coins carrying this tag (case-sensitive)")
   .option("--untagged", "Only coins with no tags")
+  .option("--collection <name>", "Only coins in this collection (case-sensitive)")
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -107,10 +117,13 @@ coinCommand
 
       const locked = getLockedOutpoints(email, network, wallet.walletId);
       const tagNames = getCoinTagNames(email, network, wallet.walletId);
+      const collectionNames = getCoinCollectionNames(email, network, wallet.walletId);
       const isLocked = (c: { txid: string; vout: number }): boolean =>
         locked.has(`${c.txid}:${c.vout}`);
       const tagsOf = (c: { txid: string; vout: number }): string[] =>
         tagNames.get(`${c.txid}:${c.vout}`) ?? [];
+      const collectionsOf = (c: { txid: string; vout: number }): string[] =>
+        collectionNames.get(`${c.txid}:${c.vout}`) ?? [];
 
       if (options.tag) {
         const wanted = String(options.tag).startsWith("#")
@@ -119,6 +132,9 @@ coinCommand
         filtered = filtered.filter((c) => tagsOf(c).includes(wanted));
       } else if (options.untagged) {
         filtered = filtered.filter((c) => tagsOf(c).length === 0);
+      }
+      if (options.collection) {
+        filtered = filtered.filter((c) => collectionsOf(c).includes(String(options.collection)));
       }
 
       const globals = cmd.optsWithGlobals();
@@ -137,6 +153,7 @@ coinCommand
               isChange: c.isChange,
               locked: isLocked(c),
               tags: tagsOf(c),
+              collections: collectionsOf(c),
             })),
           },
           cmd,
@@ -159,6 +176,11 @@ coinCommand
         const tags = tagsOf(c);
         if (tags.length > 0) {
           console.log(`     Tags: ${tags.map((t) => `#${t}`).join(" ")}`);
+        }
+        const collections = collectionsOf(c);
+        if (collections.length > 0) {
+          // Collection names may contain spaces, so join with commas.
+          console.log(`     Collections: ${collections.join(", ")}`);
         }
       });
     } catch (err) {
@@ -354,6 +376,238 @@ tagCommand
         return;
       }
       console.log(`Removed #${tag.name} from ${txid}:${vout}`);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+function collectTag(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+function describeRules(c: {
+  addUntagged: boolean;
+  autoLock: boolean;
+  addTagNames: string[];
+}): string {
+  const rules: string[] = [];
+  if (c.addUntagged) rules.push("add-untagged");
+  for (const t of c.addTagNames) rules.push(`add-tag #${t}`);
+  if (c.autoLock) rules.push("auto-lock");
+  return rules.length > 0 ? rules.join(", ") : "none";
+}
+
+const collectionCommand = new Command("collection").description(
+  "Manage coin collections (named groups with optional auto-membership rules)",
+);
+coinCommand.addCommand(collectionCommand);
+
+collectionCommand
+  .command("create")
+  .description("Create a collection")
+  .argument("<name>", "Collection name (case-sensitive; spaces allowed)")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .option("--add-untagged", "Rule: new coins without tags join this collection")
+  .option("--add-tag <tag>", "Rule: coins carrying this tag join (repeatable)", collectTag, [])
+  .option("--auto-lock", "Lock coins when they join this collection")
+  .action((name, options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const collection = createCollection(email, network, wallet.walletId, name, {
+        addUntagged: Boolean(options.addUntagged),
+        autoLock: Boolean(options.autoLock),
+        addTagNames: options.addTag as string[],
+      });
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print(
+          {
+            id: collection.id,
+            name: collection.name,
+            addUntagged: collection.addUntagged,
+            autoLock: collection.autoLock,
+            addTags: options.addTag,
+          },
+          cmd,
+        );
+        return;
+      }
+      console.log(`Created collection "${collection.name}"`);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+collectionCommand
+  .command("update")
+  .description("Update a collection's name or rules (members are kept)")
+  .argument("<name>", "Current collection name")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .option("--name <new-name>", "New collection name")
+  .option("--add-untagged", "Rule on: new coins without tags join this collection")
+  .option("--no-add-untagged", "Rule off: stop adding untagged coins")
+  .option("--add-tag <tag>", "Add a tag to the join rule (repeatable)", collectTag, [])
+  .option("--clear-add-tags", "Remove every tag from the join rule")
+  .option("--auto-lock", "Rule on: lock coins when they join")
+  .option("--no-auto-lock", "Rule off: stop locking joining coins")
+  .action((name, options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const addTagNames = options.addTag as string[];
+      if (options.clearAddTags && addTagNames.length > 0) {
+        throw new Error("--add-tag and --clear-add-tags cannot be combined.");
+      }
+      if (
+        options.name === undefined &&
+        options.addUntagged === undefined &&
+        options.autoLock === undefined &&
+        !options.clearAddTags &&
+        addTagNames.length === 0
+      ) {
+        throw new Error("Nothing to update. Pass at least one option.");
+      }
+      const collection = updateCollection(email, network, wallet.walletId, name, {
+        name: options.name,
+        addUntagged: options.addUntagged,
+        autoLock: options.autoLock,
+        addTagNames: addTagNames.length > 0 ? addTagNames : undefined,
+        clearAddTags: Boolean(options.clearAddTags),
+      });
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print(
+          {
+            id: collection.id,
+            name: collection.name,
+            addUntagged: collection.addUntagged,
+            autoLock: collection.autoLock,
+          },
+          cmd,
+        );
+        return;
+      }
+      console.log(`Updated collection "${collection.name}"`);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+collectionCommand
+  .command("list")
+  .description("List collections with their rules and coin counts")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .action((options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const collections = listCollections(email, network, wallet.walletId);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print(
+          {
+            collections: collections.map((c) => ({
+              id: c.id,
+              name: c.name,
+              addUntagged: c.addUntagged,
+              autoLock: c.autoLock,
+              addTags: c.addTagNames,
+              coinCount: c.coinCount,
+            })),
+          },
+          cmd,
+        );
+        return;
+      }
+      if (collections.length === 0) {
+        console.log("No collections.");
+        return;
+      }
+      for (const c of collections) {
+        console.log(`  "${c.name}" (${c.coinCount} coin${c.coinCount === 1 ? "" : "s"})`);
+        console.log(`     Rules: ${describeRules(c)}`);
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+collectionCommand
+  .command("delete")
+  .description("Delete a collection (member coins keep their lock state)")
+  .argument("<name>", "Collection name")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .action((name, options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      deleteCollection(email, network, wallet.walletId, name);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print({ deleted: true }, cmd);
+        return;
+      }
+      console.log("Collection deleted.");
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+collectionCommand
+  .command("add")
+  .description("Add a coin to a collection (locks the coin if the collection auto-locks)")
+  .argument("<name>", "Collection name")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .action((name, options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const { txid, vout } = options.coin as { txid: string; vout: number };
+      const collection = addCoinToCollection(email, network, wallet.walletId, txid, vout, name);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print({ txid, vout, collection: collection.name }, cmd);
+        return;
+      }
+      console.log(`Added ${txid}:${vout} to "${collection.name}"`);
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+collectionCommand
+  .command("remove")
+  .description("Remove a coin from a collection (the coin keeps its lock state)")
+  .argument("<name>", "Collection name")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .action((name, options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const { txid, vout } = options.coin as { txid: string; vout: number };
+      const collection = removeCoinFromCollection(
+        email,
+        network,
+        wallet.walletId,
+        txid,
+        vout,
+        name,
+      );
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print({ txid, vout, collection: collection.name }, cmd);
+        return;
+      }
+      console.log(`Removed ${txid}:${vout} from "${collection.name}"`);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }

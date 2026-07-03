@@ -4,20 +4,28 @@ import type { WalletData } from "../../core/storage.js";
 
 const {
   mockAddCoinTag,
+  mockAddCoinToCollection,
+  mockCreateCollection,
   mockCreateTag,
+  mockGetCoinCollectionNames,
   mockGetCoinTagNames,
   mockGetLockedOutpoints,
   mockListCoins,
   mockLoadWallet,
   mockSetCoinLock,
+  mockUpdateCollection,
 } = vi.hoisted(() => ({
   mockAddCoinTag: vi.fn(),
+  mockAddCoinToCollection: vi.fn(),
+  mockCreateCollection: vi.fn(),
   mockCreateTag: vi.fn(),
+  mockGetCoinCollectionNames: vi.fn(() => new Map<string, string[]>()),
   mockGetCoinTagNames: vi.fn(() => new Map<string, string[]>()),
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
   mockListCoins: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockSetCoinLock: vi.fn(),
+  mockUpdateCollection: vi.fn(),
 }));
 
 vi.mock("../../core/config.js", () => ({
@@ -52,6 +60,16 @@ vi.mock("../../core/tag-store.js", () => ({
   listTags: vi.fn(() => []),
   removeCoinTag: vi.fn(),
   renameTag: vi.fn(),
+}));
+
+vi.mock("../../core/collection-store.js", () => ({
+  addCoinToCollection: mockAddCoinToCollection,
+  createCollection: mockCreateCollection,
+  deleteCollection: vi.fn(),
+  getCoinCollectionNames: mockGetCoinCollectionNames,
+  listCollections: vi.fn(() => []),
+  removeCoinFromCollection: vi.fn(),
+  updateCollection: mockUpdateCollection,
 }));
 
 vi.mock("../../core/electrum.js", () => ({
@@ -232,5 +250,181 @@ describe("coin tag commands", () => {
       "kyc",
     );
     expect(logSpy).toHaveBeenCalledWith(`Tagged ${TXID}:0 with #kyc`);
+  });
+});
+
+describe("coin collection commands", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockCreateCollection.mockReturnValue({
+      id: 1,
+      name: "Exchange A",
+      addUntagged: false,
+      autoLock: false,
+      addTags: [],
+    });
+    mockUpdateCollection.mockReturnValue({
+      id: 1,
+      name: "Exchange A",
+      addUntagged: true,
+      autoLock: false,
+      addTags: [],
+    });
+    mockAddCoinToCollection.mockReturnValue({ id: 1, name: "Exchange A" });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("coin collection create forwards name and rule flags", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin([
+      "collection",
+      "create",
+      "Exchange A",
+      "--wallet",
+      "jk74e3up",
+      "--add-untagged",
+      "--add-tag",
+      "kyc",
+      "--add-tag",
+      "cold",
+      "--auto-lock",
+    ]);
+    expect(mockCreateCollection).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "Exchange A",
+      { addUntagged: true, autoLock: true, addTagNames: ["kyc", "cold"] },
+    );
+    expect(logSpy).toHaveBeenCalledWith(`Created collection "Exchange A"`);
+  });
+
+  it("coin collection update forwards tri-state flags and --no- variants", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin([
+      "collection",
+      "update",
+      "Exchange A",
+      "--wallet",
+      "jk74e3up",
+      "--add-untagged",
+      "--no-auto-lock",
+      "--clear-add-tags",
+    ]);
+    expect(mockUpdateCollection).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "Exchange A",
+      {
+        name: undefined,
+        addUntagged: true,
+        autoLock: false,
+        addTagNames: undefined,
+        clearAddTags: true,
+      },
+    );
+  });
+
+  it("coin collection update rejects --add-tag with --clear-add-tags and empty updates", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runCoin([
+      "collection",
+      "update",
+      "Exchange A",
+      "--wallet",
+      "jk74e3up",
+      "--add-tag",
+      "kyc",
+      "--clear-add-tags",
+    ]);
+    expect(mockUpdateCollection).not.toHaveBeenCalled();
+    let err = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(err).toContain("--add-tag and --clear-add-tags cannot be combined.");
+
+    errSpy.mockClear();
+    await runCoin(["collection", "update", "Exchange A", "--wallet", "jk74e3up"]);
+    expect(mockUpdateCollection).not.toHaveBeenCalled();
+    err = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(err).toContain("Nothing to update.");
+  });
+
+  it("coin collection add forwards the outpoint and name", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin([
+      "collection",
+      "add",
+      "Exchange A",
+      "--wallet",
+      "jk74e3up",
+      "--coin",
+      `${TXID}:0`,
+    ]);
+    expect(mockAddCoinToCollection).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      TXID,
+      0,
+      "Exchange A",
+    );
+    expect(logSpy).toHaveBeenCalledWith(`Added ${TXID}:0 to "Exchange A"`);
+  });
+});
+
+describe("coin list --collection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockListCoins.mockResolvedValue([
+      {
+        txid: TXID,
+        vout: 0,
+        address: "bc1qaddr",
+        amount: 10_000n,
+        height: 100,
+        confirmations: 5,
+        status: "CONFIRMED",
+        isChange: false,
+      },
+      {
+        txid: TXID,
+        vout: 1,
+        address: "bc1qaddr2",
+        amount: 20_000n,
+        height: 100,
+        confirmations: 5,
+        status: "CONFIRMED",
+        isChange: false,
+      },
+    ]);
+    mockGetLockedOutpoints.mockReturnValue(new Set<string>());
+    mockGetCoinTagNames.mockReturnValue(new Map<string, string[]>());
+    mockGetCoinCollectionNames.mockReturnValue(new Map([[`${TXID}:0`, ["Exchange A"]]]));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("shows collections and filters with --collection", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["list", "--wallet", "jk74e3up"]);
+    let out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("Collections: Exchange A");
+
+    logSpy.mockClear();
+    await runCoin(["list", "--wallet", "jk74e3up", "--collection", "Exchange A"]);
+    out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`${TXID}:0`);
+    expect(out).not.toContain(`${TXID}:1`);
   });
 });
