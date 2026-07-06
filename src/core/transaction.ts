@@ -2711,7 +2711,7 @@ async function fetchTransactionBatchMap(
   }
 }
 
-async function fetchBlockHeaderBatchMap(
+export async function fetchBlockHeaderBatchMap(
   electrum: ElectrumClient,
   heights: number[],
 ): Promise<Map<number, string>> {

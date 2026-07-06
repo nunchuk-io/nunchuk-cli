@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WalletData } from "../../core/storage.js";
+import { formatDateTime } from "../../core/format.js";
 
 const {
   mockAddCoinTag,
@@ -236,6 +237,26 @@ describe("coin list locked column", () => {
     const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toContain(`${TXID}:1 [locked]`);
     expect(out).not.toContain(`${TXID}:0 [locked]`);
+  });
+
+  it("shows the received date-time when the block time is known", async () => {
+    mockListCoins.mockResolvedValue([
+      {
+        txid: TXID,
+        vout: 0,
+        address: "bc1qaddr",
+        amount: 10_000n,
+        height: 100,
+        confirmations: 5,
+        status: "CONFIRMED",
+        isChange: false,
+        blocktime: 1_700_000_000,
+      },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["list", "--wallet", "jk74e3up"]);
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`Received: ${formatDateTime(1_700_000_000)}`);
   });
 
   it("shows tags and filters with --tag and --untagged", async () => {
@@ -606,6 +627,7 @@ describe("coin tag get / coin collection get", () => {
         confirmations: 5,
         status: "CONFIRMED",
         isChange: false,
+        blocktime: 1_700_000_000,
       },
     ]);
   });
@@ -640,7 +662,9 @@ describe("coin tag get / coin collection get", () => {
     expect(out).toContain(`"quarantine" (2 coins, 1 spent)`);
     expect(out).toContain("Rules: add-untagged, auto-lock");
     expect(out).toContain("Total: 0.00010000 BTC (10000 sat)"); // spendable member only
-    expect(out).toContain(`${TXID}:0 [locked]  0.00010000 BTC (10000 sat)  #kyc`);
+    expect(out).toContain(
+      `${TXID}:0 [locked]  0.00010000 BTC (10000 sat)  ${formatDateTime(1_700_000_000)}  #kyc`,
+    );
     expect(out).toContain(`${TXID}:9 [spent]`);
   });
 
@@ -656,6 +680,8 @@ describe("coin tag get / coin collection get", () => {
     const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toContain("#kyc (1 coin)");
     expect(out).toContain("Total: 0.00010000 BTC (10000 sat)");
-    expect(out).toContain(`${TXID}:0  0.00010000 BTC (10000 sat)  #kyc #cold`);
+    expect(out).toContain(
+      `${TXID}:0  0.00010000 BTC (10000 sat)  ${formatDateTime(1_700_000_000)}  #kyc #cold`,
+    );
   });
 });

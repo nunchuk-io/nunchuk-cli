@@ -30,7 +30,7 @@ import {
   updateCollection,
 } from "../core/collection-store.js";
 import { reconcileNewCoins } from "../core/coin-rules.js";
-import { formatBtc, formatSats } from "../core/format.js";
+import { formatBtc, formatDateTime, formatSats } from "../core/format.js";
 import { print, printError } from "../output.js";
 
 const COIN_STATUSES: CoinStatus[] = [
@@ -149,6 +149,8 @@ function memberCoinJson(c: MemberCoin): Record<string, unknown> {
           amount: c.live.amount.toString(),
           amountBtc: formatBtc(c.live.amount),
           status: c.live.status,
+          blocktime: c.live.blocktime,
+          receivedAt: c.live.blocktime > 0 ? formatDateTime(c.live.blocktime) : null,
         }
       : {}),
   };
@@ -163,8 +165,11 @@ function printMemberCoinLines(coins: MemberCoin[]): void {
   for (const c of coins) {
     const labels = `${c.locked ? " [locked]" : ""}${c.live ? "" : " [spent]"}`;
     const amount = c.live ? `  ${formatBtc(c.live.amount)} (${formatSats(c.live.amount)})` : "";
+    const receivedAt = c.live
+      ? `  ${c.live.blocktime > 0 ? formatDateTime(c.live.blocktime) : "unconfirmed"}`
+      : "";
     const tags = c.tags.length > 0 ? `  ${c.tags.map((t) => `#${t}`).join(" ")}` : "";
-    console.log(`    ${c.txid}:${c.vout}${labels}${amount}${tags}`);
+    console.log(`    ${c.txid}:${c.vout}${labels}${amount}${receivedAt}${tags}`);
   }
 }
 
@@ -234,6 +239,8 @@ coinCommand
               confirmations: c.confirmations,
               status: c.status,
               isChange: c.isChange,
+              blocktime: c.blocktime,
+              receivedAt: c.blocktime > 0 ? formatDateTime(c.blocktime) : null,
               locked: isLocked(c),
               tags: tagsOf(c),
               collections: collectionsOf(c),
@@ -256,6 +263,9 @@ coinCommand
         console.log(`     Amount: ${formatBtc(c.amount)} (${formatSats(c.amount)})`);
         console.log(`     Status: ${c.status}`);
         console.log(`     Confirmations: ${c.confirmations}`);
+        if (c.blocktime > 0) {
+          console.log(`     Received: ${formatDateTime(c.blocktime)}`);
+        }
         const tags = tagsOf(c);
         if (tags.length > 0) {
           console.log(`     Tags: ${tags.map((t) => `#${t}`).join(" ")}`);

@@ -24,6 +24,17 @@ export function formatDate(unixTimestamp: number): string {
   return new Date(unixTimestamp * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC");
 }
 
+// MM-DD-YYYY hh:mm AM/PM in local time (coin received-at display).
+export function formatDateTime(unixTimestamp: number): string {
+  const d = new Date(unixTimestamp * 1000);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  const hours24 = d.getHours();
+  const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${d.getFullYear()} ${pad(hours12)}:${pad(
+    d.getMinutes(),
+  )} ${hours24 >= 12 ? "PM" : "AM"}`;
+}
+
 export function getOutputAddress(script: Uint8Array, network: Network): string | null {
   try {
     const net = network === "mainnet" ? NETWORK : TEST_NETWORK;

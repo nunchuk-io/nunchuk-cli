@@ -125,6 +125,14 @@ function mockElectrum(utxos: MockUtxo[]): {
     return u ? [{ tx_hash: u.txid, height: u.height }] : [];
   });
 
+  // 80-byte header whose timestamp field (bytes 68–71, little-endian) encodes
+  // a deterministic per-height time: 1_700_000_000 + height.
+  const headerForHeight = (height: number): string => {
+    const timestamp = Buffer.alloc(4);
+    timestamp.writeUInt32LE(1_700_000_000 + height, 0);
+    return "00".repeat(68) + timestamp.toString("hex") + "00".repeat(8);
+  };
+
   return {
     electrum: {
       headersSubscribe: vi.fn(async () => ({ height: 850_000, hex: "00".repeat(80) })),
@@ -132,6 +140,7 @@ function mockElectrum(utxos: MockUtxo[]): {
       listUnspentBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(listUnspent))),
       getHistory,
       getHistoryBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(getHistory))),
+      getBlockHeaderBatch: vi.fn(async (heights: number[]) => heights.map(headerForHeight)),
     } as unknown as ElectrumClient,
     outpoints,
   };
@@ -183,5 +192,31 @@ describe("listCoins", () => {
     const coins = await listCoins({ wallet: WALLET, network: "testnet", electrum });
     // tip = 850_000 → confirmations = 850_000 - 849_991 + 1 = 10
     expect(coins[0].confirmations).toBe(10);
+  });
+
+  it("resolves the confirmation block time; unconfirmed coins get 0", async () => {
+    const email = uniqueEmail();
+    saveProfile(email, "testnet", { ...FAKE_PROFILE, email });
+    const { electrum } = mockElectrum([
+      { value: 100_000n, height: 100, chain: 0, index: 0 },
+      { value: 50_000n, height: 0, chain: 0, index: 1 }, // unconfirmed
+    ]);
+    const coins = await listCoins({ wallet: WALLET, network: "testnet", electrum });
+    const byHeight = Object.fromEntries(coins.map((c) => [c.height, c.blocktime]));
+    expect(byHeight[100]).toBe(1_700_000_100);
+    expect(byHeight[0]).toBe(0);
+  });
+
+  it("leaves blocktime 0 when headers cannot be fetched", async () => {
+    const email = uniqueEmail();
+    saveProfile(email, "testnet", { ...FAKE_PROFILE, email });
+    const { electrum } = mockElectrum([{ value: 100_000n, height: 100, chain: 0, index: 0 }]);
+    (electrum as unknown as { getBlockHeaderBatch: unknown }).getBlockHeaderBatch = vi.fn(
+      async () => {
+        throw new Error("unsupported");
+      },
+    );
+    const coins = await listCoins({ wallet: WALLET, network: "testnet", electrum });
+    expect(coins[0].blocktime).toBe(0);
   });
 });

@@ -368,7 +368,7 @@ nunchuk coin list --wallet <id> --collection "Exchange A"
 nunchuk --json coin list --wallet <id>
 ```
 
-Lists the wallet's unspent outputs from Electrum with a derived status (`CONFIRMED`, `INCOMING_PENDING_CONFIRMATION`, `OUTGOING_PENDING_SIGNATURES`, `OUTGOING_PENDING_BROADCAST`) — outgoing statuses come from pending PSBTs on the group server. Each coin shows its outpoint, address, amount, status, confirmations, a change flag, a `[locked]` marker, and its tags and collections.
+Lists the wallet's unspent outputs from Electrum with a derived status (`CONFIRMED`, `INCOMING_PENDING_CONFIRMATION`, `OUTGOING_PENDING_SIGNATURES`, `OUTGOING_PENDING_BROADCAST`) — outgoing statuses come from pending PSBTs on the group server. Each coin shows its outpoint, address, amount, status, confirmations, the received date-time (local time, from its confirmation block), a change flag, a `[locked]` marker, and its tags and collections.
 
 #### `coin lock` / `coin unlock`
 

@@ -16,8 +16,10 @@ import type { ApiClient } from "./api-client.js";
 import type { ElectrumClient } from "./electrum.js";
 import type { Network } from "./config.js";
 import type { WalletData } from "./storage.js";
+import { parseBlockTime } from "./electrum.js";
 import {
   decodePsbtDetail,
+  fetchBlockHeaderBatchMap,
   fetchPendingTransactions,
   scanUtxos,
   type PendingTx,
@@ -40,6 +42,9 @@ export interface CoinDetail {
   confirmations: number;
   status: CoinStatus;
   isChange: boolean;
+  // Confirmation block's timestamp (Unix seconds); 0 when unconfirmed or the
+  // header could not be fetched.
+  blocktime: number;
 }
 
 const STATUS_RANK: Record<CoinStatus, number> = {
@@ -86,7 +91,24 @@ export async function listCoins(args: {
       confirmations: utxo.height > 0 ? Math.max(0, tipHeight - utxo.height + 1) : 0,
       status,
       isChange: utxo.chain === 1,
+      blocktime: 0,
     });
+  }
+
+  // Received-at timestamps: one batched header fetch for the unique
+  // confirmation heights (~80 bytes each). Missing headers leave blocktime 0.
+  const headerByHeight = await fetchBlockHeaderBatchMap(
+    args.electrum,
+    [...coins.values()].map((c) => c.height),
+  );
+  for (const coin of coins.values()) {
+    const header = headerByHeight.get(coin.height);
+    if (!header) continue;
+    try {
+      coin.blocktime = parseBlockTime(header);
+    } catch {
+      // malformed header → blocktime stays 0
+    }
   }
 
   if (args.client) {

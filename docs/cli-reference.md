@@ -1040,7 +1040,7 @@ Status is derived per coin, not stored on-chain:
 - `CONFIRMED` / `INCOMING_PENDING_CONFIRMATION` — from the Electrum unspent set (confirmed vs unconfirmed).
 - `OUTGOING_PENDING_SIGNATURES` / `OUTGOING_PENDING_BROADCAST` — raised when the coin is an input of a pending PSBT on the group server (still unspent on-chain, but reserved by an unsigned/unbroadcast transaction).
 
-Each coin shows its outpoint (`txid:vout`), address, amount, status, confirmations, a `change` flag, its lock state, tags, and collections. Human output marks coins with `[change]` and `[locked]` and lists `Tags: #…` and `Collections: …`; JSON returns `{ coins: [{ txid, vout, address, amount, amountBtc, height, confirmations, status, isChange, locked, tags, collections }] }`.
+Each coin shows its outpoint (`txid:vout`), address, amount, status, confirmations, the received date-time, a `change` flag, its lock state, tags, and collections. Human output marks coins with `[change]` and `[locked]` and lists `Received: MM-DD-YYYY hh:mm AM/PM` (local time, from the confirmation block's timestamp; omitted while unconfirmed), `Tags: #…`, and `Collections: …`; JSON returns `{ coins: [{ txid, vout, address, amount, amountBtc, height, confirmations, status, isChange, blocktime, receivedAt, locked, tags, collections }] }`.
 
 ```bash
 nunchuk coin list --wallet w123
@@ -1081,7 +1081,7 @@ Manage coin tags — reusable labels for classifying coins (for example by sourc
 
 Tagging a coin also inserts it into every collection whose rules include that tag (see below). Removing a tag does **not** remove the coin from collections it already joined.
 
-`coin tag get <name>` (like `coin collection get`) joins the locally recorded members with the wallet's live unspent set: each member shows its amount and status, members that are no longer unspent are marked `[spent]`, and a `Total:` line sums the **spendable** members only. JSON returns `coinCount`, `spentCount`, `total`/`totalBtc`, and per-coin `spent`/`amount`/`status`. `coin list --tag <name>` remains the coin-first view (same data, filtered listing).
+`coin tag get <name>` (like `coin collection get`) joins the locally recorded members with the wallet's live unspent set: each member shows its amount, received date-time, and status, members that are no longer unspent are marked `[spent]`, and a `Total:` line sums the **spendable** members only. JSON returns `coinCount`, `spentCount`, `total`/`totalBtc`, and per-coin `spent`/`amount`/`status`/`blocktime`/`receivedAt`. `coin list --tag <name>` remains the coin-first view (same data, filtered listing).
 
 ```bash
 nunchuk coin tag create kyc --wallet w123
