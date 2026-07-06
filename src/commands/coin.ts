@@ -38,8 +38,6 @@ const COIN_STATUSES: CoinStatus[] = [
   "CONFIRMED",
   "OUTGOING_PENDING_SIGNATURES",
   "OUTGOING_PENDING_BROADCAST",
-  "OUTGOING_PENDING_CONFIRMATION",
-  "SPENT",
 ];
 
 function parseStatusOption(value: string): CoinStatus {

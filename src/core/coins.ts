@@ -8,8 +8,9 @@
 //   CONFIRMED (1)
 //   OUTGOING_PENDING_SIGNATURES (2)
 //   OUTGOING_PENDING_BROADCAST (3)
-//   OUTGOING_PENDING_CONFIRMATION (4)  — deferred (needs spending-tx history)
-//   SPENT (5)                          — deferred (coin would be off-chain by then)
+// libnunchuk also has OUTGOING_PENDING_CONFIRMATION (4) and SPENT (5); both need
+// spending-transaction history the CLI does not keep (a spent coin leaves the
+// Electrum unspent set), so they are not part of the CLI status surface.
 
 import { Transaction } from "@scure/btc-signer";
 import type { ApiClient } from "./api-client.js";
@@ -29,9 +30,7 @@ export type CoinStatus =
   | "INCOMING_PENDING_CONFIRMATION"
   | "CONFIRMED"
   | "OUTGOING_PENDING_SIGNATURES"
-  | "OUTGOING_PENDING_BROADCAST"
-  | "OUTGOING_PENDING_CONFIRMATION"
-  | "SPENT";
+  | "OUTGOING_PENDING_BROADCAST";
 
 export interface CoinDetail {
   txid: string;
@@ -52,8 +51,6 @@ const STATUS_RANK: Record<CoinStatus, number> = {
   CONFIRMED: 1,
   OUTGOING_PENDING_SIGNATURES: 2,
   OUTGOING_PENDING_BROADCAST: 3,
-  OUTGOING_PENDING_CONFIRMATION: 4,
-  SPENT: 5,
 };
 
 export function raiseStatus(current: CoinStatus, candidate: CoinStatus): CoinStatus {
