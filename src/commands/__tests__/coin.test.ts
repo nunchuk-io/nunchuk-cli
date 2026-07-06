@@ -131,6 +131,33 @@ describe("coin lock / unlock", () => {
     expect(logSpy).toHaveBeenCalledWith(`Locked ${TXID}:1`);
   });
 
+  it("coin lock locks every repeated --coin (regression: last one won)", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const TXID2 = "cd".repeat(32);
+    await runCoin(["lock", "--wallet", "jk74e3up", "--coin", `${TXID}:0`, "--coin", `${TXID2}:1`]);
+    expect(mockSetCoinLock).toHaveBeenCalledTimes(2);
+    expect(mockSetCoinLock).toHaveBeenNthCalledWith(
+      1,
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      TXID,
+      0,
+      true,
+    );
+    expect(mockSetCoinLock).toHaveBeenNthCalledWith(
+      2,
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      TXID2,
+      1,
+      true,
+    );
+    expect(logSpy).toHaveBeenCalledWith(`Locked ${TXID}:0`);
+    expect(logSpy).toHaveBeenCalledWith(`Locked ${TXID2}:1`);
+  });
+
   it("coin unlock clears the lock flag", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     await runCoin(["unlock", "--wallet", "jk74e3up", "--coin", `${TXID}:1`]);
@@ -259,6 +286,45 @@ describe("coin tag commands", () => {
       "kyc",
     );
     expect(logSpy).toHaveBeenCalledWith(`Tagged ${TXID}:0 with #kyc`);
+  });
+
+  it("coin tag add tags every repeated --coin (regression: last one won)", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const TXID2 = "cd".repeat(32);
+    const TXID3 = "ef".repeat(32);
+    await runCoin([
+      "tag",
+      "add",
+      "kyc",
+      "--wallet",
+      "jk74e3up",
+      "--coin",
+      `${TXID}:0`,
+      "--coin",
+      `${TXID2}:0`,
+      "--coin",
+      `${TXID3}:0`,
+    ]);
+    expect(mockAddCoinTag).toHaveBeenCalledTimes(3);
+    expect(mockAddCoinTag).toHaveBeenNthCalledWith(
+      1,
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      TXID,
+      0,
+      "kyc",
+    );
+    expect(mockAddCoinTag).toHaveBeenNthCalledWith(
+      3,
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      TXID3,
+      0,
+      "kyc",
+    );
+    expect(logSpy).toHaveBeenCalledWith(`Tagged ${TXID2}:0 with #kyc`);
   });
 });
 

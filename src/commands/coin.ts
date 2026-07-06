@@ -47,14 +47,17 @@ function parseStatusOption(value: string): CoinStatus {
   return upper as CoinStatus;
 }
 
-function parseCoinOption(value: string): { txid: string; vout: number } {
+type Outpoint = { txid: string; vout: number };
+
+// Repeatable --coin collector (same grammar as tx create --coin).
+function parseCoinOption(value: string, previous: Outpoint[] | undefined): Outpoint[] {
   const match = /^([0-9a-fA-F]{64}):(\d+)$/.exec(value);
   if (!match) {
     throw new InvalidArgumentError(
       "--coin must be <txid>:<vout> (64-character hex transaction ID, then the output index)",
     );
   }
-  return { txid: match[1].toLowerCase(), vout: Number(match[2]) };
+  return [...(previous ?? []), { txid: match[1].toLowerCase(), vout: Number(match[2]) }];
 }
 
 function getGlobals(cmd: Command): { apiKey: string; network: Network; email: string } {
@@ -207,22 +210,26 @@ coinCommand
 
 coinCommand
   .command("lock")
-  .description("Lock a coin so automatic coin selection skips it (spend it explicitly with --coin)")
+  .description("Lock coins so automatic coin selection skips them (spend explicitly with --coin)")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .requiredOption("--coin <txid:vout>", "Coin outpoint; repeat for multiple", parseCoinOption)
   .action((options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
-      const { txid, vout } = options.coin as { txid: string; vout: number };
-      setCoinLock(email, network, wallet.walletId, txid, vout, true);
+      const coins = options.coin as Outpoint[];
+      for (const { txid, vout } of coins) {
+        setCoinLock(email, network, wallet.walletId, txid, vout, true);
+      }
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
-        print({ txid, vout, locked: true }, cmd);
+        print({ coins, locked: true }, cmd);
         return;
       }
-      console.log(`Locked ${txid}:${vout}`);
+      for (const { txid, vout } of coins) {
+        console.log(`Locked ${txid}:${vout}`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -230,22 +237,26 @@ coinCommand
 
 coinCommand
   .command("unlock")
-  .description("Unlock a coin so automatic coin selection can use it again")
+  .description("Unlock coins so automatic coin selection can use them again")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .requiredOption("--coin <txid:vout>", "Coin outpoint; repeat for multiple", parseCoinOption)
   .action((options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
-      const { txid, vout } = options.coin as { txid: string; vout: number };
-      setCoinLock(email, network, wallet.walletId, txid, vout, false);
+      const coins = options.coin as Outpoint[];
+      for (const { txid, vout } of coins) {
+        setCoinLock(email, network, wallet.walletId, txid, vout, false);
+      }
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
-        print({ txid, vout, locked: false }, cmd);
+        print({ coins, locked: false }, cmd);
         return;
       }
-      console.log(`Unlocked ${txid}:${vout}`);
+      for (const { txid, vout } of coins) {
+        console.log(`Unlocked ${txid}:${vout}`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -352,23 +363,28 @@ tagCommand
 
 tagCommand
   .command("add")
-  .description("Add a tag to a coin")
+  .description("Add a tag to one or more coins")
   .argument("<name>", "Tag name")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .requiredOption("--coin <txid:vout>", "Coin outpoint; repeat for multiple", parseCoinOption)
   .action((name, options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
-      const { txid, vout } = options.coin as { txid: string; vout: number };
-      const tag = addCoinTag(email, network, wallet.walletId, txid, vout, name);
+      const coins = options.coin as Outpoint[];
+      let tagName = "";
+      for (const { txid, vout } of coins) {
+        tagName = addCoinTag(email, network, wallet.walletId, txid, vout, name).name;
+      }
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
-        print({ txid, vout, tag: tag.name }, cmd);
+        print({ tag: tagName, coins }, cmd);
         return;
       }
-      console.log(`Tagged ${txid}:${vout} with #${tag.name}`);
+      for (const { txid, vout } of coins) {
+        console.log(`Tagged ${txid}:${vout} with #${tagName}`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -376,23 +392,28 @@ tagCommand
 
 tagCommand
   .command("remove")
-  .description("Remove a tag from a coin")
+  .description("Remove a tag from one or more coins")
   .argument("<name>", "Tag name")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .requiredOption("--coin <txid:vout>", "Coin outpoint; repeat for multiple", parseCoinOption)
   .action((name, options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
-      const { txid, vout } = options.coin as { txid: string; vout: number };
-      const tag = removeCoinTag(email, network, wallet.walletId, txid, vout, name);
+      const coins = options.coin as Outpoint[];
+      let tagName = "";
+      for (const { txid, vout } of coins) {
+        tagName = removeCoinTag(email, network, wallet.walletId, txid, vout, name).name;
+      }
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
-        print({ txid, vout, tag: tag.name }, cmd);
+        print({ tag: tagName, coins }, cmd);
         return;
       }
-      console.log(`Removed #${tag.name} from ${txid}:${vout}`);
+      for (const { txid, vout } of coins) {
+        console.log(`Removed #${tagName} from ${txid}:${vout}`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -602,23 +623,35 @@ collectionCommand
 
 collectionCommand
   .command("add")
-  .description("Add a coin to a collection (locks the coin if the collection auto-locks)")
+  .description("Add one or more coins to a collection (locks them if the collection auto-locks)")
   .argument("<name>", "Collection name")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .requiredOption("--coin <txid:vout>", "Coin outpoint; repeat for multiple", parseCoinOption)
   .action((name, options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
-      const { txid, vout } = options.coin as { txid: string; vout: number };
-      const collection = addCoinToCollection(email, network, wallet.walletId, txid, vout, name);
+      const coins = options.coin as Outpoint[];
+      let collectionName = "";
+      for (const { txid, vout } of coins) {
+        collectionName = addCoinToCollection(
+          email,
+          network,
+          wallet.walletId,
+          txid,
+          vout,
+          name,
+        ).name;
+      }
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
-        print({ txid, vout, collection: collection.name }, cmd);
+        print({ collection: collectionName, coins }, cmd);
         return;
       }
-      console.log(`Added ${txid}:${vout} to "${collection.name}"`);
+      for (const { txid, vout } of coins) {
+        console.log(`Added ${txid}:${vout} to "${collectionName}"`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -626,30 +659,35 @@ collectionCommand
 
 collectionCommand
   .command("remove")
-  .description("Remove a coin from a collection (the coin keeps its lock state)")
+  .description("Remove one or more coins from a collection (they keep their lock state)")
   .argument("<name>", "Collection name")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--coin <txid:vout>", "Coin outpoint (txid:vout)", parseCoinOption)
+  .requiredOption("--coin <txid:vout>", "Coin outpoint; repeat for multiple", parseCoinOption)
   .action((name, options, cmd) => {
     try {
       const { network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
-      const { txid, vout } = options.coin as { txid: string; vout: number };
-      const collection = removeCoinFromCollection(
-        email,
-        network,
-        wallet.walletId,
-        txid,
-        vout,
-        name,
-      );
+      const coins = options.coin as Outpoint[];
+      let collectionName = "";
+      for (const { txid, vout } of coins) {
+        collectionName = removeCoinFromCollection(
+          email,
+          network,
+          wallet.walletId,
+          txid,
+          vout,
+          name,
+        ).name;
+      }
 
       const globals = cmd.optsWithGlobals();
       if (globals.json) {
-        print({ txid, vout, collection: collection.name }, cmd);
+        print({ collection: collectionName, coins }, cmd);
         return;
       }
-      console.log(`Removed ${txid}:${vout} from "${collection.name}"`);
+      for (const { txid, vout } of coins) {
+        console.log(`Removed ${txid}:${vout} from "${collectionName}"`);
+      }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
