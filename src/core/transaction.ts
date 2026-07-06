@@ -863,10 +863,19 @@ export interface CreateTransactionParams {
     scanned: Array<{ txid: string; vout: number; address: string; amountSats: bigint }>,
   ) => {
     lockedOutpoints: Set<string>;
+    // Fresh membership sets, resolved after reconciliation. When present they
+    // replace the fromTag/fromCollection outpoints, so a coin tagged or
+    // collected by this very scan's rules is already in the candidate pool.
+    fromTagOutpoints?: Set<string>;
+    fromCollectionOutpoints?: Set<string>;
   };
   // Restrict automatic selection (and --send-all) to the coins carrying this
   // tag. Cannot be combined with presetCoins.
   fromTag?: { name: string; outpoints: Set<string> };
+  // Restrict automatic selection (and --send-all) to the collection's member
+  // coins. Cannot be combined with presetCoins; combined with fromTag the
+  // filters intersect.
+  fromCollection?: { name: string; outpoints: Set<string> };
   // Randomness for selection shuffles, change target, input order, and change
   // position. Defaults to crypto-random; tests inject a seeded RNG.
   rng?: SelectionRng;
@@ -1719,11 +1728,17 @@ export async function createTransaction(
     lockedOutpoints,
     reconcileScan,
     fromTag,
+    fromCollection,
     rng = new CryptoRng(),
   } = params;
   if (fromTag && presetCoins.length > 0) {
     throw new Error(
       "--from-tag cannot be combined with --coin (manual selection spends exactly the chosen coins).",
+    );
+  }
+  if (fromCollection && presetCoins.length > 0) {
+    throw new Error(
+      "--from-collection cannot be combined with --coin (manual selection spends exactly the chosen coins).",
     );
   }
   const parsed = parseDescriptor(wallet.descriptor);
@@ -1784,7 +1799,7 @@ export async function createTransaction(
   if (scannedUtxos.length === 0) {
     throw new Error("No UTXOs found. Wallet has no funds.");
   }
-  const effectiveLocked = reconcileScan
+  const reconciled = reconcileScan
     ? reconcileScan(
         scannedUtxos.map((u) => ({
           txid: u.txHash,
@@ -1792,8 +1807,9 @@ export async function createTransaction(
           address: u.address,
           amountSats: u.value,
         })),
-      ).lockedOutpoints
-    : lockedOutpoints;
+      )
+    : undefined;
+  const effectiveLocked = reconciled ? reconciled.lockedOutpoints : lockedOutpoints;
 
   // Manual coin selection: validate the preset outpoints and restrict the
   // working set to exactly those coins.
@@ -1822,9 +1838,21 @@ export async function createTransaction(
       }
     }
     if (fromTag) {
-      utxos = utxos.filter((u) => fromTag.outpoints.has(`${u.txHash}:${u.txPos}`));
+      const outpoints = reconciled?.fromTagOutpoints ?? fromTag.outpoints;
+      utxos = utxos.filter((u) => outpoints.has(`${u.txHash}:${u.txPos}`));
       if (utxos.length === 0) {
         throw new Error(`No spendable coins carry tag #${fromTag.name}.`);
+      }
+    }
+    if (fromCollection) {
+      const outpoints = reconciled?.fromCollectionOutpoints ?? fromCollection.outpoints;
+      utxos = utxos.filter((u) => outpoints.has(`${u.txHash}:${u.txPos}`));
+      if (utxos.length === 0) {
+        throw new Error(
+          fromTag
+            ? `No spendable coins carry tag #${fromTag.name} and are in collection "${fromCollection.name}".`
+            : `No spendable coins are in collection "${fromCollection.name}".`,
+        );
       }
     }
   }

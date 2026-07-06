@@ -11,6 +11,7 @@ const {
   mockFetchPendingTransaction,
   mockGetDefaultFeeLevel,
   mockGetLockedOutpoints,
+  mockGetOutpointsByCollection,
   mockGetOutpointsByTag,
   mockPlanChangeTags,
   mockReconcileNewCoins,
@@ -28,6 +29,7 @@ const {
   mockFetchPendingTransaction: vi.fn(),
   mockGetDefaultFeeLevel: vi.fn(),
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
+  mockGetOutpointsByCollection: vi.fn(),
   mockGetOutpointsByTag: vi.fn(),
   mockPlanChangeTags: vi.fn(() => ({ tagIds: [], tagNames: [] })),
   mockReconcileNewCoins: vi.fn(),
@@ -69,6 +71,10 @@ vi.mock("../../core/coin-store.js", () => ({
 
 vi.mock("../../core/tag-store.js", () => ({
   getOutpointsByTag: mockGetOutpointsByTag,
+}));
+
+vi.mock("../../core/collection-store.js", () => ({
+  getOutpointsByCollection: mockGetOutpointsByCollection,
 }));
 
 vi.mock("../../core/coin-rules.js", () => ({
@@ -376,6 +382,111 @@ describe("tx create", () => {
     );
     expect(mockCreateTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ fromTag: resolved }),
+    );
+  });
+
+  it("forwards --from-collection as the resolved collection outpoints", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const resolved = { name: "Exchange A", outpoints: new Set(["b".repeat(64) + ":1"]) };
+    mockGetOutpointsByCollection.mockReturnValue(resolved);
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--from-collection",
+        "Exchange A",
+      ],
+      { from: "user" },
+    );
+
+    expect(mockGetOutpointsByCollection).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "Exchange A",
+    );
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ fromCollection: resolved }),
+    );
+  });
+
+  it("the reconcileScan hook re-resolves the filter outpoints after reconciliation", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGetOutpointsByTag.mockReturnValue({ name: "kyc", outpoints: new Set<string>() });
+    mockGetOutpointsByCollection.mockReturnValue({
+      name: "Exchange A",
+      outpoints: new Set<string>(),
+    });
+
+    await root.parseAsync(
+      [
+        "tx",
+        "create",
+        "--wallet",
+        "jk74e3up",
+        "--to",
+        "bc1qvqglvj69qw82984ap5gdre5egae8p50wets0rukfek2ettknp2pq7j2n9z",
+        "--amount",
+        "0.2",
+        "--currency",
+        "btc",
+        "--from-tag",
+        "kyc",
+        "--from-collection",
+        "Exchange A",
+      ],
+      { from: "user" },
+    );
+
+    const { reconcileScan } = mockCreateTransaction.mock.calls[0][0] as {
+      reconcileScan: (scanned: Array<{ txid: string; vout: number }>) => {
+        lockedOutpoints: Set<string>;
+        fromTagOutpoints?: Set<string>;
+        fromCollectionOutpoints?: Set<string>;
+      };
+    };
+
+    // The scan reconciled a new coin into the tag and collection; the fresh
+    // sets returned by the hook must reflect that.
+    const freshTag = new Set(["c".repeat(64) + ":0"]);
+    const freshCollection = new Set(["c".repeat(64) + ":0", "d".repeat(64) + ":1"]);
+    mockGetOutpointsByTag.mockReturnValue({ name: "kyc", outpoints: freshTag });
+    mockGetOutpointsByCollection.mockReturnValue({
+      name: "Exchange A",
+      outpoints: freshCollection,
+    });
+
+    const returned = reconcileScan([{ txid: "c".repeat(64), vout: 0 }]);
+    expect(returned.fromTagOutpoints).toBe(freshTag);
+    expect(returned.fromCollectionOutpoints).toBe(freshCollection);
+    // Re-resolution happens AFTER reconciliation (by name, not raw input).
+    expect(mockGetOutpointsByTag).toHaveBeenLastCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "kyc",
+    );
+    expect(mockReconcileNewCoins.mock.invocationCallOrder[0]).toBeLessThan(
+      mockGetOutpointsByTag.mock.invocationCallOrder[1],
     );
   });
 
@@ -1070,6 +1181,27 @@ describe("tx draft", () => {
     );
     const out = logSpy.mock.calls.map((c) => c[0]).join("\n");
     expect(out).not.toContain("pass --fee-rate");
+  });
+
+  it("forwards --from-tag and --from-collection like tx create", async () => {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.addCommand(txCommand);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const resolvedTag = { name: "kyc", outpoints: new Set(["a".repeat(64) + ":0"]) };
+    const resolvedCollection = { name: "Exchange A", outpoints: new Set(["b".repeat(64) + ":1"]) };
+    mockGetOutpointsByTag.mockReturnValue(resolvedTag);
+    mockGetOutpointsByCollection.mockReturnValue(resolvedCollection);
+
+    await root.parseAsync([...baseArgs, "--from-tag", "kyc", "--from-collection", "Exchange A"], {
+      from: "user",
+    });
+
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ fromTag: resolvedTag, fromCollection: resolvedCollection }),
+    );
   });
 
   it("forwards --coin outpoints and marks the input list as manually selected", async () => {

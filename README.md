@@ -296,6 +296,7 @@ nunchuk tx create --wallet <id> --to <address> --amount <sats> --subtract-fee   
 nunchuk tx create --wallet <id> --to <address> --send-all                              # sweep the entire balance
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --coin <txid:vout> --coin <txid:vout>  # manual coin selection
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-tag kyc          # auto-select only from tagged coins
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-collection "Exchange A"  # auto-select only from a collection
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --change-tags none      # don't tag the change coin
 ```
 
@@ -307,9 +308,9 @@ Fee rate is automatically estimated from the Nunchuk API, or set manually with `
 
 `--send-all` sweeps the entire wallet balance to the recipient — it spends every coin, forces `--subtract-fee` on (recipient receives `balance - fee`), and leaves no change. Use it instead of `--amount` (exactly one is required); if both are given, `--amount` is ignored with a warning.
 
-`--coin <txid:vout>` (repeatable) selects coins manually: the transaction spends **exactly** the chosen coins — no subset optimization, no automatic top-up (a shortfall fails with insufficient funds). Explicitly chosen coins are spent even when locked. Combined with `--send-all`, only the chosen coins are swept. Cannot be combined with `--from-tag`.
+`--coin <txid:vout>` (repeatable) selects coins manually: the transaction spends **exactly** the chosen coins — no subset optimization, no automatic top-up (a shortfall fails with insufficient funds). Explicitly chosen coins are spent even when locked. Combined with `--send-all`, only the chosen coins are swept. Cannot be combined with `--from-tag` or `--from-collection`.
 
-`--from-tag <name>` restricts automatic coin selection to coins carrying that tag (case-sensitive). Locked coins stay excluded within the filtered pool.
+`--from-tag <name>` restricts automatic coin selection to coins carrying that tag; `--from-collection <name>` restricts it to a collection's member coins (both case-sensitive). Given together, only coins matching **both** qualify. Locked coins stay excluded within the filtered pool.
 
 `--change-tags <tags>` decides which tags the change coin inherits. By default the change coin inherits **all** tags carried by the input coins; pass `none` to inherit nothing, or a comma-separated subset of the input coins' tags (e.g. `--change-tags kyc,cold`). The choice is stored locally and applied when the change coin appears in a later scan or broadcast — see [`coin tag`](#coin) for how tags work.
 

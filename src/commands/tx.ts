@@ -20,6 +20,7 @@ import { loadWallet, removeMusigNonce } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { getLockedOutpoints } from "../core/coin-store.js";
 import { reconcileNewCoins } from "../core/coin-rules.js";
+import { getOutpointsByCollection } from "../core/collection-store.js";
 import { getOutpointsByTag } from "../core/tag-store.js";
 import {
   getPendingIntentAddresses,
@@ -512,6 +513,10 @@ txCommand
     "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
   )
   .option(
+    "--from-collection <name>",
+    "Restrict automatic coin selection to coins in this collection (case-sensitive; combined with --from-tag both must match)",
+  )
+  .option(
     "--change-tags <tags>",
     'Tags for the change coin: a comma-separated subset of the input coins\' tags, or "none" (default: inherit all input tags)',
   )
@@ -534,6 +539,16 @@ txCommand
         const feeLevel =
           options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
 
+        // Resolve the pool filters eagerly so an unknown name fails before the
+        // scan; the reconcile hook re-resolves the outpoints afterwards so a
+        // coin classified by this very scan's rules is already in the pool.
+        const fromTag = options.fromTag
+          ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
+          : undefined;
+        const fromCollection = options.fromCollection
+          ? getOutpointsByCollection(email, network, wallet.walletId, options.fromCollection)
+          : undefined;
+
         const result = await createTransaction({
           wallet,
           network,
@@ -550,15 +565,24 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
-          // Reconcile coin-control state against the scan (first-seen collection
-          // rules can lock a coin), then hand back the fresh locked set.
+          // Reconcile coin-control state against the scan (change-tag intents
+          // and collection rules can tag, collect, or lock a coin the moment it
+          // is first seen), then hand back the fresh locked and filter sets.
           reconcileScan: (scanned) => {
             reconcileNewCoins(email, network, wallet.walletId, scanned);
-            return { lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId) };
+            return {
+              lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+              fromTagOutpoints: fromTag
+                ? getOutpointsByTag(email, network, wallet.walletId, fromTag.name).outpoints
+                : undefined,
+              fromCollectionOutpoints: fromCollection
+                ? getOutpointsByCollection(email, network, wallet.walletId, fromCollection.name)
+                    .outpoints
+                : undefined,
+            };
           },
-          fromTag: options.fromTag
-            ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
-            : undefined,
+          fromTag,
+          fromCollection,
         });
         // Under send-all there is no requested amount; the gross amount sent is
         // the swept balance (recipient + fee). recipientAmount + fee also equals
@@ -733,6 +757,10 @@ txCommand
     "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
   )
   .option(
+    "--from-collection <name>",
+    "Restrict automatic coin selection to coins in this collection (case-sensitive; combined with --from-tag both must match)",
+  )
+  .option(
     "--change-tags <tags>",
     'Tags for the change coin: a comma-separated subset of the input coins\' tags, or "none" (default: inherit all input tags)',
   )
@@ -753,6 +781,16 @@ txCommand
         const feeLevel =
           options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
 
+        // Resolve the pool filters eagerly so an unknown name fails before the
+        // scan; the reconcile hook re-resolves the outpoints afterwards so a
+        // coin classified by this very scan's rules is already in the pool.
+        const fromTag = options.fromTag
+          ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
+          : undefined;
+        const fromCollection = options.fromCollection
+          ? getOutpointsByCollection(email, network, wallet.walletId, options.fromCollection)
+          : undefined;
+
         // Build the transaction exactly as `tx create` would — but never upload.
         const result = await createTransaction({
           wallet,
@@ -769,15 +807,24 @@ txCommand
           antiFeeSniping: Boolean(options.antiFeeSniping),
           subtractFeeFromAmount: Boolean(options.subtractFee),
           presetCoins: options.coin,
-          // Reconcile coin-control state against the scan (first-seen collection
-          // rules can lock a coin), then hand back the fresh locked set.
+          // Reconcile coin-control state against the scan (change-tag intents
+          // and collection rules can tag, collect, or lock a coin the moment it
+          // is first seen), then hand back the fresh locked and filter sets.
           reconcileScan: (scanned) => {
             reconcileNewCoins(email, network, wallet.walletId, scanned);
-            return { lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId) };
+            return {
+              lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+              fromTagOutpoints: fromTag
+                ? getOutpointsByTag(email, network, wallet.walletId, fromTag.name).outpoints
+                : undefined,
+              fromCollectionOutpoints: fromCollection
+                ? getOutpointsByCollection(email, network, wallet.walletId, fromCollection.name)
+                    .outpoints
+                : undefined,
+            };
           },
-          fromTag: options.fromTag
-            ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
-            : undefined,
+          fromTag,
+          fromCollection,
         });
         // Under send-all the gross amount sent is the swept balance (recipient +
         // fee); otherwise it is the requested amount.

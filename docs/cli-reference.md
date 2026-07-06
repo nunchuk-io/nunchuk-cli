@@ -864,6 +864,7 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 | `--subtract-fee`            | No       | Subtract the network fee from the amount (recipient receives amount minus fee) |
 | `--coin <txid:vout>`        | No       | Spend exactly this coin; repeat for multiple (manual coin selection)  |
 | `--from-tag <name>`         | No       | Restrict automatic selection to coins carrying this tag (case-sensitive) |
+| `--from-collection <name>`  | No       | Restrict automatic selection to a collection's member coins (case-sensitive) |
 | `--change-tags <tags>`      | No       | Tags for the change coin: comma-separated subset of the input coins' tags, or `none` (default: inherit all) |
 
 Fee rate is automatically estimated from the Nunchuk API (with Electrum fallback), unless `--fee-rate <sat/vB>` is given to set it manually. The value is a positive number in sat/vB and may be fractional (e.g. `1.5`); it is applied at sat/kvB precision.
@@ -882,7 +883,7 @@ For miniscript wallets, the CLI selects the first satisfiable supported path wit
 
 **Manual coin selection.** `--coin <txid:vout>` (repeatable) spends **exactly** the chosen coins — the transaction uses every listed coin as an input, with no subset optimization and no automatic top-up: if the chosen coins cannot cover `amount + fee` (without `--subtract-fee`), creation fails with insufficient funds. Explicitly chosen coins are spent even when locked (`coin lock` guards automatic selection only). Combined with `--send-all`, only the chosen coins are swept. Cannot be combined with `--from-tag`. Unknown or duplicate outpoints are rejected before anything is built. The output labels the selection (`Coins: N selected manually`; JSON `coinSelection: "manual"` plus an `inputs` array).
 
-**Tag-scoped automatic selection.** `--from-tag <name>` restricts the automatic candidate pool to coins carrying the tag (case-sensitive; a leading `#` is accepted). Locked coins remain excluded inside the filtered pool. If no spendable coin carries the tag, creation fails with a message naming the tag.
+**Tag- and collection-scoped automatic selection.** `--from-tag <name>` restricts the automatic candidate pool to coins carrying the tag (case-sensitive; a leading `#` is accepted); `--from-collection <name>` restricts it to a collection's member coins (case-sensitive; quote names with spaces). Given together the filters intersect: only coins that carry the tag **and** are in the collection qualify. Locked coins remain excluded inside the filtered pool, and neither flag can be combined with `--coin`. If the filtered pool is empty, creation fails with a message naming the tag and/or collection. The membership sets are re-resolved after the scan's coin-control reconciliation, so a coin that receives the tag or joins the collection at that very scan (change-tag intent, collection rule) is already eligible.
 
 **Change-coin tag inheritance.** When the transaction produces change, the change coin inherits the input coins' tags by default. `--change-tags <tags>` overrides the default: `none` inherits nothing; a comma-separated list (e.g. `kyc,cold`) must be a subset of the tags carried by the input coins — inheritance copies existing classification, it never invents it. The choice is validated after coin selection and before upload, stored locally as a pending intent keyed by the change address, and applied automatically when the change coin is next seen (any `coin list` / `tx create` / `tx draft` scan, or immediately on `tx broadcast`) — regardless of whether the CLI, the mobile app, or the backend broadcast the transaction. The output shows `Change tags: …` (JSON `changeTags`). If the transaction has no change, an explicit `--change-tags` is ignored with a warning.
 
@@ -901,6 +902,8 @@ nunchuk tx create --wallet w123 --to bc1q... --send-all
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --coin <txid>:0 --coin <txid>:1
 nunchuk tx create --wallet w123 --to bc1q... --send-all --coin <txid>:0     # sweep only this coin
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --from-tag kyc
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --from-collection "Exchange A"
+nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --from-tag kyc --from-collection "Exchange A"
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --change-tags none
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --change-tags kyc,cold
 ```
@@ -922,7 +925,7 @@ JSON mode adds the raw sat/kvB values (`prioritySatPerKvB`, `standardSatPerKvB`,
 
 Preview a transaction without creating it. Builds the same PSBT that `tx create` would (coin selection, fee, change), shows the "confirm" details, and **never uploads to the group server or writes storage**.
 
-Takes the **same options as [`tx create`](#nunchuk-tx-create)** — `--wallet`, `--to`, `--amount`, `--send-all`, `--currency`, `--fee-rate`, `--fee-level`, `--anti-fee-sniping`, `--subtract-fee`, `--coin`, `--from-tag`, `--change-tags`, `--miniscript-path`, `--taproot-script-path`, `--preimage` — plus one extra:
+Takes the **same options as [`tx create`](#nunchuk-tx-create)** — `--wallet`, `--to`, `--amount`, `--send-all`, `--currency`, `--fee-rate`, `--fee-level`, `--anti-fee-sniping`, `--subtract-fee`, `--coin`, `--from-tag`, `--from-collection`, `--change-tags`, `--miniscript-path`, `--taproot-script-path`, `--preimage` — plus one extra:
 
 | Option           | Required | Description                                                       |
 | ---------------- | -------- | ----------------------------------------------------------------- |
