@@ -11,12 +11,13 @@ import {
 } from "../storage.js";
 import type { Profile } from "../storage.js";
 import { isCoinLocked, loadCoinControl, setCoinLock } from "../coin-store.js";
-import { createTag } from "../tag-store.js";
+import { addCoinTag, createTag } from "../tag-store.js";
 import {
   addCoinToCollection,
   createCollection,
   deleteCollection,
   getCoinCollectionNames,
+  getCollectionDetail,
   getOutpointsByCollection,
   listCollections,
   removeCoinFromCollection,
@@ -179,6 +180,29 @@ describe("collection membership", () => {
     expect(outpoints).toEqual(new Set([`${TXID}:1`]));
     // The coin entry survives removal (seen marker).
     expect(loadCoinControl(email, NET, WALLET_ID).coins[`${TXID}:0`].collections).toEqual([]);
+  });
+
+  it("getCollectionDetail returns rules and member coins with lock state and tags", () => {
+    const email = uniqueEmail();
+    bootstrap(email);
+    createTag(email, NET, WALLET_ID, "kyc");
+    createCollection(email, NET, WALLET_ID, "vault", {
+      addUntagged: true,
+      autoLock: true,
+      addTagNames: ["kyc"],
+    });
+    addCoinToCollection(email, NET, WALLET_ID, TXID, 0, "vault");
+    addCoinTag(email, NET, WALLET_ID, TXID, 0, "kyc");
+
+    const detail = getCollectionDetail(email, NET, WALLET_ID, "vault");
+    expect(detail).toMatchObject({
+      name: "vault",
+      addUntagged: true,
+      autoLock: true,
+      addTagNames: ["kyc"],
+    });
+    expect(detail.coins).toEqual([{ txid: TXID, vout: 0, locked: true, tags: ["kyc"] }]);
+    expect(() => getCollectionDetail(email, NET, WALLET_ID, "nope")).toThrow(/No collection/);
   });
 
   it("auto-lock fires once on insert; re-add does not re-lock", () => {

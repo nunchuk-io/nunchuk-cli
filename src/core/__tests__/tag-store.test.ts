@@ -17,6 +17,7 @@ import {
   deleteTag,
   getCoinTagNames,
   getOutpointsByTag,
+  getTagDetail,
   listTags,
   removeCoinTag,
   renameTag,
@@ -200,6 +201,23 @@ describe("coin tag assignment", () => {
     expect(name).toBe("kyc");
     expect(outpoints).toEqual(new Set([`${TXID}:0`, `${TXID}:2`]));
     expect(() => getOutpointsByTag(email, NET, WALLET_ID, "nope")).toThrow(/No tag "nope"/);
+  });
+
+  it("getTagDetail returns member coins with lock state and full tag names", () => {
+    const email = uniqueEmail();
+    bootstrap(email);
+    createTag(email, NET, WALLET_ID, "kyc");
+    createTag(email, NET, WALLET_ID, "cold");
+    addCoinTag(email, NET, WALLET_ID, TXID, 0, "kyc");
+    addCoinTag(email, NET, WALLET_ID, TXID, 0, "cold");
+    addCoinTag(email, NET, WALLET_ID, TXID, 1, "cold");
+
+    const detail = getTagDetail(email, NET, WALLET_ID, "#kyc");
+    expect(detail.name).toBe("kyc");
+    expect(detail.coins).toEqual([{ txid: TXID, vout: 0, locked: false, tags: ["kyc", "cold"] }]);
+
+    expect(getTagDetail(email, NET, WALLET_ID, "kyc").coins).toHaveLength(1);
+    expect(() => getTagDetail(email, NET, WALLET_ID, "nope")).toThrow(/No tag "nope"/);
   });
 
   it("listTags reports per-tag coin counts", () => {

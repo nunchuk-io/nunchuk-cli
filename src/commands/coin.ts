@@ -5,23 +5,26 @@ import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient } from "../core/electrum.js";
 import { loadWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
-import { listCoins, type CoinStatus } from "../core/coins.js";
+import { listCoins, type CoinDetail, type CoinStatus } from "../core/coins.js";
 import { getLockedOutpoints, setCoinLock } from "../core/coin-store.js";
 import {
   addCoinTag,
   createTag,
   deleteTag,
   getCoinTagNames,
+  getTagDetail,
   listTags,
   removeCoinTag,
   renameTag,
 } from "../core/tag-store.js";
+import type { TaggedCoinDetail } from "../core/tag-store.js";
 import {
   addCoinToCollection,
   applyCollectionToExisting,
   createCollection,
   deleteCollection,
   getCoinCollectionNames,
+  getCollectionDetail,
   listCollections,
   removeCoinFromCollection,
   updateCollection,
@@ -80,6 +83,91 @@ function requireWallet(email: string, network: Network, walletId: string): Walle
   return wallet;
 }
 
+// Scan the wallet's live coins (Electrum unspent set + group-server statuses)
+// and run the coin-control reconciliation pass on the result.
+async function scanAndReconcileCoins(
+  apiKey: string,
+  network: Network,
+  email: string,
+  wallet: WalletData,
+): Promise<CoinDetail[]> {
+  const client = new ApiClient(apiKey, network);
+  const server = getElectrumServer(network);
+  const electrum = new ElectrumClient();
+  let coins: CoinDetail[];
+  try {
+    await electrum.connect(server.host, server.port, server.protocol);
+    await electrum.serverVersion("nunchuk-cli", "1.4");
+    coins = await listCoins({ wallet, network, electrum, client });
+  } finally {
+    electrum.close();
+  }
+  // Change-tag intents and first-seen collection rules run before the caller
+  // consumes the scan, so a new coin already shows its inherited tags,
+  // rule-applied collections, and lock.
+  reconcileNewCoins(
+    email,
+    network,
+    wallet.walletId,
+    coins.map((c) => ({ txid: c.txid, vout: c.vout, address: c.address, amountSats: c.amount })),
+  );
+  return coins;
+}
+
+// A locally recorded tag/collection member joined with its live coin (absent
+// when the coin is no longer in the wallet's unspent set).
+type MemberCoin = TaggedCoinDetail & { live?: CoinDetail };
+
+function joinMembersWithLiveCoins(
+  members: TaggedCoinDetail[],
+  liveCoins: CoinDetail[],
+): { coins: MemberCoin[]; spentCount: number; totalSats: bigint } {
+  const byOutpoint = new Map(liveCoins.map((c) => [`${c.txid}:${c.vout}`, c]));
+  const coins = members.map((m) => ({ ...m, live: byOutpoint.get(`${m.txid}:${m.vout}`) }));
+  let totalSats = 0n;
+  let spentCount = 0;
+  for (const c of coins) {
+    if (c.live) totalSats += c.live.amount;
+    else spentCount += 1;
+  }
+  return { coins, spentCount, totalSats };
+}
+
+function describeMemberCount(count: number, spentCount: number): string {
+  return `${count} coin${count === 1 ? "" : "s"}${spentCount > 0 ? `, ${spentCount} spent` : ""}`;
+}
+
+function memberCoinJson(c: MemberCoin): Record<string, unknown> {
+  return {
+    txid: c.txid,
+    vout: c.vout,
+    locked: c.locked,
+    tags: c.tags,
+    spent: !c.live,
+    ...(c.live
+      ? {
+          amount: c.live.amount.toString(),
+          amountBtc: formatBtc(c.live.amount),
+          status: c.live.status,
+        }
+      : {}),
+  };
+}
+
+function printMemberCoinLines(coins: MemberCoin[]): void {
+  if (coins.length === 0) {
+    console.log("  Coins: none");
+    return;
+  }
+  console.log("  Coins:");
+  for (const c of coins) {
+    const labels = `${c.locked ? " [locked]" : ""}${c.live ? "" : " [spent]"}`;
+    const amount = c.live ? `  ${formatBtc(c.live.amount)} (${formatSats(c.live.amount)})` : "";
+    const tags = c.tags.length > 0 ? `  ${c.tags.map((t) => `#${t}`).join(" ")}` : "";
+    console.log(`    ${c.txid}:${c.vout}${labels}${amount}${tags}`);
+  }
+}
+
 export const coinCommand = new Command("coin").description(
   "Inspect and manage wallet UTXOs (coins)",
 );
@@ -103,37 +191,12 @@ coinCommand
       if (options.tag && options.untagged) {
         throw new Error("--tag and --untagged cannot be combined.");
       }
-      const client = new ApiClient(apiKey, network);
-      const server = getElectrumServer(network);
-      const electrum = new ElectrumClient();
-      let coins;
-      try {
-        await electrum.connect(server.host, server.port, server.protocol);
-        await electrum.serverVersion("nunchuk-cli", "1.4");
-        coins = await listCoins({ wallet, network, electrum, client });
-      } finally {
-        electrum.close();
-      }
+      const coins = await scanAndReconcileCoins(apiKey, network, email, wallet);
 
       let filtered = coins;
       if (options.status) {
         filtered = filtered.filter((c) => c.status === options.status);
       }
-
-      // Change-tag intents and first-seen collection rules run before the list
-      // is rendered, so a new coin already shows its inherited tags,
-      // rule-applied collections, and lock.
-      reconcileNewCoins(
-        email,
-        network,
-        wallet.walletId,
-        coins.map((c) => ({
-          txid: c.txid,
-          vout: c.vout,
-          address: c.address,
-          amountSats: c.amount,
-        })),
-      );
 
       const locked = getLockedOutpoints(email, network, wallet.walletId);
       const tagNames = getCoinTagNames(email, network, wallet.walletId);
@@ -311,6 +374,43 @@ tagCommand
       for (const t of tags) {
         console.log(`  #${t.name} (${t.coinCount} coin${t.coinCount === 1 ? "" : "s"})`);
       }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+tagCommand
+  .command("get")
+  .description("Show a tag's member coins with live amounts and the spendable total")
+  .argument("<name>", "Tag name")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .action(async (name, options, cmd) => {
+    try {
+      const { apiKey, network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const liveCoins = await scanAndReconcileCoins(apiKey, network, email, wallet);
+      const detail = getTagDetail(email, network, wallet.walletId, name);
+      const { coins, spentCount, totalSats } = joinMembersWithLiveCoins(detail.coins, liveCoins);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print(
+          {
+            id: detail.id,
+            name: detail.name,
+            coinCount: coins.length,
+            spentCount,
+            total: totalSats.toString(),
+            totalBtc: formatBtc(totalSats),
+            coins: coins.map(memberCoinJson),
+          },
+          cmd,
+        );
+        return;
+      }
+      console.log(`#${detail.name} (${describeMemberCount(coins.length, spentCount)})`);
+      console.log(`  Total: ${formatBtc(totalSats)} (${formatSats(totalSats)})`);
+      printMemberCoinLines(coins);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }
@@ -594,6 +694,49 @@ collectionCommand
         console.log(`  "${c.name}" (${c.coinCount} coin${c.coinCount === 1 ? "" : "s"})`);
         console.log(`     Rules: ${describeRules(c)}`);
       }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+collectionCommand
+  .command("get")
+  .description(
+    "Show a collection's rules and member coins with live amounts and the spendable total",
+  )
+  .argument("<name>", "Collection name")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .action(async (name, options, cmd) => {
+    try {
+      const { apiKey, network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const liveCoins = await scanAndReconcileCoins(apiKey, network, email, wallet);
+      const detail = getCollectionDetail(email, network, wallet.walletId, name);
+      const { coins, spentCount, totalSats } = joinMembersWithLiveCoins(detail.coins, liveCoins);
+
+      const globals = cmd.optsWithGlobals();
+      if (globals.json) {
+        print(
+          {
+            id: detail.id,
+            name: detail.name,
+            addUntagged: detail.addUntagged,
+            autoLock: detail.autoLock,
+            addTags: detail.addTagNames,
+            coinCount: coins.length,
+            spentCount,
+            total: totalSats.toString(),
+            totalBtc: formatBtc(totalSats),
+            coins: coins.map(memberCoinJson),
+          },
+          cmd,
+        );
+        return;
+      }
+      console.log(`"${detail.name}" (${describeMemberCount(coins.length, spentCount)})`);
+      console.log(`  Rules: ${describeRules(detail)}`);
+      console.log(`  Total: ${formatBtc(totalSats)} (${formatSats(totalSats)})`);
+      printMemberCoinLines(coins);
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);
     }

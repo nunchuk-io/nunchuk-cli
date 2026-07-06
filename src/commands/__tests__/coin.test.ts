@@ -10,7 +10,9 @@ const {
   mockCreateTag,
   mockGetCoinCollectionNames,
   mockGetCoinTagNames,
+  mockGetCollectionDetail,
   mockGetLockedOutpoints,
+  mockGetTagDetail,
   mockListCoins,
   mockLoadWallet,
   mockReconcileNewCoins,
@@ -24,7 +26,9 @@ const {
   mockCreateTag: vi.fn(),
   mockGetCoinCollectionNames: vi.fn(() => new Map<string, string[]>()),
   mockGetCoinTagNames: vi.fn(() => new Map<string, string[]>()),
+  mockGetCollectionDetail: vi.fn(),
   mockGetLockedOutpoints: vi.fn(() => new Set<string>()),
+  mockGetTagDetail: vi.fn(),
   mockListCoins: vi.fn(),
   mockLoadWallet: vi.fn(),
   mockReconcileNewCoins: vi.fn(),
@@ -61,6 +65,7 @@ vi.mock("../../core/tag-store.js", () => ({
   createTag: mockCreateTag,
   deleteTag: vi.fn(),
   getCoinTagNames: mockGetCoinTagNames,
+  getTagDetail: mockGetTagDetail,
   listTags: vi.fn(() => []),
   removeCoinTag: vi.fn(),
   renameTag: vi.fn(),
@@ -72,6 +77,7 @@ vi.mock("../../core/collection-store.js", () => ({
   createCollection: mockCreateCollection,
   deleteCollection: vi.fn(),
   getCoinCollectionNames: mockGetCoinCollectionNames,
+  getCollectionDetail: mockGetCollectionDetail,
   listCollections: vi.fn(() => []),
   removeCoinFromCollection: vi.fn(),
   updateCollection: mockUpdateCollection,
@@ -581,5 +587,75 @@ describe("coin collection --apply-to-existing", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     await runCoin(["collection", "create", "quarantine", "--wallet", "jk74e3up"]);
     expect(mockApplyCollectionToExisting).not.toHaveBeenCalled();
+  });
+});
+
+describe("coin tag get / coin collection get", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    // Live wallet: only vout 0 is still unspent (10_000 sats).
+    mockListCoins.mockResolvedValue([
+      {
+        txid: TXID,
+        vout: 0,
+        address: "bc1qaddr",
+        amount: 10_000n,
+        height: 100,
+        confirmations: 5,
+        status: "CONFIRMED",
+        isChange: false,
+      },
+    ]);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("coin collection get shows rules, live amounts, a spendable total, and spent members", async () => {
+    mockGetCollectionDetail.mockReturnValue({
+      id: 1,
+      name: "quarantine",
+      addUntagged: true,
+      autoLock: true,
+      addTagNames: [],
+      coins: [
+        { txid: TXID, vout: 0, locked: true, tags: ["kyc"] },
+        { txid: TXID, vout: 9, locked: false, tags: [] }, // no longer unspent
+      ],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["collection", "get", "quarantine", "--wallet", "jk74e3up"]);
+    expect(mockGetCollectionDetail).toHaveBeenCalledWith(
+      "user@example.com",
+      "mainnet",
+      "jk74e3up",
+      "quarantine",
+    );
+    // The scan reconciles before the detail is read.
+    expect(mockReconcileNewCoins).toHaveBeenCalled();
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`"quarantine" (2 coins, 1 spent)`);
+    expect(out).toContain("Rules: add-untagged, auto-lock");
+    expect(out).toContain("Total: 0.00010000 BTC (10000 sat)"); // spendable member only
+    expect(out).toContain(`${TXID}:0 [locked]  0.00010000 BTC (10000 sat)  #kyc`);
+    expect(out).toContain(`${TXID}:9 [spent]`);
+  });
+
+  it("coin tag get shows member coins with the spendable total", async () => {
+    mockGetTagDetail.mockReturnValue({
+      id: 1,
+      name: "kyc",
+      coins: [{ txid: TXID, vout: 0, locked: false, tags: ["kyc", "cold"] }],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["tag", "get", "kyc", "--wallet", "jk74e3up"]);
+    expect(mockGetTagDetail).toHaveBeenCalledWith("user@example.com", "mainnet", "jk74e3up", "kyc");
+    const out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("#kyc (1 coin)");
+    expect(out).toContain("Total: 0.00010000 BTC (10000 sat)");
+    expect(out).toContain(`${TXID}:0  0.00010000 BTC (10000 sat)  #kyc #cold`);
   });
 });

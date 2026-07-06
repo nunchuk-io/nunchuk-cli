@@ -13,6 +13,7 @@ import type { CoinCollection, CoinControlDoc } from "./coin-store.js";
 import { ensureCoinEntry, loadCoinControl, mutateCoinControl, outpointKey } from "./coin-store.js";
 import { applyRulesToExistingCoins, joinCollection } from "./coin-rules.js";
 import { getTagByName } from "./tag-store.js";
+import type { TaggedCoinDetail } from "./tag-store.js";
 
 const MAX_COLLECTION_NAME_LENGTH = 64;
 
@@ -216,6 +217,50 @@ export function removeCoinFromCollection(
     }
     return collection;
   });
+}
+
+export interface CollectionDetail {
+  id: number;
+  name: string;
+  addUntagged: boolean;
+  autoLock: boolean;
+  addTagNames: string[];
+  coins: TaggedCoinDetail[];
+}
+
+// Local-only detail view: the collection's rules plus every member coin (lock
+// state + tags). Includes coins that have since been spent — the spendable
+// view is `coin list --collection`.
+export function getCollectionDetail(
+  email: string,
+  network: Network,
+  walletId: string,
+  rawName: string,
+): CollectionDetail {
+  const doc = loadCoinControl(email, network, walletId);
+  const collection = getCollectionByName(doc, rawName);
+  const tagNameById = new Map(doc.tags.map((t) => [t.id, t.name]));
+  const coins: TaggedCoinDetail[] = [];
+  for (const [key, entry] of Object.entries(doc.coins)) {
+    if (!entry.collections.includes(collection.id)) continue;
+    const sep = key.lastIndexOf(":");
+    coins.push({
+      txid: key.slice(0, sep),
+      vout: Number(key.slice(sep + 1)),
+      locked: entry.locked,
+      tags: entry.tags.map((id) => tagNameById.get(id)).filter((n): n is string => n !== undefined),
+    });
+  }
+  return {
+    id: collection.id,
+    name: collection.name,
+    addUntagged: collection.addUntagged,
+    autoLock: collection.autoLock,
+    addTagNames: collection.addTags
+      .map((id) => tagNameById.get(id))
+      .filter((n): n is string => n !== undefined),
+    coins,
+  };
 }
 
 // Resolves a collection and returns the outpoint keys of its member coins.
