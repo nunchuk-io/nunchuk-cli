@@ -366,6 +366,7 @@ nunchuk coin list --wallet <id> --status CONFIRMED
 nunchuk coin list --wallet <id> --tag kyc            # only coins carrying #kyc
 nunchuk coin list --wallet <id> --untagged           # only coins with no tags
 nunchuk coin list --wallet <id> --collection "Exchange A"
+nunchuk coin list --wallet <id> --locked             # only locked coins (--unlocked for the rest)
 nunchuk --json coin list --wallet <id>
 ```
 

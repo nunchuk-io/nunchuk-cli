@@ -259,6 +259,29 @@ describe("coin list locked column", () => {
     expect(out).toContain(`Received: ${formatDateTime(1_700_000_000)}`);
   });
 
+  it("filters with --locked and --unlocked", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runCoin(["list", "--wallet", "jk74e3up", "--locked"]);
+    let out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`${TXID}:1`);
+    expect(out).not.toContain(`${TXID}:0`);
+
+    logSpy.mockClear();
+    await runCoin(["list", "--wallet", "jk74e3up", "--unlocked"]);
+    out = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain(`${TXID}:0`);
+    expect(out).not.toContain(`${TXID}:1`);
+  });
+
+  it("rejects combining --locked with --unlocked", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runCoin(["list", "--wallet", "jk74e3up", "--locked", "--unlocked"]);
+    const err = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(err).toContain("--locked and --unlocked cannot be combined.");
+  });
+
   it("shows tags and filters with --tag and --untagged", async () => {
     mockGetCoinTagNames.mockReturnValue(new Map([[`${TXID}:0`, ["kyc"]]]));
 

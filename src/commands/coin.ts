@@ -187,12 +187,17 @@ coinCommand
   .option("--tag <name>", "Only coins carrying this tag (case-sensitive)")
   .option("--untagged", "Only coins with no tags")
   .option("--collection <name>", "Only coins in this collection (case-sensitive)")
+  .option("--locked", "Only locked coins")
+  .option("--unlocked", "Only unlocked coins")
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
       if (options.tag && options.untagged) {
         throw new Error("--tag and --untagged cannot be combined.");
+      }
+      if (options.locked && options.unlocked) {
+        throw new Error("--locked and --unlocked cannot be combined.");
       }
       const coins = await scanAndReconcileCoins(apiKey, network, email, wallet);
 
@@ -221,6 +226,11 @@ coinCommand
       }
       if (options.collection) {
         filtered = filtered.filter((c) => collectionsOf(c).includes(String(options.collection)));
+      }
+      if (options.locked) {
+        filtered = filtered.filter((c) => isLocked(c));
+      } else if (options.unlocked) {
+        filtered = filtered.filter((c) => !isLocked(c));
       }
 
       const globals = cmd.optsWithGlobals();

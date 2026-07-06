@@ -1037,6 +1037,8 @@ List a wallet's UTXOs (coins) with a derived status and their coin-control annot
 | `--tag <name>`         | No       | Only coins carrying this tag (case-sensitive)            |
 | `--untagged`           | No       | Only coins with no tags (cannot combine with `--tag`)    |
 | `--collection <name>`  | No       | Only coins in this collection (case-sensitive)           |
+| `--locked`             | No       | Only locked coins (cannot combine with `--unlocked`)     |
+| `--unlocked`           | No       | Only unlocked coins                                      |
 
 Status is derived per coin, not stored on-chain:
 
@@ -1051,6 +1053,7 @@ nunchuk coin list --wallet w123 --status CONFIRMED
 nunchuk coin list --wallet w123 --tag kyc
 nunchuk coin list --wallet w123 --untagged
 nunchuk coin list --wallet w123 --collection "Exchange A"
+nunchuk coin list --wallet w123 --locked
 nunchuk --json coin list --wallet w123
 ```
 
