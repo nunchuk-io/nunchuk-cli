@@ -294,6 +294,9 @@ nunchuk tx create --wallet <id> --to <address> --amount <sats> --fee-level prior
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --anti-fee-sniping      # pin nLockTime to the chain tip
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --subtract-fee          # recipient pays the fee
 nunchuk tx create --wallet <id> --to <address> --send-all                              # sweep the entire balance
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --coin <txid:vout> --coin <txid:vout>  # manual coin selection
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-tag kyc          # auto-select only from tagged coins
+nunchuk tx create --wallet <id> --to <address> --amount <sats> --change-tags none      # don't tag the change coin
 ```
 
 Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. When auto-estimating, the **level** is `--fee-level <economy|standard|priority>` (one-shot), else the account's saved default (`config fee-rate set`), else `economy`; `--fee-rate` overrides the level. Run [`tx fees`](#tx-fees) to see the current rates for each level. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
@@ -303,6 +306,12 @@ Fee rate is automatically estimated from the Nunchuk API, or set manually with `
 `--subtract-fee` takes the network fee out of the send amount instead of adding it on top, so the recipient receives `amount - fee` and the wallet's total spend stays at `amount`. The output shows the reduced `Recipient receives` value. The send fails if the amount cannot cover the fee or the recipient would drop below the dust threshold.
 
 `--send-all` sweeps the entire wallet balance to the recipient — it spends every coin, forces `--subtract-fee` on (recipient receives `balance - fee`), and leaves no change. Use it instead of `--amount` (exactly one is required); if both are given, `--amount` is ignored with a warning.
+
+`--coin <txid:vout>` (repeatable) selects coins manually: the transaction spends **exactly** the chosen coins — no subset optimization, no automatic top-up (a shortfall fails with insufficient funds). Explicitly chosen coins are spent even when locked. Combined with `--send-all`, only the chosen coins are swept. Cannot be combined with `--from-tag`.
+
+`--from-tag <name>` restricts automatic coin selection to coins carrying that tag (case-sensitive). Locked coins stay excluded within the filtered pool.
+
+`--change-tags <tags>` decides which tags the change coin inherits. By default the change coin inherits **all** tags carried by the input coins; pass `none` to inherit nothing, or a comma-separated subset of the input coins' tags (e.g. `--change-tags kyc,cold`). The choice is stored locally and applied when the change coin appears in a later scan or broadcast — see [`coin tag`](#coin) for how tags work.
 
 #### `tx fees`
 
@@ -341,17 +350,75 @@ nunchuk tx broadcast --wallet <id> --tx-id <txid>
 
 ### `coin`
 
-| Command     | Description                                          |
-| ----------- | --------------------------------------------------- |
-| `coin list` | List a wallet's UTXOs (coins) with their status      |
+| Command                  | Description                                                          |
+| ------------------------ | -------------------------------------------------------------------- |
+| `coin list`              | List a wallet's UTXOs (coins) with status, lock, tags, collections   |
+| `coin lock` / `unlock`   | Exclude a coin from (or return it to) automatic coin selection       |
+| `coin tag …`             | Manage tags: `create`, `list`, `get`, `rename`, `delete`, `add`, `remove`   |
+| `coin collection …`      | Manage collections: `create`, `update`, `list`, `get`, `delete`, `add`, `remove` |
+
+#### `coin list`
 
 ```bash
 nunchuk coin list --wallet <id>
 nunchuk coin list --wallet <id> --status CONFIRMED
+nunchuk coin list --wallet <id> --tag kyc            # only coins carrying #kyc
+nunchuk coin list --wallet <id> --untagged           # only coins with no tags
+nunchuk coin list --wallet <id> --collection "Exchange A"
 nunchuk --json coin list --wallet <id>
 ```
 
-Lists the wallet's unspent outputs from Electrum with a derived status (`CONFIRMED`, `INCOMING_PENDING_CONFIRMATION`, `OUTGOING_PENDING_SIGNATURES`, `OUTGOING_PENDING_BROADCAST`) — outgoing statuses come from pending PSBTs on the group server. Each coin shows its outpoint, address, amount, status, confirmations, and a change flag. Filter with `--status <status>`. Coin memo and lock annotations arrive in a later release.
+Lists the wallet's unspent outputs from Electrum with a derived status (`CONFIRMED`, `INCOMING_PENDING_CONFIRMATION`, `OUTGOING_PENDING_SIGNATURES`, `OUTGOING_PENDING_BROADCAST`) — outgoing statuses come from pending PSBTs on the group server. Each coin shows its outpoint, address, amount, status, confirmations, a change flag, a `[locked]` marker, and its tags and collections.
+
+#### `coin lock` / `coin unlock`
+
+```bash
+nunchuk coin lock --wallet <id> --coin <txid:vout>
+nunchuk coin unlock --wallet <id> --coin <txid:vout>
+```
+
+A locked coin is never used by automatic coin selection (including `--send-all`). Selecting it explicitly with `tx create --coin` still spends it — the lock guards against accidental use, not deliberate use. `--coin` is repeatable here (and on `coin tag add/remove`, `coin collection add/remove`) to act on several coins at once.
+
+#### `coin tag`
+
+```bash
+nunchuk coin tag create kyc --wallet <id>
+nunchuk coin tag list --wallet <id>
+nunchuk coin tag get kyc --wallet <id>              # member coins + spendable total
+nunchuk coin tag rename kyc --wallet <id> --name kyc-verified
+nunchuk coin tag delete kyc --wallet <id>
+nunchuk coin tag add kyc --wallet <id> --coin <txid:vout>
+nunchuk coin tag remove kyc --wallet <id> --coin <txid:vout>
+```
+
+Tags are reusable labels for classifying coins (for example by source: `kyc`, `exchange-a`, `payroll`), matching the mobile app's coin tags. Names are **case-sensitive** (`KYC` and `kyc` are different tags), contain no whitespace, and a leading `#` on input is accepted and stripped. Use them to scope spending (`tx create --from-tag`), filter listings (`coin list --tag`), and drive collection rules. `--coin` is repeatable to tag several coins in one command; list a tag's coins with `coin list --tag <name>`. Deleting a tag removes it from every coin.
+
+#### `coin collection`
+
+```bash
+nunchuk coin collection create "Exchange A" --wallet <id>
+nunchuk coin collection create quarantine --wallet <id> --add-untagged --auto-lock
+nunchuk coin collection create verified --wallet <id> --add-tag kyc --apply-to-existing
+nunchuk coin collection update quarantine --wallet <id> --no-auto-lock
+nunchuk coin collection list --wallet <id>
+nunchuk coin collection get quarantine --wallet <id>   # rules + member coins + spendable total
+nunchuk coin collection delete quarantine --wallet <id>
+nunchuk coin collection add "Exchange A" --wallet <id> --coin <txid:vout>
+nunchuk coin collection remove "Exchange A" --wallet <id> --coin <txid:vout>
+```
+
+Collections are named groups of coins with optional membership rules, matching the mobile app's collection settings. Names are case-sensitive and may contain spaces. Rules:
+
+- `--add-untagged` — new coins that arrive without tags join the collection automatically.
+- `--add-tag <tag>` (repeatable) — coins join when they receive one of these tags.
+- `--auto-lock` — coins are locked the moment they join (a quarantine posture: combined with `--add-untagged`, every unclassified inbound coin is locked until reviewed).
+- `--apply-to-existing` — one-shot: run the rules over currently known coins now.
+
+Rule semantics follow the app: membership applies on arrival and is never re-evaluated or auto-removed — removing a tag keeps the coin in the collection, deleting a collection keeps its locks. Rules are evaluated when the CLI next sees the wallet's coins (`coin list`, `tx create`, `tx draft`, `tx broadcast`); there is no background daemon.
+
+#### Change-coin tag inheritance
+
+When `tx create` produces change from tagged inputs, the change coin inherits the inputs' tags by default (`--change-tags` selects a subset or `none`). The choice is stored locally keyed by the change address and applied automatically when the change coin is next seen — regardless of whether the transaction was broadcast by the CLI, the app, or the backend. An inherited-tag change coin joins tag-rule collections but never `--add-untagged` collections.
 
 ### `config`
 
