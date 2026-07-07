@@ -1,12 +1,33 @@
 import { Command, InvalidArgumentError } from "commander";
 import { Transaction } from "@scure/btc-signer";
-import { requireApiKey, requireEmail, getNetwork, getElectrumServer } from "../core/config.js";
-import type { Network } from "../core/config.js";
+import {
+  requireApiKey,
+  requireEmail,
+  getNetwork,
+  getElectrumServer,
+  loadConfig,
+  getDefaultFeeLevel,
+  isFeeLevel,
+  DEFAULT_FEE_LEVEL,
+  FEE_LEVELS,
+} from "../core/config.js";
+import type { FeeLevel, Network } from "../core/config.js";
+import { estimateFeeRateLevels } from "../core/fees.js";
 import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/electrum.js";
 import { deriveDescriptorAddresses } from "../core/address.js";
 import { loadWallet, removeMusigNonce } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
+import { getLockedOutpoints } from "../core/coin-store.js";
+import { reconcileNewCoins } from "../core/coin-rules.js";
+import { getOutpointsByCollection } from "../core/collection-store.js";
+import { getOutpointsByTag } from "../core/tag-store.js";
+import {
+  getPendingIntentAddresses,
+  planChangeTags,
+  storeChangeTagIntent,
+} from "../core/change-intents.js";
+import type { ChangeTagPlan } from "../core/change-intents.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
@@ -43,7 +64,14 @@ import {
   getOutputAddress,
   statusFromHeight,
 } from "../core/format.js";
-import { convertAmountInputToSats, fetchMarketRates, normalizeCurrency } from "../core/currency.js";
+import {
+  convertAmount,
+  convertAmountInputToSats,
+  fetchMarketRates,
+  formatAmount,
+  normalizeCurrency,
+  type MarketRates,
+} from "../core/currency.js";
 import { print, printError } from "../output.js";
 
 function parseMiniscriptPathOption(value: string): number {
@@ -52,6 +80,107 @@ function parseMiniscriptPathOption(value: string): number {
     throw new InvalidArgumentError("--miniscript-path must be a non-negative integer");
   }
   return parsed;
+}
+
+// Parse --fee-rate as a decimal sat/vB and convert to integer sat/kvB (CFeeRate
+// unit), rounding to the nearest sat/kvB. So 1.5 sat/vB → 1500, 12 → 12000.
+function parseFeeRateOption(value: string): bigint {
+  const satPerVb = Number(value);
+  if (!Number.isFinite(satPerVb) || satPerVb <= 0) {
+    throw new InvalidArgumentError("--fee-rate must be a positive number in sat/vB (e.g. 1.5)");
+  }
+  const satPerKvB = BigInt(Math.round(satPerVb * 1000));
+  if (satPerKvB <= 0n) {
+    throw new InvalidArgumentError("--fee-rate is too small (rounds to 0)");
+  }
+  return satPerKvB;
+}
+
+// Render a sat/kvB rate as sat/vB for display, trimming trailing zeros
+// (1500 → "1.5", 12000 → "12", 1235 → "1.235").
+function formatFeeRateSatPerVb(satPerKvB: bigint): string {
+  const whole = satPerKvB / 1000n;
+  const frac = (satPerKvB % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
+  return frac.length > 0 ? `${whole}.${frac}` : whole.toString();
+}
+
+function parseFeeLevelOption(value: string): FeeLevel {
+  if (!isFeeLevel(value)) {
+    throw new InvalidArgumentError(`--fee-level must be one of: ${FEE_LEVELS.join(", ")}`);
+  }
+  return value;
+}
+
+// Parse a repeatable --coin <txid:vout> into a preset outpoint list.
+function parseCoinOption(
+  value: string,
+  previous: Array<{ txid: string; vout: number }>,
+): Array<{ txid: string; vout: number }> {
+  const match = /^([0-9a-fA-F]{64}):(\d+)$/.exec(value);
+  if (!match) {
+    throw new InvalidArgumentError(
+      "--coin must be <txid>:<vout> (64-character hex transaction ID, then the output index)",
+    );
+  }
+  return [...previous, { txid: match[1].toLowerCase(), vout: Number(match[2]) }];
+}
+
+// Resolve the recipient amount for `tx create` / `tx draft`. With --send-all the
+// engine sweeps the whole balance, so no amount is needed (and any --amount is
+// ignored with a warning). Otherwise exactly one --amount is required, converted
+// from its --currency to sats.
+async function resolveSendAmount(
+  options: { amount?: string; currency?: string },
+  sendAll: boolean,
+): Promise<bigint> {
+  if (sendAll) {
+    if (options.amount != null) {
+      console.error("Warning: --amount is ignored when --send-all is set.");
+    }
+    return 0n; // ignored by createTransaction when sendAll is true
+  }
+  if (options.amount == null) {
+    throw new Error("Provide --amount, or use --send-all to send the entire balance.");
+  }
+  const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
+  const rates = currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
+  const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
+  if (sendAmount <= 0n) {
+    throw new Error("Amount must convert to at least 1 sat");
+  }
+  return sendAmount;
+}
+
+// Resolve the change coin's inherited tags for a built transaction. Returns
+// undefined when there is no change output (with a warning if tags were
+// explicitly requested).
+function resolveChangeTagPlan(
+  email: string,
+  network: Network,
+  walletId: string,
+  result: {
+    changeAddress: string | null;
+    changeAmount: bigint;
+    selectedInputs: Array<{ txid: string; vout: number }>;
+  },
+  requested?: string,
+): ChangeTagPlan | undefined {
+  if (!result.changeAddress || result.changeAmount <= 0n) {
+    if (requested && requested.trim() !== "none") {
+      console.error(
+        "Warning: --change-tags is ignored because the transaction has no change output.",
+      );
+    }
+    return undefined;
+  }
+  return planChangeTags(email, network, walletId, result.selectedInputs, requested);
+}
+
+function printChangeTagPlan(plan: ChangeTagPlan | undefined, requested?: string): void {
+  if (!plan || (plan.tagNames.length === 0 && !requested)) return;
+  console.log(
+    `  Change tags: ${plan.tagNames.length > 0 ? plan.tagNames.map((n) => `#${n}`).join(" ") : "none"}`,
+  );
 }
 
 function parsePreimageOption(value: string, previous: string[]): string[] {
@@ -331,7 +460,11 @@ txCommand
   .description("Create a new transaction")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
   .requiredOption("--to <address>", "Recipient address")
-  .requiredOption("--amount <value>", "Amount to send")
+  .option("--amount <value>", "Amount to send (required unless --send-all)")
+  .option(
+    "--send-all",
+    "Send the entire wallet balance (the fee is subtracted from the amount; overrides --amount)",
+  )
   .option(
     "--currency <code>",
     "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
@@ -351,6 +484,42 @@ txCommand
     "--taproot-script-path",
     "Spend a taproot wallet through its script path; key path is the default when available",
   )
+  .option(
+    "--fee-rate <sat/vB>",
+    "Manual fee rate in sat/vB (default: auto-estimate)",
+    parseFeeRateOption,
+  )
+  .option(
+    "--fee-level <level>",
+    `Fee level for auto-estimate: ${FEE_LEVELS.join(", ")} (overrides saved default; ignored with --fee-rate)`,
+    parseFeeLevelOption,
+  )
+  .option(
+    "--anti-fee-sniping",
+    "Pin nLockTime to the current block height (a spending path's own locktime takes precedence)",
+  )
+  .option(
+    "--subtract-fee",
+    "Subtract the network fee from the amount so the recipient receives amount minus fee",
+  )
+  .option(
+    "--coin <txid:vout>",
+    "Spend exactly this coin; repeat to select multiple (manual coin selection)",
+    parseCoinOption,
+    [] as Array<{ txid: string; vout: number }>,
+  )
+  .option(
+    "--from-tag <name>",
+    "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
+  )
+  .option(
+    "--from-collection <name>",
+    "Restrict automatic coin selection to coins in this collection (case-sensitive; combined with --from-tag both must match)",
+  )
+  .option(
+    "--change-tags <tags>",
+    'Tags for the change coin: a comma-separated subset of the input coins\' tags, or "none" (default: inherit all input tags)',
+  )
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -363,26 +532,81 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        const currency = options.currency ? normalizeCurrency(options.currency) : "sat";
-        const rates =
-          currency === "sat" || currency === "BTC" ? undefined : await fetchMarketRates();
-        const sendAmount = convertAmountInputToSats(options.amount, currency, rates);
-        if (sendAmount <= 0n) {
-          throw new Error("Amount must convert to at least 1 sat");
-        }
+        const sendAll = Boolean(options.sendAll);
+        const sendAmount = await resolveSendAmount(options, sendAll);
+        // Effective fee level for the auto-estimate: one-shot --fee-level wins,
+        // else the account's saved default, else the built-in default (economy).
+        const feeLevel =
+          options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
+
+        // Resolve the pool filters eagerly so an unknown name fails before the
+        // scan; the reconcile hook re-resolves the outpoints afterwards so a
+        // coin classified by this very scan's rules is already in the pool.
+        const fromTag = options.fromTag
+          ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
+          : undefined;
+        const fromCollection = options.fromCollection
+          ? getOutpointsByCollection(email, network, wallet.walletId, options.fromCollection)
+          : undefined;
+
         const result = await createTransaction({
           wallet,
           network,
           electrum,
           toAddress: options.to,
           amount: sendAmount,
+          sendAll,
           miniscriptPath: options.miniscriptPath,
           taprootScriptPath: options.taprootScriptPath,
           preimages: options.preimage,
-          // Fee rate always estimated from Nunchuk API (with Electrum fallback)
+          // Manual fee rate (sat/kvB) when --fee-rate is given; else auto-estimate.
+          feeRateSatPerKvB: options.feeRate,
+          feeLevel,
+          antiFeeSniping: Boolean(options.antiFeeSniping),
+          subtractFeeFromAmount: Boolean(options.subtractFee),
+          presetCoins: options.coin,
+          // Reconcile coin-control state against the scan (change-tag intents
+          // and collection rules can tag, collect, or lock a coin the moment it
+          // is first seen), then hand back the fresh locked and filter sets.
+          reconcileScan: (scanned) => {
+            reconcileNewCoins(email, network, wallet.walletId, scanned);
+            return {
+              lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+              fromTagOutpoints: fromTag
+                ? getOutpointsByTag(email, network, wallet.walletId, fromTag.name).outpoints
+                : undefined,
+              fromCollectionOutpoints: fromCollection
+                ? getOutpointsByCollection(email, network, wallet.walletId, fromCollection.name)
+                    .outpoints
+                : undefined,
+            };
+          },
+          fromTag,
+          fromCollection,
         });
+        // Under send-all there is no requested amount; the gross amount sent is
+        // the swept balance (recipient + fee). recipientAmount + fee also equals
+        // the requested amount in the normal subtract case, so this is uniform.
+        const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
+        const manualSelection = options.coin.length > 0;
+
+        // Validate the change-tag choice before uploading anything.
+        const changeTagPlan = resolveChangeTagPlan(
+          email,
+          network,
+          wallet.walletId,
+          result,
+          options.changeTags,
+        );
 
         await uploadTransaction(client, wallet, result.psbtB64, result.txId);
+        if (changeTagPlan && changeTagPlan.tagIds.length > 0 && result.changeAddress) {
+          storeChangeTagIntent(email, network, wallet.walletId, {
+            address: result.changeAddress,
+            amountSats: result.changeAmount,
+            tagIds: changeTagPlan.tagIds,
+          });
+        }
         const detail = await decodePsbtDetailWithTimelockMetadata(
           result.psbtB64,
           network,
@@ -395,10 +619,26 @@ txCommand
           print(
             {
               txId: result.txId,
-              feeRate: result.feePerByte.toString(),
+              feeRate: formatFeeRateSatPerVb(result.feeRateSatPerKvB),
+              feeRateSatPerKvB: result.feeRateSatPerKvB.toString(),
+              feeRateManual: Boolean(options.feeRate),
+              feeLevel: result.feeLevel ?? null,
+              antiFeeSniping: Boolean(options.antiFeeSniping),
+              lockTime: result.lockTime,
+              sendAll,
+              coinSelection: manualSelection ? "manual" : "auto",
+              inputs: result.selectedInputs.map((i) => ({
+                txid: i.txid,
+                vout: i.vout,
+                amount: i.value.toString(),
+              })),
+              subtractFee: result.subtractFee,
+              amount: grossAmount.toString(),
+              recipientAmount: result.recipientAmount.toString(),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
+              changeTags: changeTagPlan?.tagNames ?? [],
               miniscriptPath: result.miniscriptPath ?? detail?.miniscriptPath,
               miniscriptPaths: detail?.miniscriptPaths,
               timelockedUntil: detail?.timelockedUntil,
@@ -410,12 +650,37 @@ txCommand
 
         console.log("Transaction created and uploaded to group server.");
         console.log(`  Transaction ID: ${result.txId}`);
-        console.log(`  Fee rate: ${result.feePerByte} sat/vB`);
+        console.log(
+          `  Fee rate: ${formatFeeRateSatPerVb(result.feeRateSatPerKvB)} sat/vB${
+            options.feeRate ? " (manual)" : result.feeLevel ? ` (${result.feeLevel})` : ""
+          }`,
+        );
         console.log(`  Fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})`);
         console.log(`  Recipient: ${options.to}`);
-        console.log(`  Amount: ${formatBtc(sendAmount)} (${formatSats(sendAmount)})`);
+        console.log(
+          `  Amount: ${formatBtc(grossAmount)} (${formatSats(grossAmount)})${
+            sendAll ? " (send all)" : ""
+          }`,
+        );
+        if (result.subtractFee) {
+          console.log(
+            `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
+              result.recipientAmount,
+            )})`,
+          );
+        }
         if (result.changeAddress) {
           console.log(`  Change: ${result.changeAddress}`);
+        }
+        printChangeTagPlan(changeTagPlan, options.changeTags);
+        if (manualSelection) {
+          console.log(`  Coins: ${result.selectedInputs.length} selected manually`);
+          for (const i of result.selectedInputs) {
+            console.log(`    ${i.txid}:${i.vout} (${formatSats(i.value)})`);
+          }
+        }
+        if (options.antiFeeSniping) {
+          console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
         }
         const selectedMiniscriptPath = result.miniscriptPath ?? detail?.miniscriptPath;
         printMiniscriptPathSummary(selectedMiniscriptPath);
@@ -424,6 +689,312 @@ txCommand
         console.log(
           `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId}`,
         );
+      } finally {
+        electrum.close();
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+// tx draft — Build the same PSBT as `tx create` and show the confirm screen,
+// without uploading anything. Mirrors libnunchuk DraftTransaction.
+txCommand
+  .command("draft")
+  .description("Preview a transaction (fee, total, change, input coins) without creating it")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--to <address>", "Recipient address")
+  .option("--amount <value>", "Amount to send (required unless --send-all)")
+  .option(
+    "--send-all",
+    "Send the entire wallet balance (the fee is subtracted from the amount; overrides --amount)",
+  )
+  .option(
+    "--currency <code>",
+    "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
+  )
+  .option(
+    "--preimage <hex>",
+    "Attach a 32-byte miniscript hash preimage (repeat or comma-separate)",
+    parsePreimageOption,
+    [],
+  )
+  .option(
+    "--miniscript-path <index>",
+    "Select a miniscript signing path by index",
+    parseMiniscriptPathOption,
+  )
+  .option(
+    "--taproot-script-path",
+    "Spend a taproot wallet through its script path; key path is the default when available",
+  )
+  .option(
+    "--fee-rate <sat/vB>",
+    "Manual fee rate in sat/vB (default: auto-estimate)",
+    parseFeeRateOption,
+  )
+  .option(
+    "--fee-level <level>",
+    `Fee level for auto-estimate: ${FEE_LEVELS.join(", ")} (overrides saved default; ignored with --fee-rate)`,
+    parseFeeLevelOption,
+  )
+  .option(
+    "--anti-fee-sniping",
+    "Pin nLockTime to the current block height (a spending path's own locktime takes precedence)",
+  )
+  .option(
+    "--subtract-fee",
+    "Subtract the network fee from the amount so the recipient receives amount minus fee",
+  )
+  .option(
+    "--coin <txid:vout>",
+    "Spend exactly this coin; repeat to select multiple (manual coin selection)",
+    parseCoinOption,
+    [] as Array<{ txid: string; vout: number }>,
+  )
+  .option(
+    "--from-tag <name>",
+    "Restrict automatic coin selection to coins carrying this tag (case-sensitive)",
+  )
+  .option(
+    "--from-collection <name>",
+    "Restrict automatic coin selection to coins in this collection (case-sensitive; combined with --from-tag both must match)",
+  )
+  .option(
+    "--change-tags <tags>",
+    'Tags for the change coin: a comma-separated subset of the input coins\' tags, or "none" (default: inherit all input tags)',
+  )
+  .option("--fiat <code>", "Show fiat values alongside BTC (e.g. --fiat USD)")
+  .action(async (options, cmd) => {
+    try {
+      const { network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const server = getElectrumServer(network);
+      const electrum = new ElectrumClient();
+      try {
+        await electrum.connect(server.host, server.port, server.protocol);
+        await electrum.serverVersion("nunchuk-cli", "1.4");
+
+        const sendAll = Boolean(options.sendAll);
+        const sendAmount = await resolveSendAmount(options, sendAll);
+
+        const feeLevel =
+          options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
+
+        // Resolve the pool filters eagerly so an unknown name fails before the
+        // scan; the reconcile hook re-resolves the outpoints afterwards so a
+        // coin classified by this very scan's rules is already in the pool.
+        const fromTag = options.fromTag
+          ? getOutpointsByTag(email, network, wallet.walletId, options.fromTag)
+          : undefined;
+        const fromCollection = options.fromCollection
+          ? getOutpointsByCollection(email, network, wallet.walletId, options.fromCollection)
+          : undefined;
+
+        // Build the transaction exactly as `tx create` would — but never upload.
+        const result = await createTransaction({
+          wallet,
+          network,
+          electrum,
+          toAddress: options.to,
+          amount: sendAmount,
+          sendAll,
+          miniscriptPath: options.miniscriptPath,
+          taprootScriptPath: options.taprootScriptPath,
+          preimages: options.preimage,
+          feeRateSatPerKvB: options.feeRate,
+          feeLevel,
+          antiFeeSniping: Boolean(options.antiFeeSniping),
+          subtractFeeFromAmount: Boolean(options.subtractFee),
+          presetCoins: options.coin,
+          // Reconcile coin-control state against the scan (change-tag intents
+          // and collection rules can tag, collect, or lock a coin the moment it
+          // is first seen), then hand back the fresh locked and filter sets.
+          reconcileScan: (scanned) => {
+            reconcileNewCoins(email, network, wallet.walletId, scanned);
+            return {
+              lockedOutpoints: getLockedOutpoints(email, network, wallet.walletId),
+              fromTagOutpoints: fromTag
+                ? getOutpointsByTag(email, network, wallet.walletId, fromTag.name).outpoints
+                : undefined,
+              fromCollectionOutpoints: fromCollection
+                ? getOutpointsByCollection(email, network, wallet.walletId, fromCollection.name)
+                    .outpoints
+                : undefined,
+            };
+          },
+          fromTag,
+          fromCollection,
+        });
+        // Under send-all the gross amount sent is the swept balance (recipient +
+        // fee); otherwise it is the requested amount.
+        const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
+        const manualSelection = options.coin.length > 0;
+
+        // Preview the change coin's inherited tags; nothing is stored on draft.
+        const changeTagPlan = resolveChangeTagPlan(
+          email,
+          network,
+          wallet.walletId,
+          result,
+          options.changeTags,
+        );
+
+        // Join selected inputs with their block date + confirmations.
+        const inputMeta = await fetchPsbtInputTimelockMetadata(result.psbtB64, electrum, network);
+        let tipHeight = 0;
+        try {
+          tipHeight = (await electrum.headersSubscribe()).height;
+        } catch {
+          // tip unavailable → confirmations stay 0
+        }
+        const metaByOutpoint = new Map(inputMeta.map((m) => [`${m.txHash}:${m.txPos}`, m]));
+        const inputs = result.selectedInputs.map((i) => {
+          const m = metaByOutpoint.get(`${i.txid}:${i.vout}`);
+          const height = m?.height ?? 0;
+          return {
+            txid: i.txid,
+            vout: i.vout,
+            value: i.value,
+            height,
+            confirmations: height > 0 ? Math.max(0, tipHeight - height + 1) : 0,
+            blocktime: m?.blocktime ?? 0,
+          };
+        });
+
+        // Total spend on the payment side: recipient + fee (= amount + fee, or
+        // just `amount` under --subtract-fee since the fee comes out of it).
+        const total = result.recipientAmount + result.fee;
+
+        // Optional fiat display.
+        let fiatCode: string | null = null;
+        let fiatRates: MarketRates | undefined;
+        if (options.fiat) {
+          const code = normalizeCurrency(options.fiat);
+          if (code !== "sat" && code !== "BTC") {
+            fiatCode = code;
+            try {
+              fiatRates = await fetchMarketRates();
+            } catch {
+              fiatRates = undefined;
+            }
+          }
+        }
+        const fiat = (sats: bigint): string => {
+          if (!fiatCode || !fiatRates) return "";
+          const v = convertAmount(Number(sats), "sat", fiatCode, fiatRates).converted;
+          return ` ~ ${formatAmount(v, fiatCode)} ${fiatCode}`;
+        };
+        const fiatValue = (sats: bigint): string | undefined => {
+          if (!fiatCode || !fiatRates) return undefined;
+          return formatAmount(
+            convertAmount(Number(sats), "sat", fiatCode, fiatRates).converted,
+            fiatCode,
+          );
+        };
+
+        const globals = cmd.optsWithGlobals();
+        if (globals.json) {
+          print(
+            {
+              recipient: options.to,
+              sendAll,
+              amount: grossAmount.toString(),
+              amountBtc: formatBtc(grossAmount),
+              recipientAmount: result.recipientAmount.toString(),
+              fee: result.fee.toString(),
+              feeBtc: formatBtc(result.fee),
+              feeRate: formatFeeRateSatPerVb(result.feeRateSatPerKvB),
+              feeRateSatPerKvB: result.feeRateSatPerKvB.toString(),
+              feeRateManual: Boolean(options.feeRate),
+              feeLevel: result.feeLevel ?? null,
+              total: total.toString(),
+              totalBtc: formatBtc(total),
+              changeAddress: result.changeAddress,
+              changeAmount: result.changeAmount.toString(),
+              changeAmountBtc: formatBtc(result.changeAmount),
+              changeTags: changeTagPlan?.tagNames ?? [],
+              subtractFee: result.subtractFee,
+              antiFeeSniping: Boolean(options.antiFeeSniping),
+              lockTime: result.lockTime,
+              coinSelection: manualSelection ? "manual" : "auto",
+              inputs: inputs.map((i) => ({
+                txid: i.txid,
+                vout: i.vout,
+                amount: i.value.toString(),
+                amountBtc: formatBtc(i.value),
+                height: i.height,
+                confirmations: i.confirmations,
+                blocktime: i.blocktime,
+              })),
+              miniscriptPath: result.miniscriptPath,
+              fiat:
+                fiatCode && fiatRates
+                  ? {
+                      code: fiatCode,
+                      amount: fiatValue(grossAmount),
+                      fee: fiatValue(result.fee),
+                      total: fiatValue(total),
+                      change: fiatValue(result.changeAmount),
+                    }
+                  : null,
+            },
+            cmd,
+          );
+          return;
+        }
+
+        console.log("Draft transaction (not created)");
+        console.log(`  Recipient: ${options.to}`);
+        console.log(
+          `  Amount: ${formatBtc(grossAmount)} (${formatSats(grossAmount)})${fiat(grossAmount)}${
+            sendAll ? " (send all)" : ""
+          }`,
+        );
+        if (result.subtractFee) {
+          console.log(
+            `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
+              result.recipientAmount,
+            )})${fiat(result.recipientAmount)}`,
+          );
+        }
+        console.log(
+          `  Fee rate: ${formatFeeRateSatPerVb(result.feeRateSatPerKvB)} sat/vB${
+            options.feeRate ? " (manual)" : result.feeLevel ? ` (${result.feeLevel})` : ""
+          }`,
+        );
+        console.log(
+          `  Estimated fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})${fiat(result.fee)}`,
+        );
+        console.log(`  Total amount: ${formatBtc(total)} (${formatSats(total)})${fiat(total)}`);
+        if (result.changeAddress) {
+          console.log(
+            `  Change: ${result.changeAddress} - ${formatBtc(result.changeAmount)} (${formatSats(
+              result.changeAmount,
+            )})${fiat(result.changeAmount)}`,
+          );
+        }
+        printChangeTagPlan(changeTagPlan, options.changeTags);
+        if (options.antiFeeSniping) {
+          console.log(`  Anti-fee sniping: locktime ${result.lockTime}`);
+        }
+        console.log(`  Input coins${manualSelection ? " (selected manually)" : ""}:`);
+        inputs.forEach((i) => {
+          const date = i.blocktime > 0 ? formatDate(i.blocktime) : "unconfirmed";
+          console.log(
+            `    ${i.txid}:${i.vout}  ${formatBtc(i.value)} (${formatSats(i.value)})${fiat(
+              i.value,
+            )}  ${date} (${i.confirmations} confs)`,
+          );
+        });
+        if (options.fiat && fiatCode && !fiatRates) {
+          console.log("  (fiat values unavailable: market rate fetch failed)");
+        }
+        if (!options.feeRate) {
+          console.log(
+            "  Note: fee is auto-estimated and may change; pass --fee-rate <sat/vB> to lock it.",
+          );
+        }
       } finally {
         electrum.close();
       }
@@ -691,6 +1262,37 @@ txCommand
         await deleteTransaction(client, wallet, options.txId);
       } catch {
         // Non-fatal: tx is already broadcast even if server delete fails
+      }
+
+      // Immediate change-tag reconciliation: the change output is known now,
+      // so apply its pending intent without waiting for the next scan. An
+      // optimization only — scans reconcile app/backend broadcasts the same way.
+      try {
+        const intentAddresses = getPendingIntentAddresses(email, network, wallet.walletId);
+        if (intentAddresses.size > 0) {
+          const changeOutputs: Array<{
+            txid: string;
+            vout: number;
+            address: string;
+            amountSats: bigint;
+          }> = [];
+          for (let i = 0; i < tx.outputsLength; i++) {
+            const output = tx.getOutput(i);
+            if (!output.script) continue;
+            const address = getOutputAddress(output.script, network);
+            if (address && intentAddresses.has(address)) {
+              changeOutputs.push({
+                txid: broadcastTxId,
+                vout: i,
+                address,
+                amountSats: output.amount ?? 0n,
+              });
+            }
+          }
+          reconcileNewCoins(email, network, wallet.walletId, changeOutputs);
+        }
+      } catch {
+        // Non-fatal: the next scan reconciles.
       }
 
       const globals = cmd.optsWithGlobals();
@@ -1109,6 +1711,59 @@ txCommand
 
         console.error(`Transaction ${options.txId} not found.`);
         process.exit(1);
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+txCommand
+  .command("fees")
+  .description("Show current recommended fee rates (priority / standard / economy)")
+  .action(async (_options, cmd) => {
+    try {
+      const globals = cmd.optsWithGlobals();
+      const network = getNetwork(globals.network);
+      const email = requireEmail(globals.network);
+
+      const server = getElectrumServer(network);
+      const electrum = new ElectrumClient();
+      try {
+        await electrum.connect(server.host, server.port, server.protocol);
+        await electrum.serverVersion("nunchuk-cli", "1.4");
+
+        const levels = await estimateFeeRateLevels(network, electrum);
+        const defaultLevel = getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
+
+        if (globals.json) {
+          print(
+            {
+              priority: formatFeeRateSatPerVb(levels.priority),
+              standard: formatFeeRateSatPerVb(levels.standard),
+              economy: formatFeeRateSatPerVb(levels.economy),
+              prioritySatPerKvB: levels.priority.toString(),
+              standardSatPerKvB: levels.standard.toString(),
+              economySatPerKvB: levels.economy.toString(),
+              defaultFeeLevel: defaultLevel,
+            },
+            cmd,
+          );
+          return;
+        }
+
+        console.log("Recommended fee rates:");
+        const rows: [FeeLevel, bigint][] = [
+          ["priority", levels.priority],
+          ["standard", levels.standard],
+          ["economy", levels.economy],
+        ];
+        for (const [level, rate] of rows) {
+          const label = level.charAt(0).toUpperCase() + level.slice(1);
+          const marker = level === defaultLevel ? "  (default)" : "";
+          console.log(`  ${label.padEnd(9)}${formatFeeRateSatPerVb(rate)} sat/vB${marker}`);
+        }
+      } finally {
+        electrum.close();
       }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);

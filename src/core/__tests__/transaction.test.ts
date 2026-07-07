@@ -15,6 +15,7 @@ import { finalizeMiniscriptPsbt } from "../miniscript-finalize.js";
 import { signWalletPsbtWithKey } from "../psbt-sign.js";
 import { encryptWalletPayload } from "../wallet-keys.js";
 import {
+  availableCandidates,
   classifyWalletOutput,
   combinePendingPsbt,
   createWalletOutputClassifier,
@@ -25,6 +26,8 @@ import {
   fetchPendingTxInputTimelockMetadataBatch,
   fetchPsbtInputTimelockMetadata,
 } from "../transaction.js";
+import { CFeeRate, makeCOutput, type COutput } from "../coin-selection.js";
+import { SeededRng } from "../coin-selection-params.js";
 import { createDummyPsbt } from "../platform-key.js";
 import {
   buildWalletDescriptor,
@@ -411,6 +414,27 @@ function removeInputWitnessUtxo(psbtB64: string): string {
   return Buffer.from(tx.toPSBT()).toString("base64");
 }
 
+// Locate the wallet's change output regardless of its (randomized) position:
+// only the change output carries wallet derivation metadata — recipient outputs
+// are added via addOutputAddress with no bip32/taproot metadata.
+function findChangeOutputIndex(tx: Transaction): number {
+  for (let i = 0; i < tx.outputsLength; i++) {
+    const out = tx.getOutput(i);
+    if (
+      out.tapInternalKey ||
+      (out.bip32Derivation?.length ?? 0) > 0 ||
+      (out.tapBip32Derivation?.length ?? 0) > 0
+    ) {
+      return i;
+    }
+  }
+  throw new Error("No wallet change output found");
+}
+
+function findChangeOutput(tx: Transaction) {
+  return tx.getOutput(findChangeOutputIndex(tx));
+}
+
 function createMiniscriptElectrumMock(
   descriptor: string,
   fundingAmount: bigint,
@@ -458,6 +482,1423 @@ function createMiniscriptElectrumMock(
     } as unknown as ElectrumClient,
   };
 }
+
+// Funds the wallet's first receive address with several independent UTXOs so
+// coin selection actually has a set to choose from. Amounts must be distinct
+// (createFundingHex derives the txid from the output, so equal amounts collide).
+function createMultiUtxoElectrumMock(
+  descriptor: string,
+  amounts: bigint[],
+  height = 200,
+  blocktime = 1_700_000_000,
+): { electrum: ElectrumClient; txids: string[] } {
+  const receiveAddress = deriveDescriptorAddresses(descriptor, "testnet", 0, 0, 1)[0];
+  const scripthash = addressToScripthash(receiveAddress, "testnet");
+  const funding = amounts.map((amount) => createFundingHex(receiveAddress, amount));
+  const hexByTxid = new Map(funding.map((f) => [f.txid, f.rawHex]));
+  const utxos = funding.map((f, i) => ({
+    tx_hash: f.txid,
+    tx_pos: 0,
+    height,
+    value: Number(amounts[i]),
+  }));
+  const getTransaction = vi.fn(async (hash: string) => {
+    const rawHex = hexByTxid.get(hash);
+    if (!rawHex) throw new Error("unknown tx");
+    return rawHex;
+  });
+  const listUnspent = vi.fn(async (hash: string) => (hash === scripthash ? utxos : []));
+  const getHistory = vi.fn(async (hash: string) =>
+    hash === scripthash ? utxos.map((u) => ({ tx_hash: u.tx_hash, height })) : [],
+  );
+  const getBlockHeader = vi.fn(async (requestedHeight: number) => {
+    if (requestedHeight !== height) throw new Error("unknown block");
+    return createBlockHeaderHex(blocktime);
+  });
+
+  return {
+    txids: funding.map((f) => f.txid),
+    electrum: {
+      estimateFee: vi.fn(async () => 0.00001),
+      getTransaction,
+      getTransactionBatch: vi.fn(async (hashes: string[]) =>
+        Promise.all(hashes.map(getTransaction)),
+      ),
+      listUnspent,
+      listUnspentBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(listUnspent))),
+      getHistory,
+      getHistoryBatch: vi.fn(async (hashes: string[]) => Promise.all(hashes.map(getHistory))),
+      getBlockHeader,
+      getBlockHeaderBatch: vi.fn(async (heights: number[]) =>
+        Promise.all(heights.map(getBlockHeader)),
+      ),
+    } as unknown as ElectrumClient,
+  };
+}
+
+describe("availableCandidates (remain_target oldest-first cap)", () => {
+  const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
+
+  // feerate 0 → fee 0 → effectiveValue == value, so cap math is exact and obvious.
+  function coinAt(height: number, value: bigint): COutput {
+    return makeCOutput(
+      {
+        txid: "00".repeat(32),
+        vout: 0,
+        value,
+        inputVBytes: 68,
+        height,
+        blocktime: 0,
+        isChange: false,
+      },
+      {
+        effectiveFeerate: new CFeeRate(0n),
+        longTermFeerate: new CFeeRate(0n),
+        currentHeight: 1_000_000,
+      },
+    );
+  }
+
+  const coins = [
+    coinAt(300, 30_000n),
+    coinAt(100, 25_000n),
+    coinAt(-1, 99_000n), // unconfirmed
+    coinAt(200, 20_000n),
+  ];
+
+  it("returns every coin, oldest-confirmed-first, for a normal RBF spend", () => {
+    const result = availableCandidates(coins, MAX_BIP125_RBF_SEQUENCE, 10_000n, false);
+    expect(result.map((c) => c.coin.height)).toEqual([100, 200, 300, -1]);
+  });
+
+  it("does not cap when sequence is 0 (no relative timelock)", () => {
+    const result = availableCandidates(coins, 0, 10_000n, false);
+    expect(result).toHaveLength(coins.length);
+  });
+
+  it("caps a CSV spend to the oldest coins covering the target", () => {
+    // target 40k: oldest-first 25k (h100) + 20k (h200) = 45k >= 40k → stop.
+    const result = availableCandidates(coins, 6, 40_000n, false);
+    expect(result.map((c) => c.coin.height)).toEqual([100, 200]);
+  });
+
+  it("keeps adding oldest coins until the target is met, unconfirmed last", () => {
+    // target 80k: 25k + 20k + 30k = 75k (< 80k) then unconfirmed 99k crosses it.
+    const result = availableCandidates(coins, 6, 80_000n, false);
+    expect(result.map((c) => c.coin.height)).toEqual([100, 200, 300, -1]);
+  });
+});
+
+describe("createTransaction coin selection (multi-UTXO end-to-end)", () => {
+  // Sum of every input's value and every output's value, read off the PSBT.
+  function sumInOut(tx: Transaction): { totalIn: bigint; totalOut: bigint } {
+    let totalIn = 0n;
+    for (let i = 0; i < tx.inputsLength; i++) {
+      totalIn += tx.getInput(i).witnessUtxo!.amount;
+    }
+    let totalOut = 0n;
+    for (let i = 0; i < tx.outputsLength; i++) {
+      totalOut += tx.getOutput(i).amount!;
+    }
+    return { totalIn, totalOut };
+  }
+
+  it("selects a subset and balances inputs = outputs + fee (segwit multisig)", async () => {
+    const amounts = [40_000n, 35_000n, 30_000n, 25_000n, 22_000n, 18_000n];
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, amounts);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Selection chose a proper subset of the available UTXOs (not all of them).
+      expect(tx.inputsLength).toBeGreaterThanOrEqual(1);
+      expect(tx.inputsLength).toBeLessThan(amounts.length);
+
+      // Every selected input is one of our funded UTXOs (amounts are distinct).
+      const fundedAmounts = new Set(amounts);
+      for (let i = 0; i < tx.inputsLength; i++) {
+        expect(fundedAmounts.has(tx.getInput(i).witnessUtxo!.amount)).toBe(true);
+      }
+
+      // The recipient is paid exactly, and inputs cover amount + fee.
+      const { totalIn, totalOut } = sumInOut(tx);
+      expect([...Array(tx.outputsLength).keys()].map((i) => tx.getOutput(i).amount)).toContain(
+        10_000n,
+      );
+      expect(result.fee).toBeGreaterThan(0n);
+      expect(totalIn - totalOut).toBe(result.fee); // value conservation
+      expect(totalIn).toBeGreaterThanOrEqual(10_000n + result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("selects a subset for a taproot key-path multisig wallet", async () => {
+    const signers = TEST_WALLET.signers.slice(0, 2);
+    const descriptor = buildWalletDescriptor(signers, 2, "TAPROOT", "DEFAULT");
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 2,
+      n: 2,
+      addressType: "TAPROOT",
+      descriptor,
+      signers,
+    };
+    const amounts = [40_000n, 33_000n, 27_000n, 21_000n, 16_000n];
+    const { electrum } = createMultiUtxoElectrumMock(descriptor, amounts);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+
+      expect(tx.inputsLength).toBeGreaterThanOrEqual(1);
+      expect(tx.inputsLength).toBeLessThan(amounts.length);
+
+      // Key-path spend: every input carries a taproot internal key, no leaf script.
+      for (let i = 0; i < tx.inputsLength; i++) {
+        const input = tx.getInput(i);
+        expect(input.tapInternalKey).toHaveLength(32);
+        expect(input.tapLeafScript ?? []).toEqual([]);
+      }
+
+      const { totalIn, totalOut } = sumInOut(tx);
+      expect(result.fee).toBeGreaterThan(0n);
+      expect(totalIn - totalOut).toBe(result.fee);
+      expect(totalIn).toBeGreaterThanOrEqual(10_000n + result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("rejects a recipient amount below the dust threshold", async () => {
+    // TEST_RECIPIENT is a P2WSH output → ~330 sat dust at the 3000 sat/kvB discard rate.
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 100n,
+        }),
+      ).rejects.toThrow(/too small/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("createTransaction manual coin selection (presetCoins)", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n, 25_000n, 22_000n, 18_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("spends exactly the preset coins and nothing else", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 50_000n,
+        presetCoins: [
+          { txid: txids[1], vout: 0 }, // 35_000
+          { txid: txids[3], vout: 0 }, // 25_000
+        ],
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(tx.inputsLength).toBe(2);
+      const inputAmounts = [...Array(tx.inputsLength).keys()]
+        .map((i) => tx.getInput(i).witnessUtxo!.amount)
+        .sort((a, b) => Number(a - b));
+      expect(inputAmounts).toEqual([25_000n, 35_000n]);
+      expect(result.selectedInputs.map((s) => s.txid).sort()).toEqual([txids[1], txids[3]].sort());
+
+      // Recipient paid exactly; inputs = outputs + fee.
+      let totalOut = 0n;
+      const outAmounts: bigint[] = [];
+      for (let i = 0; i < tx.outputsLength; i++) {
+        outAmounts.push(tx.getOutput(i).amount!);
+        totalOut += tx.getOutput(i).amount!;
+      }
+      expect(outAmounts).toContain(50_000n);
+      expect(60_000n - totalOut).toBe(result.fee);
+    });
+  });
+
+  it("includes every preset coin even when one alone would cover (no subset optimization)", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        presetCoins: [
+          { txid: txids[0], vout: 0 }, // 40_000 — alone would cover
+          { txid: txids[4], vout: 0 }, // 22_000
+          { txid: txids[5], vout: 0 }, // 18_000
+        ],
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(tx.inputsLength).toBe(3);
+    });
+  });
+
+  it("fails with insufficient funds when the preset cannot cover amount + fee (no auto top-up)", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Wallet holds plenty (170k total) — but the preset alone must cover.
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 20_000n,
+          presetCoins: [{ txid: txids[5], vout: 0 }], // 18_000
+        }),
+      ).rejects.toThrow(/insufficient funds/i);
+    });
+  });
+
+  it("rejects an outpoint that is not a spendable UTXO of the wallet", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [{ txid: txids[0], vout: 7 }],
+        }),
+      ).rejects.toThrow(/not a spendable UTXO/);
+    });
+  });
+
+  it("rejects a duplicate preset outpoint", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [
+            { txid: txids[0], vout: 0 },
+            { txid: txids[0], vout: 0 },
+          ],
+        }),
+      ).rejects.toThrow(/Duplicate coin/);
+    });
+  });
+
+  it("send-all with presets sweeps only the preset coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        presetCoins: [
+          { txid: txids[2], vout: 0 }, // 30_000
+          { txid: txids[3], vout: 0 }, // 25_000
+        ],
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Only the two preset coins are swept — not the wallet's other four.
+      expect(tx.inputsLength).toBe(2);
+      expect(tx.outputsLength).toBe(1); // no change on a sweep
+      expect(result.changeAddress).toBeNull();
+      expect(tx.getOutput(0).amount).toBe(55_000n - result.fee);
+      expect(result.recipientAmount).toBe(55_000n - result.fee);
+    });
+  });
+});
+
+describe("createTransaction locked coins", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("automatic selection never spends a locked coin", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Lock the two largest coins; only the 30_000 coin remains spendable.
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        lockedOutpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("fails with insufficient funds when the unlocked coins cannot cover", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 50_000n, // total is 105_000, but 75_000 of it is locked
+          lockedOutpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]),
+        }),
+      ).rejects.toThrow(/insufficient funds/i);
+    });
+  });
+
+  it("errors clearly when every coin is locked", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          lockedOutpoints: new Set(txids.map((t) => `${t}:0`)),
+        }),
+      ).rejects.toThrow(/All coins are locked/);
+    });
+  });
+
+  it("an explicit --coin preset spends a locked coin (bypass)", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        presetCoins: [{ txid: txids[0], vout: 0 }],
+        lockedOutpoints: new Set([`${txids[0]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[0]);
+    });
+  });
+
+  it("send-all sweeps only unlocked coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        lockedOutpoints: new Set([`${txids[0]}:0`]), // 40_000 stays behind
+      });
+      expect(result.selectedInputs.map((i) => i.txid).sort()).toEqual([txids[1], txids[2]].sort());
+      expect(result.recipientAmount).toBe(65_000n - result.fee);
+    });
+  });
+});
+
+describe("createTransaction reconcileScan hook", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("receives every scanned outpoint and its locked set replaces lockedOutpoints", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const seen: Array<{ txid: string; vout: number; address: string; amountSats: bigint }> = [];
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        lockedOutpoints: new Set(), // superseded by the hook's result
+        reconcileScan: (scanned) => {
+          seen.push(...scanned);
+          // A first-seen rule locked the two largest coins mid-scan.
+          return { lockedOutpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]) };
+        },
+      });
+      expect(seen.map((c) => c.txid).sort()).toEqual([...txids].sort());
+      // Each scanned coin carries what intent matching needs.
+      expect(seen.map((c) => c.amountSats).sort()).toEqual([...AMOUNTS].sort());
+      for (const c of seen) expect(c.address).toMatch(/^tb1/);
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("runs with preset coins too, and presets still bypass hook-applied locks", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      let seenCount = 0;
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        presetCoins: [{ txid: txids[0], vout: 0 }],
+        reconcileScan: (scanned) => {
+          seenCount = scanned.length;
+          return { lockedOutpoints: new Set([`${txids[0]}:0`]) };
+        },
+      });
+      expect(seenCount).toBe(3);
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[0]);
+    });
+  });
+
+  it("its fresh fromTag/fromCollection sets replace the pre-resolved outpoints", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Pre-resolved sets are empty (the coin was unknown when the command
+      // started); the hook re-resolves after reconciliation and finds it.
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set() },
+        fromCollection: { name: "verified", outpoints: new Set() },
+        reconcileScan: () => ({
+          lockedOutpoints: new Set<string>(),
+          fromTagOutpoints: new Set([`${txids[2]}:0`]),
+          fromCollectionOutpoints: new Set([`${txids[2]}:0`]),
+        }),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("falls back to the pre-resolved outpoints when the hook omits the fresh sets", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[1]}:0`]) },
+        reconcileScan: () => ({ lockedOutpoints: new Set<string>() }),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[1]);
+    });
+  });
+});
+
+describe("createTransaction --from-tag filter", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("restricts automatic selection to coins carrying the tag", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[2]}:0`]) },
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("send-all with --from-tag sweeps only the tagged coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[1]}:0`, `${txids[2]}:0`]) },
+      });
+      expect(result.selectedInputs.map((i) => i.txid).sort()).toEqual([txids[1], txids[2]].sort());
+      expect(result.recipientAmount).toBe(65_000n - result.fee);
+    });
+  });
+
+  it("errors with the tag name when no spendable coin carries it", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          fromTag: { name: "kyc", outpoints: new Set() },
+        }),
+      ).rejects.toThrow(/No spendable coins carry tag #kyc/);
+    });
+  });
+
+  it("locked coins stay excluded inside the tag-filtered pool", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Both large coins carry the tag, but one is locked.
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]) },
+        lockedOutpoints: new Set([`${txids[0]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[1]);
+    });
+  });
+
+  it("rejects combining --from-tag with --coin presets", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [{ txid: txids[0], vout: 0 }],
+          fromTag: { name: "kyc", outpoints: new Set([`${txids[0]}:0`]) },
+        }),
+      ).rejects.toThrow(/--from-tag cannot be combined with --coin/);
+    });
+  });
+});
+
+describe("createTransaction --from-collection filter", () => {
+  const AMOUNTS = [40_000n, 35_000n, 30_000n];
+
+  function withOfflineFetch<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it("restricts automatic selection to the collection's member coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromCollection: { name: "Exchange A", outpoints: new Set([`${txids[2]}:0`]) },
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[2]);
+    });
+  });
+
+  it("send-all with --from-collection sweeps only the member coins", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        sendAll: true,
+        fromCollection: {
+          name: "Exchange A",
+          outpoints: new Set([`${txids[1]}:0`, `${txids[2]}:0`]),
+        },
+      });
+      expect(result.selectedInputs.map((i) => i.txid).sort()).toEqual([txids[1], txids[2]].sort());
+      expect(result.recipientAmount).toBe(65_000n - result.fee);
+    });
+  });
+
+  it("errors with the collection name when no spendable coin is a member", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          fromCollection: { name: "Exchange A", outpoints: new Set() },
+        }),
+      ).rejects.toThrow(/No spendable coins are in collection "Exchange A"/);
+    });
+  });
+
+  it("combined with --from-tag the filters intersect", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      // Tag matches coins 0+1, collection matches coins 1+2 → only coin 1.
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromTag: { name: "kyc", outpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]) },
+        fromCollection: {
+          name: "Exchange A",
+          outpoints: new Set([`${txids[1]}:0`, `${txids[2]}:0`]),
+        },
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[1]);
+    });
+  });
+
+  it("an empty intersection names both filters in the error", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          fromTag: { name: "kyc", outpoints: new Set([`${txids[0]}:0`]) },
+          fromCollection: { name: "Exchange A", outpoints: new Set([`${txids[1]}:0`]) },
+        }),
+      ).rejects.toThrow(/No spendable coins carry tag #kyc and are in collection "Exchange A"/);
+    });
+  });
+
+  it("locked coins stay excluded inside the collection-filtered pool", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 20_000n,
+        fromCollection: {
+          name: "Exchange A",
+          outpoints: new Set([`${txids[0]}:0`, `${txids[1]}:0`]),
+        },
+        lockedOutpoints: new Set([`${txids[0]}:0`]),
+      });
+      expect(result.selectedInputs).toHaveLength(1);
+      expect(result.selectedInputs[0].txid).toBe(txids[1]);
+    });
+  });
+
+  it("rejects combining --from-collection with --coin presets", async () => {
+    const { electrum, txids } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, AMOUNTS);
+    await withOfflineFetch(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          presetCoins: [{ txid: txids[0], vout: 0 }],
+          fromCollection: { name: "Exchange A", outpoints: new Set([`${txids[0]}:0`]) },
+        }),
+      ).rejects.toThrow(/--from-collection cannot be combined with --coin/);
+    });
+  });
+});
+
+describe("createTransaction privacy (input shuffle + change position)", () => {
+  it("places the change output at both positions across RNG seeds", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const positions = new Set<number>();
+      for (let seed = 0; seed < 16; seed++) {
+        const result = await createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          rng: new SeededRng(seed),
+        });
+        const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+        expect(tx.outputsLength).toBe(2);
+        positions.add(findChangeOutputIndex(tx));
+      }
+      // Change must appear at both index 0 and index 1 — not a fixed position.
+      expect([...positions].sort()).toEqual([0, 1]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("shuffles the input order across RNG seeds", async () => {
+    // Amounts chosen so all three coins are always required (no two cover 60k),
+    // fixing the selected set — only the input order can vary, via the shuffle.
+    const amounts = [30_000n, 28_000n, 26_000n];
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, amounts);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const orderings = new Set<string>();
+      for (let seed = 0; seed < 16; seed++) {
+        const result = await createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 60_000n,
+          rng: new SeededRng(seed),
+        });
+        const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+        expect(tx.inputsLength).toBe(amounts.length);
+        const order = Array.from({ length: tx.inputsLength }, (_, i) =>
+          tx.getInput(i).witnessUtxo!.amount.toString(),
+        ).join(",");
+        orderings.add(order);
+      }
+      // At least two distinct input orderings → inputs are shuffled, not fixed.
+      expect(orderings.size).toBeGreaterThan(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("createTransaction manual fee rate", () => {
+  const offlineBase = (electrum: ElectrumClient) => ({
+    wallet: TEST_WALLET,
+    network: "testnet" as const,
+    electrum,
+    toAddress: TEST_RECIPIENT,
+    amount: 10_000n,
+  });
+
+  it("uses the manual rate verbatim and scales the fee by it (overriding the estimate)", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const base = offlineBase(electrum);
+      const high = await createTransaction({ ...base, feeRateSatPerKvB: 25_000n }); // 25 sat/vB
+      const low = await createTransaction({ ...base, feeRateSatPerKvB: 5_000n }); // 5 sat/vB
+      const auto = await createTransaction(base); // estimate (~1 sat/vB)
+
+      // Manual rate is used verbatim, not the estimate.
+      expect(high.feeRateSatPerKvB).toBe(25_000n);
+      expect(low.feeRateSatPerKvB).toBe(5_000n);
+      expect(high.feeRateSatPerKvB).not.toBe(auto.feeRateSatPerKvB);
+
+      // fee == getFee(vsize) = rate × vsize / 1000; an integer sat/vB rate divides it.
+      expect(high.fee % 25n).toBe(0n);
+      expect(low.fee % 5n).toBe(0n);
+      expect(high.fee).toBeGreaterThan(low.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("supports a fractional rate (1.5 sat/vB = 1500 sat/kvB)", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const base = offlineBase(electrum);
+      const r1 = await createTransaction({ ...base, feeRateSatPerKvB: 1_000n }); // 1 sat/vB → fee == vsize
+      const r15 = await createTransaction({ ...base, feeRateSatPerKvB: 1_500n }); // 1.5 sat/vB
+      const r2 = await createTransaction({ ...base, feeRateSatPerKvB: 2_000n }); // 2 sat/vB
+
+      expect(r15.feeRateSatPerKvB).toBe(1_500n);
+      // Same single-UTXO tx shape → fee scales with the rate, strictly between 1× and 2×.
+      expect(r15.fee).toBeGreaterThan(r1.fee);
+      expect(r15.fee).toBeLessThan(r2.fee);
+      // fee(1.5) == floor(1.5 × vsize), and vsize == fee at 1 sat/vB.
+      expect(r15.fee).toBe((3n * r1.fee) / 2n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("createTransaction fee level", () => {
+  const offlineFetch = () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return () => {
+      globalThis.fetch = originalFetch;
+    };
+  };
+
+  it("estimates with the requested level's conf_target and reports it", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const restore = offlineFetch();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        feeLevel: "priority",
+      });
+      // priority → Electrum conf_target 2 on the API-offline fallback path.
+      expect(electrum.estimateFee).toHaveBeenCalledWith(2);
+      expect(result.feeLevel).toBe("priority");
+    } finally {
+      restore();
+    }
+  });
+
+  it("defaults to economy (conf_target 6) when no level is given", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const restore = offlineFetch();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      expect(electrum.estimateFee).toHaveBeenCalledWith(6);
+      expect(result.feeLevel).toBe("economy");
+    } finally {
+      restore();
+    }
+  });
+
+  it("ignores the level and reports no level when a manual rate is supplied", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const restore = offlineFetch();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        feeRateSatPerKvB: 5_000n,
+        feeLevel: "priority",
+      });
+      // Manual rate wins: no estimate, and no level reported back.
+      expect(electrum.estimateFee).not.toHaveBeenCalled();
+      expect(result.feeRateSatPerKvB).toBe(5_000n);
+      expect(result.feeLevel).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("createTransaction anti-fee sniping", () => {
+  const offline = () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return () => {
+      globalThis.fetch = originalFetch;
+    };
+  };
+
+  it("pins nLockTime to the chain tip when no path locktime exists", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        antiFeeSniping: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(headersSubscribe).toHaveBeenCalled();
+      expect(result.lockTime).toBe(850_000);
+      expect(tx.lockTime).toBe(850_000);
+      // Default Replace-By-Fee sequence (< 0xFFFFFFFF) keeps the locktime enforced.
+      expect(tx.getInput(0).sequence).toBe(0xfffffffd);
+    } finally {
+      restore();
+    }
+  });
+
+  it("leaves nLockTime at 0 when anti-fee sniping is off", async () => {
+    const { electrum } = createMiniscriptElectrumMock(TEST_WALLET.descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+      });
+      expect(headersSubscribe).not.toHaveBeenCalled();
+      expect(result.lockTime).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps a path's absolute locktime instead of the chain tip", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),after(144))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[0]],
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        antiFeeSniping: true,
+      });
+      // The path's absolute locktime wins; the chain tip is never consulted.
+      expect(headersSubscribe).not.toHaveBeenCalled();
+      expect(result.lockTime).toBe(144);
+    } finally {
+      restore();
+    }
+  });
+
+  it("still fills the chain-tip locktime for a relative-timelock-only path", async () => {
+    const descriptor = buildMiniscriptDescriptor(
+      `and_v(v:pk(${TEST_WALLET.signers[0]}/<0;1>/*),older(10))`,
+      "NATIVE_SEGWIT",
+    );
+    const wallet: WalletData = {
+      ...TEST_WALLET,
+      m: 0,
+      descriptor,
+      signers: [TEST_WALLET.signers[0]],
+    };
+    const { electrum } = createMiniscriptElectrumMock(descriptor, 50_000n);
+    const headersSubscribe = vi.fn(async () => ({ height: 850_000, hex: "tip" }));
+    (electrum as unknown as { headersSubscribe: unknown }).headersSubscribe = headersSubscribe;
+    const restore = offline();
+    try {
+      const result = await createTransaction({
+        wallet,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        antiFeeSniping: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      // A relative timelock sets the input sequence, not the locktime, so
+      // anti-fee sniping still fills the locktime.
+      expect(result.lockTime).toBe(850_000);
+      expect(tx.lockTime).toBe(850_000);
+      expect(tx.getInput(0).sequence).toBe(10);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("createTransaction subtract fee from amount", () => {
+  it("with change: recipient = amount - fee and inputs are conserved", async () => {
+    // One large UTXO well above the amount → change is kept, recipient absorbs fee.
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [200_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 50_000n,
+        feeRateSatPerKvB: 5_000n,
+        subtractFeeFromAmount: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(result.subtractFee).toBe(true);
+      // Recipient receives the requested amount minus the fee.
+      expect(result.recipientAmount).toBe(50_000n - result.fee);
+
+      let inputSum = 0n;
+      for (let i = 0; i < tx.inputsLength; i++) {
+        inputSum += tx.getInput(i).witnessUtxo!.amount;
+      }
+      let outputSum = 0n;
+      for (let i = 0; i < tx.outputsLength; i++) {
+        outputSum += tx.getOutput(i).amount ?? 0n;
+      }
+      // Conservation: sum of inputs = sum of outputs + fee.
+      expect(inputSum).toBe(outputSum + result.fee);
+      // Change is present; recipient absorbs the fee while change = totalIn - amount.
+      expect(result.changeAddress).not.toBeNull();
+      expect(tx.outputsLength).toBe(2);
+      const changeValue = outputSum - result.recipientAmount;
+      expect(changeValue).toBe(inputSum - 50_000n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("without change: recipient = totalIn - fee and no change output", async () => {
+    // Amount is the whole UTXO so the leftover after the fee is below the
+    // viability threshold → no change output.
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [60_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 60_000n,
+        feeRateSatPerKvB: 5_000n,
+        subtractFeeFromAmount: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      expect(result.changeAddress).toBeNull();
+      expect(tx.outputsLength).toBe(1);
+      // Recipient gets everything minus the fee.
+      expect(result.recipientAmount).toBe(60_000n - result.fee);
+      expect(tx.getOutput(0).amount).toBe(result.recipientAmount);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("rejects an amount that cannot cover the fee", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [200_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 600n, // tiny send with change present → recipient can't absorb the fee
+          feeRateSatPerKvB: 50_000n,
+          subtractFeeFromAmount: true,
+        }),
+      ).rejects.toThrow(/too small/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("leaves the recipient amount unchanged when the flag is off", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [200_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 50_000n,
+        feeRateSatPerKvB: 5_000n,
+      });
+      expect(result.subtractFee).toBe(false);
+      expect(result.recipientAmount).toBe(50_000n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("createTransaction send all", () => {
+  it("sweeps every coin with no change; recipient = balance - fee", async () => {
+    const balances = [200_000n, 150_000n, 99_255n];
+    const total = balances.reduce((s, v) => s + v, 0n);
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, balances);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n, // ignored under sendAll
+        feeRateSatPerKvB: 5_000n,
+        sendAll: true,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Send-all forces subtract-fee on.
+      expect(result.subtractFee).toBe(true);
+      // Every coin is swept.
+      expect(result.selectedInputs.length).toBe(balances.length);
+      expect(tx.inputsLength).toBe(balances.length);
+      const inputSum = result.selectedInputs.reduce((s, i) => s + i.value, 0n);
+      expect(inputSum).toBe(total);
+      // No change; single recipient output = balance - fee.
+      expect(result.changeAddress).toBeNull();
+      expect(tx.outputsLength).toBe(1);
+      expect(result.recipientAmount).toBe(total - result.fee);
+      expect(tx.getOutput(0).amount).toBe(result.recipientAmount);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("forces subtract-fee even when subtractFeeFromAmount is not passed", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [120_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 0n,
+        feeRateSatPerKvB: 5_000n,
+        sendAll: true,
+        // subtractFeeFromAmount intentionally omitted
+      });
+      expect(result.subtractFee).toBe(true);
+      expect(result.recipientAmount).toBe(120_000n - result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("rejects a dust-sized wallet that cannot cover the fee", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [600n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 0n,
+          feeRateSatPerKvB: 50_000n,
+          sendAll: true,
+        }),
+      ).rejects.toThrow(/too small/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("createTransaction result inputs and change", () => {
+  it("reports selectedInputs (the chosen UTXOs) and changeAmount", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [200_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 50_000n,
+        feeRateSatPerKvB: 5_000n,
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // selectedInputs match the PSBT inputs (same outpoints + values).
+      expect(result.selectedInputs.length).toBe(tx.inputsLength);
+      const inputSum = result.selectedInputs.reduce((s, i) => s + i.value, 0n);
+      let psbtInputSum = 0n;
+      for (let i = 0; i < tx.inputsLength; i++) psbtInputSum += tx.getInput(i).witnessUtxo!.amount;
+      expect(inputSum).toBe(psbtInputSum);
+
+      // changeAmount matches the on-chain change and conserves value.
+      expect(result.changeAddress).not.toBeNull();
+      expect(result.changeAmount).toBeGreaterThan(0n);
+      expect(inputSum).toBe(50_000n + result.changeAmount + result.fee);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reports changeAmount 0 when there is no change output", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [60_000n]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+
+    try {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 60_000n,
+        feeRateSatPerKvB: 5_000n,
+        subtractFeeFromAmount: true,
+      });
+      expect(result.changeAddress).toBeNull();
+      expect(result.changeAmount).toBe(0n);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
 
 describe("createTransaction multisig", () => {
   it("uses the default dust threshold for standard multisig coin selection", async () => {
@@ -513,7 +1954,7 @@ describe("createTransaction multisig", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(tx.inputsLength).toBe(1);
       expect(tx.outputsLength).toBe(2);
@@ -707,7 +2148,7 @@ describe("createTransaction multisig", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(input.tapInternalKey).toHaveLength(32);
       expect(input.tapMerkleRoot).toHaveLength(32);
@@ -756,7 +2197,7 @@ describe("createTransaction multisig", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(input.tapInternalKey).toHaveLength(32);
       expect(input.tapMerkleRoot).toHaveLength(32);
@@ -954,8 +2395,12 @@ describe("createTransaction multisig", () => {
       const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
         allowUnknown: true,
       });
-      const changeOutput = tx.getOutput(1);
-      tx.updateOutput(0, {
+      // Pollute the recipient output's metadata with the change output's keys,
+      // to prove classification is by address ownership, not PSBT metadata.
+      const changeIndex = findChangeOutputIndex(tx);
+      const recipientIndex = changeIndex === 0 ? 1 : 0;
+      const changeOutput = tx.getOutput(changeIndex);
+      tx.updateOutput(recipientIndex, {
         tapInternalKey: changeOutput.tapInternalKey,
         tapBip32Derivation: changeOutput.tapBip32Derivation,
       });
@@ -970,8 +2415,8 @@ describe("createTransaction multisig", () => {
 
       expect(detail?.subAmount).toBe("10000 sat");
       expect(detail?.subAmountBtc).toBe("0.00010000 BTC");
-      expect(detail?.outputs[0].isChange).toBe(false);
-      expect(detail?.outputs[1].isChange).toBe(true);
+      expect(detail?.outputs[recipientIndex].isChange).toBe(false);
+      expect(detail?.outputs[changeIndex].isChange).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -1035,7 +2480,7 @@ describe("createTransaction miniscript", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(tx.inputsLength).toBe(1);
       expect(tx.outputsLength).toBe(2);
@@ -1096,7 +2541,7 @@ describe("createTransaction miniscript", () => {
         allowUnknown: true,
       });
       const input = tx.getInput(0);
-      const changeOutput = tx.getOutput(1);
+      const changeOutput = findChangeOutput(tx);
 
       expect(input.tapInternalKey).toHaveLength(32);
       expect(input.tapMerkleRoot).toHaveLength(32);

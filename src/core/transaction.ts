@@ -1,11 +1,11 @@
 // Transaction operations for group wallets
 // Reference: libnunchuk nunchukimpl.cpp, groupservice.cpp
 
-import { Transaction, bip32Path, selectUTXO, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
+import { Transaction, bip32Path, NETWORK, TEST_NETWORK } from "@scure/btc-signer";
 import { RawPSBTV0, TaprootControlBlock } from "@scure/btc-signer/psbt.js";
 import { base58 } from "@scure/base";
-import { getElectrumServer } from "./config.js";
-import type { Network } from "./config.js";
+import { DEFAULT_FEE_LEVEL, getElectrumServer } from "./config.js";
+import type { FeeLevel, Network } from "./config.js";
 import { ApiClient } from "./api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "./electrum.js";
 import type { HistoryItem } from "./electrum.js";
@@ -52,6 +52,30 @@ import { formatBtc, formatSats, getOutputAddress } from "./format.js";
 import { estimateFeeRate } from "./fees.js";
 import { timelockFromK, type TimelockBased } from "./miniscript.js";
 import { toXOnlyPubkey } from "./taproot.js";
+import type { AddressType } from "./address-type.js";
+import {
+  CFeeRate,
+  makeCOutput,
+  selectCoins,
+  type COutput,
+  type CoinInput,
+  type SelectionError,
+  type SelectionRng,
+} from "./coin-selection.js";
+import {
+  CryptoRng,
+  buildCoinSelectionParams,
+  computeTxNoinputsSize,
+  getDustThreshold,
+} from "./coin-selection-params.js";
+import {
+  buildMiniscriptDummyWitness,
+  buildTaprootMultisigDummyWitness,
+  estimateInputVBytes,
+  getChangeDust,
+  getChangeOutputSize,
+  getChangeScriptLen,
+} from "./coin-input-size.js";
 
 const GAP_LIMIT = 20;
 const MAX_BIP125_RBF_SEQUENCE = 0xfffffffd;
@@ -803,14 +827,82 @@ export interface CreateTransactionParams {
   taprootKeyPath?: boolean;
   taprootScriptPath?: boolean;
   preimages?: string[];
+  // Manual fee rate in sat/kvB (Bitcoin Core's CFeeRate unit; e.g. 1.5 sat/vB =
+  // 1500). When > 0 it overrides the auto-estimate; otherwise the rate is
+  // estimated.
+  feeRateSatPerKvB?: bigint;
+  // Fee level for the auto-estimate path (priority / standard / economy).
+  // Ignored when a manual `feeRateSatPerKvB` is supplied. Defaults to economy.
+  feeLevel?: FeeLevel;
+  // Pin nLockTime to the current block height to deter fee sniping. A spending
+  // path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY
+  // condition) always takes precedence.
+  antiFeeSniping?: boolean;
+  // Subtract the network fee from the recipient amount instead of adding it on
+  // top, so the recipient receives `amount - fee`. The wallet's total spend
+  // stays at `amount`.
+  subtractFeeFromAmount?: boolean;
+  // Sweep the entire wallet balance to the recipient. Overrides `amount` (set to
+  // the full balance) and forces `subtractFeeFromAmount` on, so the recipient
+  // receives `balance - fee` with no change. libnunchuk has no send-all
+  // primitive — this mirrors the app (amount = balance + subtract_fee).
+  // Combined with `presetCoins`, sweeps only the preset coins.
+  sendAll?: boolean;
+  // Manual coin selection: spend exactly these outpoints. Every preset coin is
+  // spent — no subset optimization, no automatic top-up.
+  presetCoins?: Array<{ txid: string; vout: number }>;
+  // "<txid>:<vout>" keys of locked coins. Automatic selection (and --send-all)
+  // skips them; an explicit preset spends a locked coin anyway.
+  lockedOutpoints?: Set<string>;
+  // Coin-control reconciliation hook, called with the scanned coins right
+  // after the UTXO scan (change-tag intents and collection rules can tag or
+  // lock a coin the moment it is first seen). Its returned locked set replaces
+  // `lockedOutpoints`, so this very transaction already respects rule-applied
+  // locks.
+  reconcileScan?: (
+    scanned: Array<{ txid: string; vout: number; address: string; amountSats: bigint }>,
+  ) => {
+    lockedOutpoints: Set<string>;
+    // Fresh membership sets, resolved after reconciliation. When present they
+    // replace the fromTag/fromCollection outpoints, so a coin tagged or
+    // collected by this very scan's rules is already in the candidate pool.
+    fromTagOutpoints?: Set<string>;
+    fromCollectionOutpoints?: Set<string>;
+  };
+  // Restrict automatic selection (and --send-all) to the coins carrying this
+  // tag. Cannot be combined with presetCoins.
+  fromTag?: { name: string; outpoints: Set<string> };
+  // Restrict automatic selection (and --send-all) to the collection's member
+  // coins. Cannot be combined with presetCoins; combined with fromTag the
+  // filters intersect.
+  fromCollection?: { name: string; outpoints: Set<string> };
+  // Randomness for selection shuffles, change target, input order, and change
+  // position. Defaults to crypto-random; tests inject a seeded RNG.
+  rng?: SelectionRng;
 }
 
 export interface CreateTransactionResult {
   psbtB64: string;
   txId: string;
   fee: bigint;
-  feePerByte: bigint;
+  // Effective fee rate in sat/kvB (CFeeRate unit). Display as sat/vB by /1000.
+  feeRateSatPerKvB: bigint;
+  // The fee level used for the auto-estimate, or undefined when a manual rate
+  // was supplied. Lets the command label output (e.g. "3 sat/vB (economy)").
+  feeLevel?: FeeLevel;
+  // The transaction's nLockTime (0 when none was applied). Reflects a spending
+  // path's absolute locktime or the anti-fee-sniping chain-tip height.
+  lockTime: number;
+  // True when the fee was subtracted from the recipient amount.
+  subtractFee: boolean;
+  // The amount actually sent to the recipient. Equals the requested amount
+  // unless the fee was subtracted from it, in which case it is reduced by the fee.
+  recipientAmount: bigint;
   changeAddress: string | null;
+  // The change output value in sats (0 when there is no change output).
+  changeAmount: bigint;
+  // The UTXOs selected as inputs, in selection order (before any shuffle).
+  selectedInputs: Array<{ txid: string; vout: number; value: bigint }>;
   miniscriptPath?: MiniscriptPathSummary;
 }
 
@@ -879,44 +971,6 @@ function buildPaymentPsbtMetadata(
     }
   }
   return update;
-}
-
-function buildMiniscriptDummyWitness(
-  plan: MiniscriptSpendingPlan,
-  witnessScript: Uint8Array,
-  controlBlock?: Uint8Array,
-): Uint8Array[] {
-  const stack: Uint8Array[] = [];
-  const isTaproot = controlBlock != null;
-  const multisigLeafCount = plan.leafNodes.filter((leaf) => leaf.type === "MULTI").length;
-  const placeholderLeaves =
-    plan.leafNodes.length > 0 ? plan.leafNodes : [{ type: "NONE" as const }];
-
-  for (const leaf of placeholderLeaves) {
-    switch (leaf.type) {
-      case "HASH160":
-      case "HASH256":
-      case "RIPEMD160":
-      case "SHA256":
-        stack.push(new Uint8Array(32));
-        break;
-      default:
-        stack.push(new Uint8Array());
-        break;
-    }
-  }
-  for (let i = 0; i < multisigLeafCount; i++) {
-    stack.push(new Uint8Array());
-  }
-  for (let i = 0; i < plan.requiredSignatures; i++) {
-    stack.push(new Uint8Array(isTaproot ? 64 : 72));
-  }
-
-  stack.push(witnessScript);
-  if (controlBlock) {
-    stack.push(controlBlock);
-  }
-  return stack;
 }
 
 function buildMiniscriptPathSummary(plan: MiniscriptSpendingPlan): MiniscriptPathSummary {
@@ -1004,22 +1058,6 @@ function getDisplaySignerDescriptors(
     signerFingerprints(parsedDescriptor.signers.slice(0, parsedDescriptor.m)),
   );
   return descriptorKeyPathSigners.length > 0 ? descriptorKeyPathSigners : walletSigners;
-}
-
-function buildTaprootKeyPathPlan(
-  parsed: ReturnType<typeof parseDescriptor>,
-): MiniscriptSpendingPlan {
-  return {
-    index: -1,
-    leafNodes: [],
-    lockTime: 0,
-    path: [],
-    preimageRequirements: [],
-    requiredSignatures: parsed.m,
-    sequence: 0,
-    signerNames: parsed.signers.slice(0, parsed.m),
-    supported: true,
-  };
 }
 
 function canSpendTaprootKeyPath(parsed: ReturnType<typeof parseDescriptor>): boolean {
@@ -1364,109 +1402,305 @@ function getMiniscriptPlanProgress(
   return { ready: true, signedCount, signedFingerprints };
 }
 
-function estimateMiniscriptFee(
-  inputs: PreparedWalletInput[],
-  btcNet: typeof NETWORK,
-  toAddress: string,
-  amount: bigint,
-  changeAddress: string,
-  includeChange: boolean,
-  txLockTime: number,
-  plan: MiniscriptSpendingPlan,
-  feePerByte: bigint,
-  taprootKeyPath = false,
-): bigint {
-  const tx = new Transaction({
-    lockTime: txLockTime,
-    allowUnknownInputs: true,
-    disableScriptCheck: true,
-  });
+// m-of-n P2WSH / P2SH-P2WSH multisig dummy witness: OP_0 + m × 72-byte sig + script.
+function buildMultisigP2WSHDummyWitness(m: number, witnessScript: Uint8Array): Uint8Array[] {
+  const stack: Uint8Array[] = [new Uint8Array()];
+  for (let i = 0; i < m; i++) stack.push(new Uint8Array(72));
+  stack.push(witnessScript);
+  return stack;
+}
 
-  const inputIndexes: number[] = [];
-  for (const prepared of inputs) {
-    inputIndexes.push(tx.addInput(prepared.input));
+// scriptSig bytes for a bare P2SH (LEGACY) m-of-n multisig spend:
+//   OP_0 OP_PUSHBYTES_72 <sig_1> ... OP_PUSHBYTES_72 <sig_m> push(redeemScript)
+function buildLegacyMultisigScriptSig(m: number, redeemScript: Uint8Array): Uint8Array {
+  const parts: number[] = [0x00]; // OP_0
+  for (let i = 0; i < m; i++) {
+    parts.push(0x48); // OP_PUSHBYTES_72
+    for (let j = 0; j < 72; j++) parts.push(0x00);
   }
-
-  tx.addOutputAddress(toAddress, amount, btcNet);
-  if (includeChange) {
-    tx.addOutputAddress(changeAddress, 1n, btcNet);
+  if (redeemScript.length <= 75) {
+    parts.push(redeemScript.length);
+  } else if (redeemScript.length <= 255) {
+    parts.push(0x4c, redeemScript.length); // OP_PUSHDATA1
+  } else {
+    parts.push(0x4d, redeemScript.length & 0xff, (redeemScript.length >> 8) & 0xff); // OP_PUSHDATA2
   }
+  for (const b of redeemScript) parts.push(b);
+  return new Uint8Array(parts);
+}
 
-  for (let i = 0; i < inputs.length; i++) {
-    const prepared = inputs[i];
-    const index = inputIndexes[i];
-    if (taprootKeyPath) {
-      tx.updateInput(index, { finalScriptWitness: [new Uint8Array(64)] }, true);
-      continue;
-    }
-
-    if (prepared.payment.witnessScript) {
-      tx.updateInput(
-        index,
-        {
-          finalScriptWitness: buildMiniscriptDummyWitness(plan, prepared.payment.witnessScript),
-        },
-        true,
-      );
-      continue;
-    }
-
-    const tapLeaf = prepared.payment.tapLeafScript?.[0];
-    if (!tapLeaf) {
-      throw new Error("Miniscript wallet input is missing witnessScript or tapLeafScript");
-    }
+function applyMultisigDummyInput(
+  tx: Transaction,
+  inputIndex: number,
+  addressType: AddressType,
+  m: number,
+  n: number,
+  payment: PreparedWalletInput["payment"],
+): void {
+  if (addressType === "NATIVE_SEGWIT" || addressType === "NESTED_SEGWIT") {
+    if (!payment.witnessScript) throw new Error("Multisig input missing witnessScript");
+    tx.updateInput(
+      inputIndex,
+      { finalScriptWitness: buildMultisigP2WSHDummyWitness(m, payment.witnessScript) },
+      true,
+    );
+    return;
+  }
+  if (addressType === "LEGACY") {
+    if (!payment.redeemScript) throw new Error("Legacy multisig input missing redeemScript");
+    tx.updateInput(
+      inputIndex,
+      { finalScriptSig: buildLegacyMultisigScriptSig(m, payment.redeemScript) },
+      true,
+    );
+    return;
+  }
+  if (addressType === "TAPROOT") {
+    const tapLeaf = payment.tapLeafScript?.[0];
+    if (!tapLeaf) throw new Error("Taproot multisig input missing tapLeafScript");
     const [controlBlock, scriptWithVersion] = tapLeaf;
     tx.updateInput(
-      index,
+      inputIndex,
       {
-        finalScriptWitness: buildMiniscriptDummyWitness(
-          plan,
+        finalScriptWitness: buildTaprootMultisigDummyWitness(
+          m,
+          n,
           scriptWithVersion.slice(0, -1),
           TaprootControlBlock.encode(controlBlock),
         ),
       },
       true,
     );
+    return;
   }
-
-  const vsize = Math.ceil(tx.weight / 4);
-  return feePerByte * BigInt(vsize);
+  throw new Error(`Unsupported address type for multisig: ${addressType}`);
 }
 
-function buildMiniscriptTransaction(
-  inputs: PreparedWalletInput[],
-  wallet: WalletData,
-  network: Network,
-  toAddress: string,
-  amount: bigint,
-  changeAddress: string,
-  changeAmount: bigint,
-  nextChangeIndex: number,
-  txLockTime: number,
-  taprootKeyPath = false,
-): Transaction {
-  const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
+// Build a dummy transaction mirroring the fully-signed PSBT and measure its
+// vsize, used to settle the post-selection fee. Handles every wallet type:
+// taproot key-path (single 64-byte Schnorr sig), miniscript v0 / taproot
+// script-path (control block + leaf), and m-of-n multisig.
+function estimateSignedTxVsize(args: {
+  selected: PreparedWalletInput[];
+  wallet: WalletData;
+  network: Network;
+  toAddress: string;
+  amount: bigint;
+  changeAddress: string | null;
+  changeAmount: bigint;
+  txLockTime: number;
+  miniscriptPlan: MiniscriptSpendingPlan | null;
+  taprootKeyPath: boolean;
+}): number {
+  const btcNet = args.network === "mainnet" ? NETWORK : TEST_NETWORK;
   const tx = new Transaction({
-    lockTime: txLockTime,
+    lockTime: args.txLockTime,
     allowUnknownInputs: true,
     disableScriptCheck: true,
   });
 
-  for (const prepared of inputs) {
-    tx.addInput(prepared.input);
+  for (const prepared of args.selected) tx.addInput(prepared.input);
+  tx.addOutputAddress(args.toAddress, args.amount, btcNet);
+  if (args.changeAddress && args.changeAmount > 0n) {
+    tx.addOutputAddress(args.changeAddress, args.changeAmount, btcNet);
   }
 
-  tx.addOutputAddress(toAddress, amount, btcNet);
+  for (let i = 0; i < args.selected.length; i++) {
+    const prepared = args.selected[i];
+    if (args.taprootKeyPath) {
+      tx.updateInput(i, { finalScriptWitness: [new Uint8Array(64)] }, true);
+      continue;
+    }
+    if (args.miniscriptPlan) {
+      if (prepared.payment.witnessScript) {
+        tx.updateInput(
+          i,
+          {
+            finalScriptWitness: buildMiniscriptDummyWitness(
+              args.miniscriptPlan,
+              prepared.payment.witnessScript,
+            ),
+          },
+          true,
+        );
+        continue;
+      }
+      const tapLeaf = prepared.payment.tapLeafScript?.[0];
+      if (!tapLeaf) {
+        throw new Error("Miniscript wallet input is missing witnessScript or tapLeafScript");
+      }
+      const [controlBlock, scriptWithVersion] = tapLeaf;
+      tx.updateInput(
+        i,
+        {
+          finalScriptWitness: buildMiniscriptDummyWitness(
+            args.miniscriptPlan,
+            scriptWithVersion.slice(0, -1),
+            TaprootControlBlock.encode(controlBlock),
+          ),
+        },
+        true,
+      );
+      continue;
+    }
+    applyMultisigDummyInput(
+      tx,
+      i,
+      args.wallet.addressType,
+      args.wallet.m,
+      args.wallet.signers.length,
+      prepared.payment,
+    );
+  }
 
-  if (changeAmount > 0n) {
-    tx.addOutputAddress(changeAddress, changeAmount, btcNet);
+  return Math.ceil(tx.weight / 4);
+}
 
-    const changePayment = deriveDescriptorPayment(wallet.descriptor, network, 1, nextChangeIndex);
-    const outputUpdate = buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath });
-    tx.updateOutput(tx.outputsLength - 1, outputUpdate);
+// Build the unsigned PSBT-ready transaction from the selected inputs, attaching
+// taproot-aware BIP-174 change-output metadata for every wallet type.
+function buildUnifiedTransaction(args: {
+  selected: PreparedWalletInput[];
+  parsed: ReturnType<typeof parseDescriptor>;
+  wallet: WalletData;
+  network: Network;
+  toAddress: string;
+  amount: bigint;
+  changeAddress: string | null;
+  changeAmount: bigint;
+  changeIndex: number;
+  txLockTime: number;
+  taprootKeyPath: boolean;
+  rng: SelectionRng;
+}): Transaction {
+  const { parsed } = args;
+  const btcNet = args.network === "mainnet" ? NETWORK : TEST_NETWORK;
+  const tx = new Transaction({
+    lockTime: args.txLockTime,
+    allowUnknownInputs: true,
+    disableScriptCheck: true,
+  });
+
+  // Recipients first, then insert change at a random position so it isn't a
+  // fixed-index fingerprint (rng.randrange(n + 1)). libnunchuk draws the change
+  // position before shuffling inputs, so keep that RNG order here.
+  const outputs: Array<{ address: string; amount: bigint; isChange: boolean }> = [
+    { address: args.toAddress, amount: args.amount, isChange: false },
+  ];
+  if (args.changeAddress && args.changeAmount > 0n) {
+    const pos = Number(args.rng.randrange(BigInt(outputs.length + 1)));
+    outputs.splice(pos, 0, {
+      address: args.changeAddress,
+      amount: args.changeAmount,
+      isChange: true,
+    });
+  }
+
+  // Shuffle the final input order so it doesn't leak the selection algorithm
+  // (GetShuffledInputVector). A single input is a no-op.
+  const shuffledInputs = [...args.selected];
+  args.rng.shuffle(shuffledInputs);
+  for (const prepared of shuffledInputs) tx.addInput(prepared.input);
+
+  let changeOutputIndex = -1;
+  outputs.forEach((out, i) => {
+    tx.addOutputAddress(out.address, out.amount, btcNet);
+    if (out.isChange) changeOutputIndex = i;
+  });
+
+  if (changeOutputIndex >= 0) {
+    const changePayment =
+      parsed.kind === "multisig"
+        ? deriveMultisigPayment(
+            parsed.signers,
+            parsed.m,
+            parsed.addressType,
+            args.network,
+            1,
+            args.changeIndex,
+            parsed.taprootWalletTemplate,
+          )
+        : deriveDescriptorPayment(args.wallet.descriptor, args.network, 1, args.changeIndex);
+    tx.updateOutput(
+      changeOutputIndex,
+      buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath: args.taprootKeyPath }),
+    );
   }
 
   return tx;
+}
+
+// Output script for a recipient address — used to size the recipient output
+// when computing the selection target's tx_noinputs_size.
+function getOutputScriptForAddress(address: string, btcNet: typeof NETWORK): Uint8Array {
+  const tx = new Transaction({ allowUnknownInputs: true, disableScriptCheck: true });
+  tx.addOutputAddress(address, 1n, btcNet);
+  const script = tx.getOutput(0).script;
+  if (!script) throw new Error("Unable to derive script for recipient address");
+  return script;
+}
+
+// BIP141 witness-program shape for an arbitrary scriptPubKey: a 1-byte version
+// opcode (OP_0, or OP_1..OP_16) followed by a single push of 2..40 bytes. Used
+// to apply the witness discount in the recipient dust threshold.
+function isWitnessProgramScript(script: Uint8Array): boolean {
+  if (script.length < 4 || script.length > 42) return false;
+  const version = script[0];
+  if (version !== 0x00 && (version < 0x51 || version > 0x60)) return false;
+  return script[1] === script.length - 2;
+}
+
+// Dust threshold for a recipient output paying `script`, at the discard feerate.
+// Mirrors Bitcoin Core's IsDust(txout, m_discard_feerate) (spender.cpp CreateTransaction).
+function getRecipientDust(script: Uint8Array, discardFeerate: CFeeRate): bigint {
+  return getDustThreshold(
+    getChangeOutputSize(script.length),
+    isWitnessProgramScript(script),
+    discardFeerate,
+  );
+}
+
+// Candidate coins for automatic selection, mirroring spender.cpp AvailableCoins
+// + the remain_target gate in CreateTransaction.
+//
+// Coins are always sorted oldest-confirmed-first (unconfirmed last). For a
+// relative-timelock (CSV) spend the input sequence is custom (not the RBF
+// sentinel, not 0), so libnunchuk caps the set to the oldest coins whose
+// cumulative effective value covers the selection target — biasing toward coins
+// that have aged into the timelock. For a normal RBF spend every coin stays
+// available (remain_target = MAX_MONEY).
+export function availableCandidates(
+  coOutputs: COutput[],
+  sequence: number,
+  selectionTarget: bigint,
+  subtractFeeOutputs: boolean,
+): COutput[] {
+  const sorted = [...coOutputs].sort((a, b) => {
+    const ha = a.coin.height <= 0 ? Number.POSITIVE_INFINITY : a.coin.height;
+    const hb = b.coin.height <= 0 ? Number.POSITIVE_INFINITY : b.coin.height;
+    return ha - hb;
+  });
+  if (sequence === MAX_BIP125_RBF_SEQUENCE || sequence === 0) {
+    return sorted; // no relative timelock — every coin is a candidate
+  }
+  // No manually pre-selected coins yet, so remain_target == selection_target.
+  // (When coin control lands, subtract the pre-selected inputs' total here.)
+  const capped: COutput[] = [];
+  let total = 0n;
+  for (const co of sorted) {
+    if (total >= selectionTarget) break;
+    capped.push(co);
+    total += subtractFeeOutputs ? co.coin.value : co.effectiveValue;
+  }
+  return capped;
+}
+
+function humanizeSelectionError(error: SelectionError): Error {
+  if (error === "max_weight") {
+    return new Error(
+      "Coin selection failed: the selected inputs would exceed the maximum transaction weight.",
+    );
+  }
+  return new Error("Insufficient funds to cover amount + fee.");
 }
 
 // Create a transaction PSBT with all metadata matching libnunchuk's FillPsbt
@@ -1480,12 +1714,33 @@ export async function createTransaction(
     network,
     electrum,
     toAddress,
-    amount,
+    amount: requestedAmount,
     miniscriptPath,
     taprootKeyPath: requestedTaprootKeyPath,
     taprootScriptPath = false,
     preimages = [],
+    feeRateSatPerKvB,
+    feeLevel = DEFAULT_FEE_LEVEL,
+    antiFeeSniping = false,
+    subtractFeeFromAmount: requestedSubtractFee = false,
+    sendAll = false,
+    presetCoins = [],
+    lockedOutpoints,
+    reconcileScan,
+    fromTag,
+    fromCollection,
+    rng = new CryptoRng(),
   } = params;
+  if (fromTag && presetCoins.length > 0) {
+    throw new Error(
+      "--from-tag cannot be combined with --coin (manual selection spends exactly the chosen coins).",
+    );
+  }
+  if (fromCollection && presetCoins.length > 0) {
+    throw new Error(
+      "--from-collection cannot be combined with --coin (manual selection spends exactly the chosen coins).",
+    );
+  }
   const parsed = parseDescriptor(wallet.descriptor);
   if (parsed.kind !== "miniscript" && miniscriptPath != null) {
     throw new Error("Miniscript signing path selection is only supported for miniscript wallets");
@@ -1526,15 +1781,92 @@ export async function createTransaction(
     parsed.kind === "miniscript" && !taprootKeyPath
       ? selectMiniscriptSpendingPlan(parsed.miniscript!, undefined, miniscriptPath)
       : null;
-  const taprootKeyPathPlan = taprootKeyPath ? buildTaprootKeyPathPlan(parsed) : null;
   const inputSequence = miniscriptPlan?.sequence || MAX_BIP125_RBF_SEQUENCE;
-  const txLockTime = miniscriptPlan?.lockTime || 0;
+  // Anti-fee sniping: pin nLockTime to the current block height so this
+  // transaction has no fee-sniping advantage over a competitor at the same
+  // height. A spending path's own absolute locktime (an `after` /
+  // OP_CHECKLOCKTIMEVERIFY condition) takes precedence; we only fill in a tip
+  // height when the locktime would otherwise be 0. The default input sequence
+  // (MAX_BIP125_RBF_SEQUENCE) is < 0xFFFFFFFF, so the locktime is enforced.
+  // Reference: nunchukimpl.cpp CreateTransaction (`locktime == 0 && anti_fee_sniping`).
+  let txLockTime = miniscriptPlan?.lockTime || 0;
+  if (txLockTime === 0 && antiFeeSniping) {
+    txLockTime = (await electrum.headersSubscribe()).height;
+  }
 
   // Step 1: Scan UTXOs
-  const { utxos, nextChangeIndex } = await scanUtxos(wallet, network, electrum);
-  if (utxos.length === 0) {
+  const { utxos: scannedUtxos, nextChangeIndex } = await scanUtxos(wallet, network, electrum);
+  if (scannedUtxos.length === 0) {
     throw new Error("No UTXOs found. Wallet has no funds.");
   }
+  const reconciled = reconcileScan
+    ? reconcileScan(
+        scannedUtxos.map((u) => ({
+          txid: u.txHash,
+          vout: u.txPos,
+          address: u.address,
+          amountSats: u.value,
+        })),
+      )
+    : undefined;
+  const effectiveLocked = reconciled ? reconciled.lockedOutpoints : lockedOutpoints;
+
+  // Manual coin selection: validate the preset outpoints and restrict the
+  // working set to exactly those coins.
+  let utxos = scannedUtxos;
+  if (presetCoins.length > 0) {
+    const presetKeys = new Set<string>();
+    for (const p of presetCoins) {
+      const key = `${p.txid}:${p.vout}`;
+      if (presetKeys.has(key)) {
+        throw new Error(`Duplicate coin ${key}.`);
+      }
+      presetKeys.add(key);
+      if (!scannedUtxos.some((u) => u.txHash === p.txid && u.txPos === p.vout)) {
+        throw new Error(`Coin ${key} is not a spendable UTXO of this wallet.`);
+      }
+    }
+    utxos = scannedUtxos.filter((u) => presetKeys.has(`${u.txHash}:${u.txPos}`));
+  } else {
+    if (effectiveLocked && effectiveLocked.size > 0) {
+      // Locked coins never enter automatic selection; explicit presets bypass.
+      utxos = utxos.filter((u) => !effectiveLocked.has(`${u.txHash}:${u.txPos}`));
+      if (utxos.length === 0) {
+        throw new Error(
+          "All coins are locked. Unlock coins with `coin unlock` or select them explicitly with --coin.",
+        );
+      }
+    }
+    if (fromTag) {
+      const outpoints = reconciled?.fromTagOutpoints ?? fromTag.outpoints;
+      utxos = utxos.filter((u) => outpoints.has(`${u.txHash}:${u.txPos}`));
+      if (utxos.length === 0) {
+        throw new Error(`No spendable coins carry tag #${fromTag.name}.`);
+      }
+    }
+    if (fromCollection) {
+      const outpoints = reconciled?.fromCollectionOutpoints ?? fromCollection.outpoints;
+      utxos = utxos.filter((u) => outpoints.has(`${u.txHash}:${u.txPos}`));
+      if (utxos.length === 0) {
+        throw new Error(
+          fromTag
+            ? `No spendable coins carry tag #${fromTag.name} and are in collection "${fromCollection.name}".`
+            : `No spendable coins are in collection "${fromCollection.name}".`,
+        );
+      }
+    }
+  }
+
+  // Send all funds (sweep): spend every available coin to the recipient with the
+  // fee taken out of the amount, so the recipient receives balance - fee and
+  // there is no change. libnunchuk has no send-all primitive — the app does it as
+  // amount = wallet balance + subtract_fee_from_amount. Selecting all coins makes
+  // the timelock oldest-first cap a no-op (the target equals the full balance).
+  // With preset coins the working set is already restricted, so the sweep covers
+  // only the chosen coins (app behavior: select coins → send max).
+  const totalBalance = utxos.reduce((sum, utxo) => sum + utxo.value, 0n);
+  const subtractFeeFromAmount = sendAll ? true : requestedSubtractFee;
+  const amount = sendAll ? totalBalance : requestedAmount;
 
   // Step 2: Fetch full previous transactions for nonWitnessUtxo
   // Reference: FillPsbt adds non_witness_utxo from database (walletdb.cpp:1074-1089)
@@ -1588,137 +1920,217 @@ export async function createTransaction(
       : deriveDescriptorAddresses(wallet.descriptor, network, 1, nextChangeIndex, 1);
   const changeAddress = changeAddrs[0];
 
-  // Step 5: Fee estimation from Nunchuk API (hourFee) with Electrum fallback
-  // Reference: NunchukImpl::EstimateFee (nunchukimpl.cpp:1854-1895)
-  const feePerByte = await estimateFeeRate(network, electrum);
+  // Step 5: Fee rate in sat/kvB — a manual rate (> 0) overrides; otherwise
+  // estimate from the Nunchuk API (hourFee) with Electrum fallback.
+  // Reference: nunchukimpl.cpp CreateTransaction (`if (fee_rate <= 0) fee_rate = EstimateFee()`).
+  const usingManualFeeRate = feeRateSatPerKvB != null && feeRateSatPerKvB > 0n;
+  const feeRate = usingManualFeeRate
+    ? feeRateSatPerKvB
+    : await estimateFeeRate(network, electrum, feeLevel);
 
-  // Step 6: Coin selection + transaction building
-  // Reference: wallet::CreateTransaction in spender.cpp:200-511 (BnB + Knapsack)
-  // CLI uses @scure/btc-signer's selectUTXO for MVP
-  let fee = 0n;
-  let tx: Transaction | null = null;
-  let txChangeAddress: string | null = null;
+  // Step 6: Coin selection (BnB / Knapsack / SRD) + transaction building.
+  // Reference: libnunchuk wallet::CreateTransaction (spender.cpp),
+  // selector.cpp (run BnB + Knapsack + SRD, choose least waste), coinselection.cpp.
+  const inputVBytes = estimateInputVBytes(wallet, network, { miniscriptPlan, taprootKeyPath });
+  const coinInputs: CoinInput[] = preparedInputs.map(({ utxo }) => ({
+    txid: utxo.txHash,
+    vout: utxo.txPos,
+    value: utxo.value,
+    inputVBytes,
+    height: utxo.height,
+    blocktime: utxo.blocktime,
+    isChange: utxo.chain === 1,
+  }));
 
-  if (parsed.kind !== "miniscript") {
-    const result = selectUTXO(
-      preparedInputs.map((prepared) => prepared.input),
-      [{ address: toAddress, amount }],
-      "default",
-      {
-        feePerByte,
-        changeAddress,
-        lockTime: txLockTime,
-        network: btcNet,
-        createTx: true,
-      },
+  const changeOutputSize = getChangeOutputSize(
+    getChangeScriptLen(wallet, network, nextChangeIndex),
+  );
+  const recipientScript = getOutputScriptForAddress(toAddress, btcNet);
+  const txNoinputsSize = computeTxNoinputsSize([recipientScript.length]);
+
+  // Reject a recipient output that is below the dust threshold, before selecting
+  // coins. Reference: spender.cpp CreateTransaction (IsDust → "Transaction amount too small").
+  const discardFeerate = new CFeeRate(3_000n);
+  if (amount < getRecipientDust(recipientScript, discardFeerate)) {
+    throw new Error("Transaction amount too small.");
+  }
+
+  const selectionParams = buildCoinSelectionParams({
+    feeRateSatPerKvB: feeRate,
+    changeOutputSize,
+    changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, discardFeerate),
+    txNoinputsSize,
+    paymentValue: amount,
+    subtractFeeOutputs: subtractFeeFromAmount,
+    rng,
+  });
+
+  // All wallet coins are our own (from_me) and the eligibility ladder only needs
+  // conf_mine >= 1, so a sentinel depth is sufficient; unconfirmed maps to 0.
+  const coOutputs = coinInputs.map((c) =>
+    makeCOutput(c, {
+      effectiveFeerate: selectionParams.effectiveFeerate,
+      longTermFeerate: selectionParams.longTermFeerate,
+      currentHeight: c.height > 0 ? c.height + 1000 : 0,
+    }),
+  );
+
+  // When the fee is subtracted from the recipient amount, inputs only need to
+  // cover the amount itself — the fee comes out of the recipient output, so the
+  // not-input fees drop out of the selection target (spender.cpp: not_input_fees
+  // = getFee(subtract_fee_outputs ? 0 : tx_noinputs_size)).
+  const notInputFees = selectionParams.effectiveFeerate.getFee(
+    subtractFeeFromAmount ? 0 : txNoinputsSize,
+  );
+  const selectionTarget = amount + notInputFees;
+  // Manual path: no automatic pool. The timelock oldest-first cap only shapes
+  // the automatic pool, so it does not apply.
+  const candidateOutputs =
+    presetCoins.length > 0
+      ? []
+      : availableCandidates(
+          coOutputs,
+          inputSequence,
+          selectionTarget,
+          selectionParams.subtractFeeOutputs,
+        );
+  const sel = selectCoins(
+    candidateOutputs,
+    selectionTarget,
+    selectionParams,
+    presetCoins.length > 0 ? coOutputs : [],
+  );
+  if (!("result" in sel)) throw humanizeSelectionError(sel.error);
+
+  const selected: PreparedWalletInput[] = sel.result.inputs.map((co) => {
+    const match = preparedInputs.find(
+      (p) => p.utxo.txHash === co.coin.txid && p.utxo.txPos === co.coin.vout,
     );
+    if (!match) throw new Error("Internal: selection picked an unknown UTXO");
+    return match;
+  });
 
-    if (!result) {
-      throw new Error("Insufficient funds to cover amount + fee.");
+  // Step 7: Settle change + fee against the actual signed vsize (spender.cpp CreateTransaction).
+  const totalIn = selected.reduce((s, p) => s + p.utxo.value, 0n);
+  // Amount placed in the recipient output. Differs from the requested `amount`
+  // only when the fee is subtracted from it, where the recipient absorbs the fee.
+  let recipientOutputAmount = amount;
+  let txChangeAddress: string | null;
+  let changeAmount: bigint;
+  let fee: bigint;
+
+  if (subtractFeeFromAmount) {
+    // The recipient pays the fee. Inputs only covered the recipient amount, so
+    // change = totalIn - amount (independent of the fee), and the recipient
+    // output is then reduced by the fee. Reference: spender.cpp CreateTransaction
+    // (reduce output values for subtract-fee-from-amount).
+    const rawChange = totalIn - amount;
+    if (rawChange >= selectionParams.minViableChange) {
+      txChangeAddress = changeAddress;
+      changeAmount = rawChange;
+    } else {
+      txChangeAddress = null;
+      changeAmount = 0n;
     }
-
-    tx = result.tx!;
-    fee = result.fee ?? 0n;
-    txChangeAddress = result.change ? changeAddress : null;
-
-    // Step 7: Add metadata to change output (bip32Derivation, witnessScript, redeemScript)
-    // Reference: FillPsbt calls UpdatePSBTOutput for ALL outputs (walletdb.cpp:1096-1099)
-    // BIP-174: outputs should include redeemScript (0x00), witnessScript (0x01), bip32Derivation (0x02)
-    if (result.change) {
-      const changePayment = deriveDescriptorPayment(wallet.descriptor, network, 1, nextChangeIndex);
-      for (let i = 0; i < tx.outputsLength; i++) {
-        const out = tx.getOutput(i);
-        if (out.script && getOutputAddress(out.script, network) === changeAddress) {
-          tx.updateOutput(i, buildPaymentPsbtMetadata(changePayment, "output", { taprootKeyPath }));
-          break;
-        }
-      }
+    const vsize = estimateSignedTxVsize({
+      selected,
+      wallet,
+      network,
+      toAddress,
+      amount,
+      changeAddress: txChangeAddress,
+      changeAmount,
+      txLockTime,
+      miniscriptPlan: miniscriptPlan ?? null,
+      taprootKeyPath,
+    });
+    fee = selectionParams.effectiveFeerate.getFee(vsize);
+    // The recipient receives everything not going to change or fees. With change
+    // this is amount - fee; without change the would-be change folds in.
+    recipientOutputAmount = totalIn - changeAmount - fee;
+    if (recipientOutputAmount < 0n) {
+      throw new Error("The transaction amount is too small to pay the fee.");
+    }
+    if (recipientOutputAmount < getRecipientDust(recipientScript, discardFeerate)) {
+      throw new Error(
+        "The transaction amount is too small to send after the fee has been deducted.",
+      );
     }
   } else {
-    const selectedPlan = miniscriptPlan ?? taprootKeyPathPlan;
-    if (!selectedPlan) {
-      throw new Error("Unable to select a miniscript signing path");
+    // Default path: the sender adds the fee on top. Recompute the signed vsize
+    // and adjust the change output to absorb any fee overpayment.
+    txChangeAddress =
+      sel.result.getChange(selectionParams.minViableChange, selectionParams.changeFee) > 0n
+        ? changeAddress
+        : null;
+    changeAmount =
+      txChangeAddress != null
+        ? totalIn -
+          amount -
+          selectionParams.effectiveFeerate.getFee(
+            estimateSignedTxVsize({
+              selected,
+              wallet,
+              network,
+              toAddress,
+              amount,
+              changeAddress,
+              changeAmount: sel.result.getChange(
+                selectionParams.minViableChange,
+                selectionParams.changeFee,
+              ),
+              txLockTime,
+              miniscriptPlan: miniscriptPlan ?? null,
+              taprootKeyPath,
+            }),
+          )
+        : 0n;
+
+    if (txChangeAddress != null && changeAmount < selectionParams.minViableChange) {
+      // Change fell below the dust/viability threshold after the fee adjustment.
+      txChangeAddress = null;
+      changeAmount = 0n;
     }
 
-    const selected: PreparedWalletInput[] = [];
-    let totalSelected = 0n;
-
-    for (const prepared of preparedInputs) {
-      selected.push(prepared);
-      totalSelected += prepared.utxo.value;
-
-      const feeWithChange = estimateMiniscriptFee(
+    if (txChangeAddress != null) {
+      fee = totalIn - amount - changeAmount;
+    } else {
+      const vsizeNoChange = estimateSignedTxVsize({
         selected,
-        btcNet,
+        wallet,
+        network,
         toAddress,
         amount,
-        changeAddress,
-        true,
+        changeAddress: null,
+        changeAmount: 0n,
         txLockTime,
-        selectedPlan,
-        feePerByte,
+        miniscriptPlan: miniscriptPlan ?? null,
         taprootKeyPath,
-      );
-      const candidateChange = totalSelected - amount - feeWithChange;
-      if (candidateChange >= 546n) {
-        fee = feeWithChange;
-        txChangeAddress = changeAddress;
-        tx = buildMiniscriptTransaction(
-          selected,
-          wallet,
-          network,
-          toAddress,
-          amount,
-          changeAddress,
-          candidateChange,
-          nextChangeIndex,
-          txLockTime,
-          taprootKeyPath,
-        );
-        break;
+      });
+      if (totalIn < amount + selectionParams.effectiveFeerate.getFee(vsizeNoChange)) {
+        throw new Error("Insufficient funds to cover amount + fee.");
       }
-
-      const feeWithoutChange = estimateMiniscriptFee(
-        selected,
-        btcNet,
-        toAddress,
-        amount,
-        changeAddress,
-        false,
-        txLockTime,
-        selectedPlan,
-        feePerByte,
-        taprootKeyPath,
-      );
-      if (totalSelected >= amount + feeWithoutChange) {
-        fee = feeWithoutChange;
-        txChangeAddress = null;
-        tx = buildMiniscriptTransaction(
-          selected,
-          wallet,
-          network,
-          toAddress,
-          amount,
-          changeAddress,
-          0n,
-          nextChangeIndex,
-          txLockTime,
-          taprootKeyPath,
-        );
-        break;
-      }
-    }
-
-    if (!tx) {
-      throw new Error("Insufficient funds to cover amount + fee.");
+      fee = totalIn - amount;
     }
   }
+
+  const tx: Transaction = buildUnifiedTransaction({
+    selected,
+    parsed,
+    wallet,
+    network,
+    toAddress,
+    amount: recipientOutputAmount,
+    changeAddress: txChangeAddress,
+    changeAmount,
+    changeIndex: nextChangeIndex,
+    txLockTime,
+    taprootKeyPath,
+    rng,
+  });
 
   // Step 8: Add global xpubs
   // Reference: FillPsbt stores signer xpubs in PSBT (walletdb.cpp:1101-1119)
-  if (!tx) {
-    throw new Error("Insufficient funds to cover amount + fee.");
-  }
   if (parsed.kind === "miniscript" && preimages.length > 0) {
     addMiniscriptPreimagesToPsbt(tx, wallet.descriptor, preimages);
   }
@@ -1731,8 +2143,18 @@ export async function createTransaction(
     psbtB64,
     txId,
     fee,
-    feePerByte,
+    feeRateSatPerKvB: feeRate,
+    feeLevel: usingManualFeeRate ? undefined : feeLevel,
+    lockTime: txLockTime,
+    subtractFee: subtractFeeFromAmount,
+    recipientAmount: recipientOutputAmount,
     changeAddress: txChangeAddress,
+    changeAmount,
+    selectedInputs: selected.map((p) => ({
+      txid: p.utxo.txHash,
+      vout: p.utxo.txPos,
+      value: p.utxo.value,
+    })),
     miniscriptPath: miniscriptPlan
       ? {
           index: miniscriptPlan.index,
@@ -2317,7 +2739,7 @@ async function fetchTransactionBatchMap(
   }
 }
 
-async function fetchBlockHeaderBatchMap(
+export async function fetchBlockHeaderBatchMap(
   electrum: ElectrumClient,
   heights: number[],
 ): Promise<Map<number, string>> {
