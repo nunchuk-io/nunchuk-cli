@@ -9,7 +9,8 @@ and confirm the issue still exists before reporting.
 
 ## Reporting a Vulnerability
 
-Please do NOT report security vulnerabilities through public GitHub issues.
+Please do NOT report security vulnerabilities through public GitHub issues,
+discussions, or pull requests.
 
 Instead, report them via:
 
