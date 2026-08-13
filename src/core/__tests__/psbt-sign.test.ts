@@ -8,7 +8,7 @@ import { Transaction, TEST_NETWORK } from "@scure/btc-signer";
 import { TESTNET_VERSIONS, deriveDescriptorPayment } from "../address.js";
 import { buildWalletDescriptor, descriptorChecksum, getUnspendableXpub } from "../descriptor.js";
 import { hasWalletSignerSignedPsbt, signWalletPsbtWithKey } from "../psbt-sign.js";
-import { _clearMasterKeyCache, _closeDatabase, loadMusigNonce } from "../storage.js";
+import { _clearMasterKeyCache, _closeDatabase } from "../storage.js";
 
 const PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS = 0x1a;
 const PSBT_IN_MUSIG2_PUB_NONCE = 0x1b;
@@ -366,7 +366,7 @@ describe("signWalletPsbtWithKey", () => {
     expectTaprootKeypathMusigSigningFlow(descriptor, signers);
   });
 
-  it("can defer consumed MuSig2 nonce deletion until the caller persists the signed PSBT", () => {
+  it("destroys a MuSig2 secret nonce as soon as it signs, preventing reuse", () => {
     const signers = Array.from({ length: 2 }, (_, index) => makeTaprootSigner(index + 1));
     const descriptor = buildWalletDescriptor(
       signers.map((signer) => signer.descriptor),
@@ -376,6 +376,7 @@ describe("signWalletPsbtWithKey", () => {
     );
     let tx = createTaprootSigningPsbt(descriptor, { taprootKeyPath: true });
 
+    // Round 1: both signers publish MuSig2 public nonces (secret nonces saved locally).
     expect(
       signWalletPsbtWithKey(
         tx,
@@ -397,14 +398,34 @@ describe("signWalletPsbtWithKey", () => {
     ).toBe(1);
     tx = roundtripPsbt(tx);
 
-    const consumedNonceIds: string[] = [];
-    const context = { ...musigContext(0), consumedNonceIds };
+    // This is exactly the state a malicious coordinator would replay after a failed
+    // upload: signer 0's public nonce is present, but no partial signature yet.
+    const replayed = roundtripPsbt(tx);
+    const signed = roundtripPsbt(tx);
+
+    // Signer 0 produces its partial signature — the secret nonce is destroyed in the
+    // same step, before the signed PSBT can leave the process.
     expect(
-      signWalletPsbtWithKey(tx, signers[0].accountKey, signers[0].fingerprint, descriptor, context),
+      signWalletPsbtWithKey(
+        signed,
+        signers[0].accountKey,
+        signers[0].fingerprint,
+        descriptor,
+        musigContext(0),
+      ),
     ).toBe(1);
 
-    expect(consumedNonceIds).toHaveLength(1);
-    expect(loadMusigNonce(context.email, context.network, consumedNonceIds[0])).not.toBeNull();
+    // Replaying the pre-signature PSBT must NOT re-sign with the same secret nonce:
+    // the record is gone, so signing fails loudly instead of reusing the nonce.
+    expect(() =>
+      signWalletPsbtWithKey(
+        replayed,
+        signers[0].accountKey,
+        signers[0].fingerprint,
+        descriptor,
+        musigContext(0),
+      ),
+    ).toThrow(/Missing local MuSig2 secret nonce/);
   });
 
   it("starts MuSig2 signing for all DEFAULT taproot paths present in the PSBT", () => {

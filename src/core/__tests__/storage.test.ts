@@ -25,6 +25,7 @@ import {
   saveMusigNonce,
   loadMusigNonce,
   removeMusigNonce,
+  takeMusigNonce,
   addSandboxId,
   removeSandboxId,
   getSandboxIds,
@@ -560,6 +561,29 @@ describe("musig nonce storage", () => {
     saveMusigNonce(email, network, nonce);
     removeMusigNonce(email, network, nonce.nonceId);
     expect(loadMusigNonce(email, network, nonce.nonceId)).toBeNull();
+  });
+
+  it("takeMusigNonce hands the nonce to exactly one caller and deletes it atomically", () => {
+    const email = trackEmail(uniqueEmail("musig"));
+    const nonce = makeNonce("nonce-1");
+    saveMusigNonce(email, network, nonce);
+
+    // First claim wins and receives the full record.
+    const first = takeMusigNonce(email, network, nonce.nonceId);
+    expect(first).toEqual(nonce);
+
+    // A second claim — a concurrent loser or a sequential retry — gets nothing:
+    // the take-and-delete is a single atomic statement, so the nonce is already gone.
+    const second = takeMusigNonce(email, network, nonce.nonceId);
+    expect(second).toBeNull();
+
+    // The row is durably removed.
+    expect(loadMusigNonce(email, network, nonce.nonceId)).toBeNull();
+  });
+
+  it("takeMusigNonce returns null for an unknown nonce id", () => {
+    const email = trackEmail(uniqueEmail("musig"));
+    expect(takeMusigNonce(email, network, "does-not-exist")).toBeNull();
   });
 });
 

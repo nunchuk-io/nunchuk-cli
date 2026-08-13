@@ -16,7 +16,7 @@ import { estimateFeeRateLevels } from "../core/fees.js";
 import { ApiClient } from "../core/api-client.js";
 import { ElectrumClient, addressToScripthash, parseBlockTime } from "../core/electrum.js";
 import { deriveDescriptorAddresses } from "../core/address.js";
-import { loadWallet, removeMusigNonce } from "../core/storage.js";
+import { loadWallet } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { getLockedOutpoints } from "../core/coin-store.js";
 import { reconcileNewCoins } from "../core/coin-rules.js";
@@ -1043,7 +1043,6 @@ txCommand
       const wantsLocalSigning = !options.psbt && (hasExplicitSigner || !hasPreimages);
       let didAddPreimages = false;
       let didLocalSign = false;
-      const consumedMusigNonceIds: string[] = [];
 
       if (options.psbt) {
         if (options.xprv || options.fingerprint) {
@@ -1098,7 +1097,6 @@ txCommand
                 network,
                 walletId: wallet.walletId,
                 txId: options.txId,
-                consumedNonceIds: consumedMusigNonceIds,
               },
             );
             didLocalSign = true;
@@ -1131,9 +1129,6 @@ txCommand
 
       if (merged.changed) {
         await uploadTransaction(client, wallet, merged.psbtB64, options.txId);
-      }
-      for (const nonceId of new Set(consumedMusigNonceIds)) {
-        removeMusigNonce(email, network, nonceId);
       }
 
       const detail = await decodePsbtDetailBestEffort(merged.psbtB64, network, wallet);

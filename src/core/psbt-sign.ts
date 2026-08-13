@@ -30,7 +30,7 @@ import {
   PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
   PSBT_IN_MUSIG2_PUB_NONCE,
 } from "./musig.js";
-import { loadMusigNonce, removeMusigNonce, saveMusigNonce } from "./storage.js";
+import { saveMusigNonce, takeMusigNonce } from "./storage.js";
 import { aggregateMusigCompressedPubkey, aggregateMusigPubkey, toXOnlyPubkey } from "./taproot.js";
 import { bytesEqual, combinationIndices, compareBytes, concatBytes, hash160 } from "./utils.js";
 
@@ -47,7 +47,6 @@ export interface MuSig2SigningContext {
   network: Network;
   walletId: string;
   txId: string;
-  consumedNonceIds?: string[];
   maxPathScan?: number;
   now?: () => Date;
 }
@@ -632,14 +631,6 @@ function buildNonceExtraInput(
   );
 }
 
-function consumeMusigNonce(context: MuSig2SigningContext, nonceId: string): void {
-  if (context.consumedNonceIds) {
-    context.consumedNonceIds.push(nonceId);
-    return;
-  }
-  removeMusigNonce(context.email, context.network, nonceId);
-}
-
 function getCandidatePublicNonces(
   input: ReturnType<Transaction["getInput"]>,
   aggregatePubkey: Uint8Array,
@@ -930,7 +921,12 @@ function signTaprootKeypathMusigCandidate(
     signer.participant.pubkey,
   );
   if (!existingPartialSig) {
-    const stored = loadMusigNonce(context.email, context.network, nonceId);
+    // A MuSig2 secret nonce must produce at most one partial signature (BIP327):
+    // signing twice with the same secret nonce over different aggregate nonces leaks
+    // the private key. Claim the nonce with an atomic take-and-delete so that neither a
+    // retry nor a concurrent process can ever sign with it again — the record is gone
+    // before it is used.
+    const stored = takeMusigNonce(context.email, context.network, nonceId);
     if (!stored) {
       throw new Error(
         "Missing local MuSig2 secret nonce. Recreate this transaction or sign from the device that published the nonce.",
@@ -942,12 +938,12 @@ function signTaprootKeypathMusigCandidate(
       stored.signerPubkey !== toHex(signer.participant.pubkey) ||
       !bytesEqual(fromBase64(stored.publicNonce), existingPublicNonce)
     ) {
-      removeMusigNonce(context.email, context.network, nonceId);
       throw new Error(
         "Local MuSig2 nonce does not match this PSBT. Recreate the transaction to avoid nonce reuse.",
       );
     }
 
+    const secretNonce = new Uint8Array(fromBase64(stored.secretNonce));
     const aggregateNonce = musig2.nonceAggregate(publicNonces);
     const session = new musig2.Session(
       aggregateNonce,
@@ -956,15 +952,10 @@ function signTaprootKeypathMusigCandidate(
       [candidate.tweak],
       [true],
     );
-    const partialSig = session.sign(
-      new Uint8Array(fromBase64(stored.secretNonce)),
-      signer.privateKey,
-    );
+    const partialSig = session.sign(secretNonce, signer.privateKey);
     if (!session.partialSigVerify(partialSig, publicNonces, signer.index)) {
       throw new Error("Generated MuSig2 key-path partial signature failed verification");
     }
-
-    consumeMusigNonce(context, nonceId);
     const didAddParticipants = ensureMusigParticipantsField(
       tx,
       inputIndex,
@@ -1086,7 +1077,9 @@ function signTaprootMusigCandidate(
     candidate.leafHash,
   );
   if (!existingPartialSig) {
-    const stored = loadMusigNonce(context.email, context.network, nonceId);
+    // Claim the secret nonce with an atomic take-and-delete so it can never be reused
+    // (BIP327 single-use), even by a concurrent process. See the key-path branch above.
+    const stored = takeMusigNonce(context.email, context.network, nonceId);
     if (!stored) {
       throw new Error(
         "Missing local MuSig2 secret nonce. Recreate this transaction or sign from the device that published the nonce.",
@@ -1098,27 +1091,22 @@ function signTaprootMusigCandidate(
       stored.signerPubkey !== toHex(signer.participant.pubkey) ||
       !bytesEqual(fromBase64(stored.publicNonce), existingPublicNonce)
     ) {
-      removeMusigNonce(context.email, context.network, nonceId);
       throw new Error(
         "Local MuSig2 nonce does not match this PSBT. Recreate the transaction to avoid nonce reuse.",
       );
     }
 
+    const secretNonce = new Uint8Array(fromBase64(stored.secretNonce));
     const aggregateNonce = musig2.nonceAggregate(publicNonces);
     const session = new musig2.Session(
       aggregateNonce,
       candidate.participants.map((participant) => participant.pubkey),
       msg,
     );
-    const partialSig = session.sign(
-      new Uint8Array(fromBase64(stored.secretNonce)),
-      signer.privateKey,
-    );
+    const partialSig = session.sign(secretNonce, signer.privateKey);
     if (!session.partialSigVerify(partialSig, publicNonces, signer.index)) {
       throw new Error("Generated MuSig2 partial signature failed verification");
     }
-
-    consumeMusigNonce(context, nonceId);
     const didAddParticipants = ensureMusigParticipantsField(
       tx,
       inputIndex,
