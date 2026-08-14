@@ -569,6 +569,31 @@ function addTapScriptSig(
   return true;
 }
 
+// Reject any input whose sighash flag is not the canonical value — SIGHASH_DEFAULT for
+// taproot, SIGHASH_ALL otherwise. Other flags come from the untrusted server PSBT and
+// would authorize a different transaction. The input type is read from the spent output
+// script, not the PSBT's forgeable taproot hints.
+function assertCanonicalSighash(tx: Transaction, inputIndex: number): void {
+  const input = tx.getInput(inputIndex);
+  const sighash = input.sighashType;
+  if (sighash === undefined) {
+    return; // unset — the signing paths default to the canonical value
+  }
+
+  const isTaproot = taprootOutputKeyFromScript(getPrevOut(input).script) !== null;
+  const expected = isTaproot ? SignatureHash.DEFAULT : SignatureHash.ALL;
+
+  if (sighash !== expected) {
+    const flag = `0x${sighash.toString(16).padStart(2, "0")}`;
+    const inputType = isTaproot ? "Taproot" : "non-Taproot";
+    const expectedName = isTaproot ? "SIGHASH_DEFAULT" : "SIGHASH_ALL";
+    throw new Error(
+      `Refusing to sign input ${inputIndex}: sighash flag ${flag} is not the canonical sighash ` +
+        `for a ${inputType} input (expected ${expectedName}). Recreate this transaction.`,
+    );
+  }
+}
+
 function appendTaprootSighash(signature: Uint8Array, sighash: number): Uint8Array {
   return sighash === SignatureHash.DEFAULT
     ? signature
@@ -582,6 +607,7 @@ function taprootScriptPathMessage(
   version: number,
 ): { msg: Uint8Array; sighash: number } {
   const input = tx.getInput(inputIndex);
+  assertCanonicalSighash(tx, inputIndex);
   const sighash = input.sighashType ?? SignatureHash.DEFAULT;
   const prevOuts = Array.from({ length: tx.inputsLength }, (_, index) =>
     getPrevOut(tx.getInput(index)),
@@ -763,6 +789,7 @@ function taprootKeypathMessage(
   inputIndex: number,
 ): { msg: Uint8Array; sighash: number } {
   const input = tx.getInput(inputIndex);
+  assertCanonicalSighash(tx, inputIndex);
   const sighash = input.sighashType ?? SignatureHash.DEFAULT;
   const prevOuts = Array.from({ length: tx.inputsLength }, (_, index) =>
     getPrevOut(tx.getInput(index)),
@@ -1203,6 +1230,7 @@ function signMiniscriptInput(
   pubkey: Uint8Array,
 ): boolean {
   const input = tx.getInput(inputIndex);
+  assertCanonicalSighash(tx, inputIndex);
   const existing = input.partialSig as Array<[Uint8Array, Uint8Array]> | undefined;
   if (existing?.some(([existingPubkey]) => bytesEqual(existingPubkey, pubkey))) {
     return false;
@@ -1519,6 +1547,12 @@ export function signWalletPsbtWithKey(
   const isTaprootDescriptor =
     parsedDescriptor?.addressType === "TAPROOT" &&
     (parsedDescriptor.kind === "multisig" || parsedDescriptor.kind === "miniscript");
+
+  // Refuse the whole transaction if any input carries a sighash flag that would not
+  // commit to the reviewed outputs, before producing any signature or MuSig2 nonce.
+  for (let i = 0; i < tx.inputsLength; i++) {
+    assertCanonicalSighash(tx, i);
+  }
 
   let signed = 0;
   for (let i = 0; i < tx.inputsLength; i++) {
