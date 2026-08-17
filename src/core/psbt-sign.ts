@@ -30,7 +30,7 @@ import {
   PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
   PSBT_IN_MUSIG2_PUB_NONCE,
 } from "./musig.js";
-import { loadMusigNonce, removeMusigNonce, saveMusigNonce } from "./storage.js";
+import { saveMusigNonce, takeMusigNonce } from "./storage.js";
 import { aggregateMusigCompressedPubkey, aggregateMusigPubkey, toXOnlyPubkey } from "./taproot.js";
 import { bytesEqual, combinationIndices, compareBytes, concatBytes, hash160 } from "./utils.js";
 
@@ -47,7 +47,6 @@ export interface MuSig2SigningContext {
   network: Network;
   walletId: string;
   txId: string;
-  consumedNonceIds?: string[];
   maxPathScan?: number;
   now?: () => Date;
 }
@@ -570,6 +569,31 @@ function addTapScriptSig(
   return true;
 }
 
+// Reject any input whose sighash flag is not the canonical value — SIGHASH_DEFAULT for
+// taproot, SIGHASH_ALL otherwise. Other flags come from the untrusted server PSBT and
+// would authorize a different transaction. The input type is read from the spent output
+// script, not the PSBT's forgeable taproot hints.
+function assertCanonicalSighash(tx: Transaction, inputIndex: number): void {
+  const input = tx.getInput(inputIndex);
+  const sighash = input.sighashType;
+  if (sighash === undefined) {
+    return; // unset — the signing paths default to the canonical value
+  }
+
+  const isTaproot = taprootOutputKeyFromScript(getPrevOut(input).script) !== null;
+  const expected = isTaproot ? SignatureHash.DEFAULT : SignatureHash.ALL;
+
+  if (sighash !== expected) {
+    const flag = `0x${sighash.toString(16).padStart(2, "0")}`;
+    const inputType = isTaproot ? "Taproot" : "non-Taproot";
+    const expectedName = isTaproot ? "SIGHASH_DEFAULT" : "SIGHASH_ALL";
+    throw new Error(
+      `Refusing to sign input ${inputIndex}: sighash flag ${flag} is not the canonical sighash ` +
+        `for a ${inputType} input (expected ${expectedName}). Recreate this transaction.`,
+    );
+  }
+}
+
 function appendTaprootSighash(signature: Uint8Array, sighash: number): Uint8Array {
   return sighash === SignatureHash.DEFAULT
     ? signature
@@ -583,6 +607,7 @@ function taprootScriptPathMessage(
   version: number,
 ): { msg: Uint8Array; sighash: number } {
   const input = tx.getInput(inputIndex);
+  assertCanonicalSighash(tx, inputIndex);
   const sighash = input.sighashType ?? SignatureHash.DEFAULT;
   const prevOuts = Array.from({ length: tx.inputsLength }, (_, index) =>
     getPrevOut(tx.getInput(index)),
@@ -630,14 +655,6 @@ function buildNonceExtraInput(
     `${context.walletId}:${context.txId}:${inputIndex}:${toHex(leafHash)}:${toHex(signerPubkey)}`,
     "utf8",
   );
-}
-
-function consumeMusigNonce(context: MuSig2SigningContext, nonceId: string): void {
-  if (context.consumedNonceIds) {
-    context.consumedNonceIds.push(nonceId);
-    return;
-  }
-  removeMusigNonce(context.email, context.network, nonceId);
 }
 
 function getCandidatePublicNonces(
@@ -772,6 +789,7 @@ function taprootKeypathMessage(
   inputIndex: number,
 ): { msg: Uint8Array; sighash: number } {
   const input = tx.getInput(inputIndex);
+  assertCanonicalSighash(tx, inputIndex);
   const sighash = input.sighashType ?? SignatureHash.DEFAULT;
   const prevOuts = Array.from({ length: tx.inputsLength }, (_, index) =>
     getPrevOut(tx.getInput(index)),
@@ -930,7 +948,12 @@ function signTaprootKeypathMusigCandidate(
     signer.participant.pubkey,
   );
   if (!existingPartialSig) {
-    const stored = loadMusigNonce(context.email, context.network, nonceId);
+    // A MuSig2 secret nonce must produce at most one partial signature (BIP327):
+    // signing twice with the same secret nonce over different aggregate nonces leaks
+    // the private key. Claim the nonce with an atomic take-and-delete so that neither a
+    // retry nor a concurrent process can ever sign with it again — the record is gone
+    // before it is used.
+    const stored = takeMusigNonce(context.email, context.network, nonceId);
     if (!stored) {
       throw new Error(
         "Missing local MuSig2 secret nonce. Recreate this transaction or sign from the device that published the nonce.",
@@ -942,12 +965,12 @@ function signTaprootKeypathMusigCandidate(
       stored.signerPubkey !== toHex(signer.participant.pubkey) ||
       !bytesEqual(fromBase64(stored.publicNonce), existingPublicNonce)
     ) {
-      removeMusigNonce(context.email, context.network, nonceId);
       throw new Error(
         "Local MuSig2 nonce does not match this PSBT. Recreate the transaction to avoid nonce reuse.",
       );
     }
 
+    const secretNonce = new Uint8Array(fromBase64(stored.secretNonce));
     const aggregateNonce = musig2.nonceAggregate(publicNonces);
     const session = new musig2.Session(
       aggregateNonce,
@@ -956,15 +979,10 @@ function signTaprootKeypathMusigCandidate(
       [candidate.tweak],
       [true],
     );
-    const partialSig = session.sign(
-      new Uint8Array(fromBase64(stored.secretNonce)),
-      signer.privateKey,
-    );
+    const partialSig = session.sign(secretNonce, signer.privateKey);
     if (!session.partialSigVerify(partialSig, publicNonces, signer.index)) {
       throw new Error("Generated MuSig2 key-path partial signature failed verification");
     }
-
-    consumeMusigNonce(context, nonceId);
     const didAddParticipants = ensureMusigParticipantsField(
       tx,
       inputIndex,
@@ -1086,7 +1104,9 @@ function signTaprootMusigCandidate(
     candidate.leafHash,
   );
   if (!existingPartialSig) {
-    const stored = loadMusigNonce(context.email, context.network, nonceId);
+    // Claim the secret nonce with an atomic take-and-delete so it can never be reused
+    // (BIP327 single-use), even by a concurrent process. See the key-path branch above.
+    const stored = takeMusigNonce(context.email, context.network, nonceId);
     if (!stored) {
       throw new Error(
         "Missing local MuSig2 secret nonce. Recreate this transaction or sign from the device that published the nonce.",
@@ -1098,27 +1118,22 @@ function signTaprootMusigCandidate(
       stored.signerPubkey !== toHex(signer.participant.pubkey) ||
       !bytesEqual(fromBase64(stored.publicNonce), existingPublicNonce)
     ) {
-      removeMusigNonce(context.email, context.network, nonceId);
       throw new Error(
         "Local MuSig2 nonce does not match this PSBT. Recreate the transaction to avoid nonce reuse.",
       );
     }
 
+    const secretNonce = new Uint8Array(fromBase64(stored.secretNonce));
     const aggregateNonce = musig2.nonceAggregate(publicNonces);
     const session = new musig2.Session(
       aggregateNonce,
       candidate.participants.map((participant) => participant.pubkey),
       msg,
     );
-    const partialSig = session.sign(
-      new Uint8Array(fromBase64(stored.secretNonce)),
-      signer.privateKey,
-    );
+    const partialSig = session.sign(secretNonce, signer.privateKey);
     if (!session.partialSigVerify(partialSig, publicNonces, signer.index)) {
       throw new Error("Generated MuSig2 partial signature failed verification");
     }
-
-    consumeMusigNonce(context, nonceId);
     const didAddParticipants = ensureMusigParticipantsField(
       tx,
       inputIndex,
@@ -1215,6 +1230,7 @@ function signMiniscriptInput(
   pubkey: Uint8Array,
 ): boolean {
   const input = tx.getInput(inputIndex);
+  assertCanonicalSighash(tx, inputIndex);
   const existing = input.partialSig as Array<[Uint8Array, Uint8Array]> | undefined;
   if (existing?.some(([existingPubkey]) => bytesEqual(existingPubkey, pubkey))) {
     return false;
@@ -1531,6 +1547,12 @@ export function signWalletPsbtWithKey(
   const isTaprootDescriptor =
     parsedDescriptor?.addressType === "TAPROOT" &&
     (parsedDescriptor.kind === "multisig" || parsedDescriptor.kind === "miniscript");
+
+  // Refuse the whole transaction if any input carries a sighash flag that would not
+  // commit to the reviewed outputs, before producing any signature or MuSig2 nonce.
+  for (let i = 0; i < tx.inputsLength; i++) {
+    assertCanonicalSighash(tx, i);
+  }
 
   let signed = 0;
   for (let i = 0; i < tx.inputsLength; i++) {

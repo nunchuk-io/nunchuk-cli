@@ -442,6 +442,26 @@ function encryptedRemoveById(
   db?.prepare(`DELETE FROM ${table} WHERE ${idColumn} = ?`).run(id);
 }
 
+// Atomically claim a row: read and delete it in a single autocommitted statement so
+// that exactly one caller ever receives it. Concurrent or repeat callers get null.
+// (SQLite runs DELETE ... RETURNING as one atomic, durably-committed operation.)
+function encryptedTakeById<T>(
+  email: string,
+  network: Network,
+  table: "musig_nonces",
+  idColumn: "nonce_id",
+  id: string,
+): T | null {
+  const db = getDatabase(email, network, { create: false });
+  if (!db) return null;
+
+  const row = db
+    .prepare(`DELETE FROM ${table} WHERE ${idColumn} = ? RETURNING encrypted`)
+    .get(id) as Record<string, unknown> | undefined;
+  if (!(row?.encrypted instanceof Uint8Array)) return null;
+  return deserializeEncrypted<T>(row.encrypted);
+}
+
 // ── Shared helpers ───────────────────────────────────────────────────
 
 export function emailHash(email: string): string {
@@ -720,6 +740,17 @@ export function loadMusigNonce(
 
 export function removeMusigNonce(email: string, network: Network, nonceId: string): void {
   encryptedRemoveById(email, network, "musig_nonces", "nonce_id", nonceId);
+}
+
+// Claim-and-delete a MuSig2 secret nonce in one atomic step. Returns the record to
+// exactly one caller and removes it durably; any concurrent or later caller gets null.
+// This enforces the BIP327 single-use rule even across concurrent CLI processes.
+export function takeMusigNonce(
+  email: string,
+  network: Network,
+  nonceId: string,
+): StoredMusigNonce | null {
+  return encryptedTakeById<StoredMusigNonce>(email, network, "musig_nonces", "nonce_id", nonceId);
 }
 
 export function _deleteAccountData(email: string): void {
