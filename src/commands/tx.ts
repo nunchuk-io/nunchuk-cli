@@ -31,7 +31,11 @@ import type { ChangeTagPlan } from "../core/change-intents.js";
 import { secretOpen } from "../core/crypto.js";
 import { hashMessage } from "../core/wallet-keys.js";
 import { resolveSignerKeys } from "../core/signer-key.js";
-import { hasWalletSignerSignedPsbt, signWalletPsbtWithKey } from "../core/psbt-sign.js";
+import {
+  aggregateWalletPsbtMusig2,
+  hasWalletSignerSignedPsbt,
+  signWalletPsbtWithKey,
+} from "../core/psbt-sign.js";
 import { parseDescriptor } from "../core/descriptor.js";
 import { finalizeMiniscriptPsbt } from "../core/miniscript-finalize.js";
 import {
@@ -1112,7 +1116,10 @@ txCommand
 
       let merged;
       try {
-        merged = combinePendingPsbt(pendingTx.psbt, nextPsbtB64);
+        merged = combinePendingPsbt(pendingTx.psbt, nextPsbtB64, {
+          descriptor: wallet.descriptor,
+          network,
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         printError(
@@ -1217,6 +1224,7 @@ txCommand
           if (parsedDescriptor.kind === "miniscript") {
             finalizeMiniscriptPsbt(tx, wallet.descriptor, network);
           } else {
+            aggregateWalletPsbtMusig2(tx, wallet.descriptor, network);
             tx.finalize();
           }
         } catch (err) {
@@ -1225,7 +1233,6 @@ txCommand
             console.error(`Error: Failed to finalize miniscript transaction: ${msg}`);
           } else {
             console.error(`Error: Failed to finalize transaction: ${msg}`);
-            console.error(`Wallet requires ${wallet.m} signatures to broadcast.`);
           }
           process.exit(1);
         }

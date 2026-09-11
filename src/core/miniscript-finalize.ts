@@ -20,6 +20,7 @@ import {
   type MiniscriptTransactionState,
 } from "./miniscript.js";
 import { toXOnlyPubkey } from "./taproot.js";
+import { aggregateWalletPsbtMusig2 } from "./psbt-sign.js";
 
 interface WitnessStackResult {
   hasSignature: boolean;
@@ -615,6 +616,7 @@ export function finalizeMiniscriptPsbt(
     throw new Error("Only native segwit and taproot miniscript descriptors are supported");
   }
   if (addressType === "TAPROOT") {
+    aggregateWalletPsbtMusig2(tx, descriptor, network);
     const txState = getTransactionState(tx);
     let requiredPreimages = 0;
     let requiredSignatures = 0;

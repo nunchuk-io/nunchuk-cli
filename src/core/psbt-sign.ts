@@ -1158,6 +1158,50 @@ function signTaprootMusigCandidate(
   return aggregateMuSigIfReady(tx, inputIndex, candidate, msg, sighash);
 }
 
+/** Aggregate complete MuSig2 sessions using public PSBT data only. */
+export function aggregateWalletPsbtMusig2(
+  tx: Transaction,
+  descriptor: string,
+  network: Network,
+): number {
+  const parsed = parseDescriptor(descriptor);
+  if (!descriptorHasMusig2Path(parsed)) {
+    return 0;
+  }
+
+  let changed = 0;
+  for (let i = 0; i < tx.inputsLength; i++) {
+    const input = tx.getInput(i);
+    if (
+      input.finalScriptWitness?.length ||
+      !input.unknown?.some(([key]) => key.type === PSBT_IN_MUSIG2_PARTIAL_SIG)
+    ) {
+      continue;
+    }
+    const path = getInputDerivationPath(input, descriptor, network);
+    if (!path) {
+      continue;
+    }
+
+    for (const candidate of enumerateKeypathCandidates(input, parsed, network, path)) {
+      const { msg, sighash } = taprootKeypathMessage(tx, i);
+      if (aggregateKeypathMuSigIfReady(tx, i, candidate, msg, sighash)) {
+        changed++;
+      }
+    }
+    for (const candidate of [
+      ...enumerateMultisigMusigCandidates(input, parsed, network, path),
+      ...enumerateMiniscriptMusigCandidates(input, descriptor, parsed, network, path),
+    ]) {
+      const { msg, sighash } = taprootScriptPathMessage(tx, i, candidate.script, candidate.version);
+      if (aggregateMuSigIfReady(tx, i, candidate, msg, sighash)) {
+        changed++;
+      }
+    }
+  }
+  return changed;
+}
+
 function signTaprootMusigInput(
   tx: Transaction,
   inputIndex: number,

@@ -47,11 +47,12 @@ import {
   PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
   PSBT_IN_MUSIG2_PUB_NONCE,
 } from "./musig.js";
-import { combinationIndices } from "./utils.js";
+import { bytesEqual, combinationIndices } from "./utils.js";
 import { formatBtc, formatSats, getOutputAddress } from "./format.js";
 import { estimateFeeRate } from "./fees.js";
 import { timelockFromK, type TimelockBased } from "./miniscript.js";
 import { toXOnlyPubkey } from "./taproot.js";
+import { aggregateWalletPsbtMusig2 } from "./psbt-sign.js";
 import type { AddressType } from "./address-type.js";
 import {
   CFeeRate,
@@ -2420,11 +2421,16 @@ export interface CombinePendingPsbtResult {
 export function combinePendingPsbt(
   currentPsbtB64: string,
   nextPsbtB64: string,
+  wallet?: { descriptor: string; network: Network },
 ): CombinePendingPsbtResult {
   const currentTx = Transaction.fromPSBT(Buffer.from(currentPsbtB64, "base64"), {
     allowUnknown: true,
   });
   const currentCanonical = Buffer.from(currentTx.toPSBT());
+  const currentUnknownInputs = Array.from(
+    { length: currentTx.inputsLength },
+    (_, i) => currentTx.getInput(i).unknown ?? [],
+  );
 
   try {
     currentTx.combine(
@@ -2443,6 +2449,29 @@ export function combinePendingPsbt(
     throw err;
   }
 
+  // scure 2.0.1 replaces unknown arrays during combine. MuSig2 fields live in
+  // these arrays, so preserve contributions from both PSBTs and reject conflicts.
+  for (let i = 0; i < currentTx.inputsLength; i++) {
+    const fields = new Map<string, PsbtUnknownEntry>();
+    for (const [key, value] of [
+      ...currentUnknownInputs[i],
+      ...(currentTx.getInput(i).unknown ?? []),
+    ]) {
+      const id = `${key.type}:${Buffer.from(key.key).toString("hex")}`;
+      const existing = fields.get(id);
+      if (existing && !bytesEqual(existing[1], value)) {
+        throw new Error(`Conflicting PSBT input field (input ${i}, type ${key.type})`);
+      }
+      fields.set(id, [key, value]);
+    }
+    if (fields.size > 0) {
+      currentTx.updateInput(i, { unknown: [...fields.values()] }, true);
+    }
+  }
+
+  if (wallet) {
+    aggregateWalletPsbtMusig2(currentTx, wallet.descriptor, wallet.network);
+  }
   const combinedCanonical = Buffer.from(currentTx.toPSBT());
   return {
     psbtB64: combinedCanonical.toString("base64"),
@@ -2461,8 +2490,17 @@ export function decodePsbtDetail(
   options?: PendingTxDecodeOptions,
 ): PendingTxDetail | null {
   try {
-    const tx = Transaction.fromPSBT(Buffer.from(psbtB64, "base64"), { allowUnknown: true });
+    let tx = Transaction.fromPSBT(Buffer.from(psbtB64, "base64"), { allowUnknown: true });
     const parsedDescriptor = walletDescriptor ? parseDescriptor(walletDescriptor) : null;
+    if (walletDescriptor && !tx.isFinal) {
+      try {
+        const aggregated = tx.clone();
+        aggregateWalletPsbtMusig2(aggregated, walletDescriptor, network);
+        tx = aggregated;
+      } catch {
+        // Keep invalid/incomplete sessions visible, without treating them as aggregated.
+      }
+    }
     const outputClassifier =
       options?.outputClassifier ?? createWalletOutputClassifier(network, walletDescriptor);
     const musig2Keysets = getTaprootMusig2KeysetStatuses(tx, parsedDescriptor);

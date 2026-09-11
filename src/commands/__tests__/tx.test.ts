@@ -1320,6 +1320,10 @@ describe("tx sign", () => {
       { from: "user" },
     );
 
+    expect(mockCombinePendingPsbt).toHaveBeenCalledWith(TEST_PSBT_B64, expect.any(String), {
+      descriptor: TEST_WALLET.descriptor,
+      network: "mainnet",
+    });
     expect(mockFetchPsbtInputTimelockMetadata).toHaveBeenCalledWith(
       TEST_PSBT_B64,
       expect.any(Object),

@@ -8,7 +8,13 @@ import { Transaction, TEST_NETWORK } from "@scure/btc-signer";
 import { SignatureHash } from "@scure/btc-signer/transaction.js";
 import { TESTNET_VERSIONS, deriveDescriptorPayment } from "../address.js";
 import { buildWalletDescriptor, descriptorChecksum, getUnspendableXpub } from "../descriptor.js";
-import { hasWalletSignerSignedPsbt, signWalletPsbtWithKey } from "../psbt-sign.js";
+import {
+  aggregateWalletPsbtMusig2,
+  hasWalletSignerSignedPsbt,
+  signWalletPsbtWithKey,
+} from "../psbt-sign.js";
+import { combinePendingPsbt, decodePsbtDetail } from "../transaction.js";
+import { finalizeMiniscriptPsbt } from "../miniscript-finalize.js";
 import { _clearMasterKeyCache, _closeDatabase } from "../storage.js";
 
 const PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS = 0x1a;
@@ -824,4 +830,133 @@ describe("signWalletPsbtWithKey sighash policy", () => {
     );
     expect(tx.getInput(0).partialSig).toBeUndefined();
   });
+});
+
+describe("aggregateWalletPsbtMusig2", () => {
+  function importedPartials(keyPath: boolean, miniscript = false) {
+    const signers = Array.from({ length: 3 }, (_, i) => makeTaprootSigner(i + 1));
+    const descriptors = signers.map((signer) => signer.descriptor);
+    const body = keyPath
+      ? `tr(musig(${descriptors[0]},${descriptors[1]})/<0;1>/*,pk(${descriptors[0]}/<0;1>/*))`
+      : `tr(${getUnspendableXpub(descriptors)}/<0;1>/*,{pk(musig(${descriptors[0]}/<0;1>/*,${descriptors[1]}/<0;1>/*)),pk(musig(${descriptors[0]}/<0;1>/*,${descriptors[1]}/<0;1>/*,${descriptors[2]}/<0;1>/*))})`;
+    const descriptor = miniscript
+      ? `${body}#${descriptorChecksum(body)}`
+      : buildWalletDescriptor(descriptors, 2, "TAPROOT", keyPath ? "DEFAULT" : "DISABLE_KEY_PATH");
+    const tx = createTaprootSigningPsbt(descriptor, { taprootKeyPath: keyPath });
+    for (let i = 0; i < 2; i++) {
+      signWalletPsbtWithKey(
+        tx,
+        signers[i].accountKey,
+        signers[i].fingerprint,
+        descriptor,
+        musigContext(i),
+      );
+    }
+    // Each device receives the same nonce round and independently returns its partial.
+    const partials = [0, 1].map((i) => {
+      const partial = roundtripPsbt(tx);
+      signWalletPsbtWithKey(
+        partial,
+        signers[i].accountKey,
+        signers[i].fingerprint,
+        descriptor,
+        musigContext(i),
+      );
+      expect(partial.getInput(0).tapKeySig).toBeUndefined();
+      expect(partial.getInput(0).tapScriptSig).toBeUndefined();
+      return Buffer.from(partial.toPSBT()).toString("base64");
+    });
+    const combined = combinePendingPsbt(partials[0], partials[1]);
+    return { descriptor, descriptors, partials, combined: combined.psbtB64 };
+  }
+
+  it.each([
+    { keyPath: false, miniscript: false },
+    { keyPath: true, miniscript: false },
+    { keyPath: false, miniscript: true },
+    { keyPath: true, miniscript: true },
+  ])(
+    "aggregates imported partials (keyPath=$keyPath, miniscript=$miniscript)",
+    ({ keyPath, miniscript }) => {
+      const { descriptor, descriptors, partials, combined } = importedPartials(keyPath, miniscript);
+      const tx = Transaction.fromPSBT(Buffer.from(combined, "base64"), { allowUnknown: true });
+      const unsigned = tx.unsignedTx;
+      expect(() => tx.clone().finalize()).toThrow("finalize/taproot: unknown input");
+      expect(decodePsbtDetail(combined, "testnet", 2, descriptors, descriptor)?.status).toBe(
+        "READY_TO_BROADCAST",
+      );
+
+      // Aggregation needs neither a signer key nor a local nonce storage context.
+      expect(aggregateWalletPsbtMusig2(tx, descriptor, "testnet")).toBe(1);
+      expect(aggregateWalletPsbtMusig2(tx, descriptor, "testnet")).toBe(0);
+      expect(tx.unsignedTx).toEqual(unsigned);
+      if (miniscript) {
+        const unaggregated = Transaction.fromPSBT(Buffer.from(combined, "base64"), {
+          allowUnknown: true,
+        });
+        finalizeMiniscriptPsbt(unaggregated, descriptor, "testnet");
+        expect(unaggregated.isFinal).toBe(true);
+      }
+      tx.finalize();
+      expect(tx.isFinal).toBe(true);
+      expect(tx.getInput(0).finalScriptWitness).toHaveLength(keyPath ? 1 : 3);
+      expect(aggregateWalletPsbtMusig2(tx, descriptor, "testnet")).toBe(0);
+
+      const imported = combinePendingPsbt(partials[0], partials[1], {
+        descriptor,
+        network: "testnet",
+      });
+      const importedTx = Transaction.fromPSBT(Buffer.from(imported.psbtB64, "base64"), {
+        allowUnknown: true,
+      });
+      expect(imported.changed).toBe(true);
+      importedTx.finalize();
+      expect(importedTx.extract()).toEqual(tx.extract());
+      expect(
+        combinePendingPsbt(imported.psbtB64, partials[0], { descriptor, network: "testnet" })
+          .changed,
+      ).toBe(false);
+    },
+    20_000,
+  );
+
+  it.each([false, true])(
+    "leaves incomplete sessions pending (keyPath=%s)",
+    (keyPath) => {
+      const { descriptor, descriptors, partials } = importedPartials(keyPath);
+      const tx = Transaction.fromPSBT(Buffer.from(partials[0], "base64"), { allowUnknown: true });
+      const before = tx.toPSBT();
+      expect(aggregateWalletPsbtMusig2(tx, descriptor, "testnet")).toBe(0);
+      expect(tx.toPSBT()).toEqual(before);
+      expect(decodePsbtDetail(partials[0], "testnet", 2, descriptors, descriptor)?.status).not.toBe(
+        "READY_TO_BROADCAST",
+      );
+    },
+    20_000,
+  );
+
+  it.each([false, true])(
+    "rejects invalid partial signatures (keyPath=%s)",
+    (keyPath) => {
+      const { descriptor, descriptors, combined } = importedPartials(keyPath);
+      const tx = Transaction.fromPSBT(Buffer.from(combined, "base64"), { allowUnknown: true });
+      const unknown = tx.getInput(0).unknown!;
+      const partial = unknown.find(([key]) => key.type === PSBT_IN_MUSIG2_PARTIAL_SIG)!;
+      partial[1][0] ^= 1;
+      tx.updateInput(0, { unknown }, true);
+      expect(() => aggregateWalletPsbtMusig2(tx, descriptor, "testnet")).toThrow(
+        /Invalid MuSig2 .*partial signature/,
+      );
+      const invalid = Buffer.from(tx.toPSBT()).toString("base64");
+      expect(decodePsbtDetail(invalid, "testnet", 2, descriptors, descriptor)?.status).toBe(
+        "PENDING_SIGNATURES",
+      );
+      expect(() =>
+        combinePendingPsbt(invalid, invalid, { descriptor, network: "testnet" }),
+      ).toThrow(/Invalid MuSig2 .*partial signature/);
+      expect(tx.getInput(0).tapKeySig).toBeUndefined();
+      expect(tx.getInput(0).tapScriptSig).toBeUndefined();
+    },
+    20_000,
+  );
 });

@@ -189,6 +189,29 @@ async function createServerTxEvent(txId: string, psbt: string) {
 }
 
 describe("combinePendingPsbt", () => {
+  it("unions unknown input fields by type and key and rejects conflicting values", () => {
+    const makePsbt = (type: number, value: number) => {
+      const tx = Transaction.fromPSBT(Buffer.from(createPsbtB64(), "base64"), {
+        allowUnknown: true,
+      });
+      tx.updateInput(0, {
+        unknown: [[{ type, key: new Uint8Array([1]) }, new Uint8Array([value])]],
+      });
+      return Buffer.from(tx.toPSBT()).toString("base64");
+    };
+    const first = makePsbt(0x1b, 1);
+    const second = makePsbt(0x1c, 2);
+    const result = combinePendingPsbt(first, second);
+    const merged = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"), {
+      allowUnknown: true,
+    });
+    expect(merged.getInput(0).unknown).toHaveLength(2);
+    expect(combinePendingPsbt(result.psbtB64, first).changed).toBe(false);
+    expect(() => combinePendingPsbt(first, makePsbt(0x1b, 3))).toThrow(
+      "Conflicting PSBT input field",
+    );
+  });
+
   it("marks changed when the provided PSBT adds a new signature", () => {
     const currentPsbtB64 = createPsbtB64();
     const nextPsbtB64 = createSignedPsbtB64();
