@@ -47,7 +47,7 @@ import {
   PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
   PSBT_IN_MUSIG2_PUB_NONCE,
 } from "./musig.js";
-import { bytesEqual, combinationIndices } from "./utils.js";
+import { bytesEqual, combinationIndices, isRecord } from "./utils.js";
 import { formatBtc, formatSats, getOutputAddress } from "./format.js";
 import { estimateFeeRate } from "./fees.js";
 import { timelockFromK, type TimelockBased } from "./miniscript.js";
@@ -2348,6 +2348,39 @@ export async function fetchPendingTransaction(
     throw new Error("Transaction not found on server");
   }
   return pending;
+}
+
+// Like fetchPendingTransaction, but resolves to null when the server has no pending
+// transaction under this txId. The backend answers 5404 for a missing transaction
+// AND for a missing wallet, so only the "Transaction not found" message is treated
+// as absence; a bad wallet still throws.
+export async function fetchPendingTransactionIfExists(
+  client: ApiClient,
+  wallet: WalletData,
+  txId: string,
+): Promise<PendingTx | null> {
+  try {
+    return await fetchPendingTransaction(client, wallet, txId);
+  } catch (err) {
+    if (isTransactionNotFoundError(err)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+function isTransactionNotFoundError(err: unknown): boolean {
+  if (err instanceof Error) {
+    return err.message === "Transaction not found on server";
+  }
+  if (isRecord(err)) {
+    return (
+      String(err.error) === "5404" &&
+      typeof err.message === "string" &&
+      err.message.startsWith("Transaction not found")
+    );
+  }
+  return false;
 }
 
 // Fetch all pending transactions

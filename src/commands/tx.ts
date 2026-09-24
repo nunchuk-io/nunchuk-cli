@@ -38,6 +38,7 @@ import {
 } from "../core/psbt-sign.js";
 import { parseDescriptor } from "../core/descriptor.js";
 import { finalizeMiniscriptPsbt } from "../core/miniscript-finalize.js";
+import { importPsbt, readPsbtFile } from "../core/psbt-import.js";
 import {
   addMiniscriptPreimagesToPsbt,
   formatMiniscriptPreimageRequirement,
@@ -1191,6 +1192,121 @@ txCommand
         console.log(
           `\nBroadcast with: nunchuk tx broadcast --wallet ${options.wallet} --tx-id ${options.txId}`,
         );
+      }
+    } catch (err) {
+      printError(err as { error: string; message: string }, cmd);
+    }
+  });
+
+// tx import — Import a PSBT file: create it as a new pending transaction, or merge
+// it into the existing one with the same txid. Devices pick it up from the server.
+txCommand
+  .command("import")
+  .description("Import a PSBT file into the wallet's pending transactions")
+  .requiredOption("--wallet <wallet-id>", "Wallet ID")
+  .requiredOption("--file <path>", "Path to the PSBT file (binary, base64, or hex)")
+  .action(async (options, cmd) => {
+    try {
+      const { apiKey, network, email } = getGlobals(cmd);
+      const wallet = requireWallet(email, network, options.wallet);
+      const client = new ApiClient(apiKey, network);
+
+      const psbtB64 = readPsbtFile(options.file);
+
+      // Best-effort chain access: used to resolve inputs the PSBT does not carry
+      // UTXO data for, to reject already-spent inputs, and for timelock metadata.
+      const server = getElectrumServer(network);
+      const electrum = new ElectrumClient();
+      let electrumReady = false;
+      try {
+        try {
+          await electrum.connect(server.host, server.port, server.protocol);
+          await electrum.serverVersion("nunchuk-cli", "1.4");
+          electrumReady = true;
+        } catch {
+          electrumReady = false;
+        }
+
+        const result = await importPsbt({
+          client,
+          wallet,
+          network,
+          psbtB64,
+          electrum: electrumReady ? electrum : null,
+        });
+
+        const detail = electrumReady
+          ? await decodePsbtDetailWithTimelockMetadata(result.psbtB64, network, wallet, electrum)
+          : decodePsbtDetail(result.psbtB64, network, wallet.m, wallet.signers, wallet.descriptor);
+
+        for (const warning of result.warnings) {
+          console.error(`Warning: ${warning}`);
+        }
+
+        const globals = cmd.optsWithGlobals();
+        if (globals.json) {
+          print(
+            {
+              txId: result.txId,
+              action: result.action,
+              updated: result.updated,
+              status: detail?.status ?? "PENDING_SIGNATURES",
+              signatures: detail ? `${detail.signedCount}/${detail.requiredCount}` : undefined,
+              fee: detail?.fee,
+              subAmount: detail?.subAmount,
+              subAmountBtc: detail?.subAmountBtc,
+              outputs: detail?.outputs,
+              signers: detail?.signers,
+              keysets: detail?.keysets,
+              nonces: detail?.nonces,
+              miniscriptPath: detail?.miniscriptPath,
+              miniscriptPaths: detail?.miniscriptPaths,
+              timelockedUntil: detail?.timelockedUntil,
+            },
+            cmd,
+          );
+          return;
+        }
+
+        if (result.action === "created") {
+          console.log("Transaction imported and uploaded to group server.");
+        } else if (result.action === "merged") {
+          console.log("Transaction PSBT combined and uploaded to group server.");
+        } else {
+          console.log("Imported PSBT added no new data. Group server PSBT unchanged.");
+        }
+        console.log(`  Transaction ID: ${result.txId}`);
+        console.log(`  Action: ${result.action}`);
+        const sigInfo = detail ? ` (${detail.signedCount}/${detail.requiredCount} signatures)` : "";
+        console.log(`  Status: ${detail?.status ?? "PENDING_SIGNATURES"}${sigInfo}`);
+        if (detail) {
+          console.log(`  Fee: ${detail.feeBtc} (${detail.fee})`);
+          console.log(`  Send: ${detail.subAmountBtc} (${detail.subAmount})`);
+          console.log("  Outputs:");
+          detail.outputs.forEach((o, i) => {
+            const changeLabel = o.isChange ? " (change)" : "";
+            console.log(
+              `    ${i}: ${o.amountBtc} (${o.amount}) -> ${o.address ?? "unknown"}${changeLabel}`,
+            );
+          });
+          printProgressMap("Signers", detail.signers);
+          printProgressMap("Nonces", detail.nonces);
+          printKeysets(detail.keysets);
+          printMiniscriptPathSummary(detail.miniscriptPath);
+          printMiniscriptPathsSummary(detail.miniscriptPaths, detail.miniscriptPath?.index);
+          printTimelockSummary(detail.timelockedUntil);
+        }
+        if (detail?.status === "READY_TO_BROADCAST") {
+          console.log(
+            `\nBroadcast with: nunchuk tx broadcast --wallet ${options.wallet} --tx-id ${result.txId}`,
+          );
+        } else {
+          console.log(
+            `\nSign with: nunchuk tx sign --wallet ${options.wallet} --tx-id ${result.txId}`,
+          );
+        }
+      } finally {
+        electrum.close();
       }
     } catch (err) {
       printError(err as { error: string; message: string }, cmd);

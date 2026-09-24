@@ -17,7 +17,9 @@ const {
   mockReconcileNewCoins,
   mockStoreChangeTagIntent,
   mockHeadersSubscribe,
+  mockImportPsbt,
   mockLoadWallet,
+  mockReadPsbtFile,
   mockRemoveMusigNonce,
   mockUploadTransaction,
 } = vi.hoisted(() => ({
@@ -35,7 +37,9 @@ const {
   mockReconcileNewCoins: vi.fn(),
   mockStoreChangeTagIntent: vi.fn(),
   mockHeadersSubscribe: vi.fn(),
+  mockImportPsbt: vi.fn(),
   mockLoadWallet: vi.fn(),
+  mockReadPsbtFile: vi.fn(),
   mockRemoveMusigNonce: vi.fn(),
   mockUploadTransaction: vi.fn(),
 }));
@@ -84,6 +88,11 @@ vi.mock("../../core/coin-rules.js", () => ({
 vi.mock("../../core/change-intents.js", () => ({
   planChangeTags: mockPlanChangeTags,
   storeChangeTagIntent: mockStoreChangeTagIntent,
+}));
+
+vi.mock("../../core/psbt-import.js", () => ({
+  importPsbt: mockImportPsbt,
+  readPsbtFile: mockReadPsbtFile,
 }));
 
 vi.mock("../../core/electrum.js", () => ({
@@ -1332,5 +1341,177 @@ describe("tx sign", () => {
     expect(logSpy).toHaveBeenCalledWith(
       "  Timelock: pending TIME_LOCK until 1893508506 (2030-01-01 14:35:06 UTC)",
     );
+  });
+});
+
+describe("tx import", () => {
+  const IMPORT_DETAIL = {
+    fee: "308 sat",
+    feeBtc: "0.00000308 BTC",
+    outputs: [
+      {
+        address: "bc1qrecipient",
+        amount: "20000000 sat",
+        amountBtc: "0.20000000 BTC",
+        isChange: false,
+      },
+    ],
+    requiredCount: 1,
+    signers: { "6cbbb5d0": false },
+    signedCount: 0,
+    status: "PENDING_SIGNATURES",
+    subAmount: "20000000 sat",
+    subAmountBtc: "0.20000000 BTC",
+    txId: "",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockHeadersSubscribe.mockResolvedValue({ height: 900_000, hex: "tip-header" });
+    mockFetchPsbtInputTimelockMetadata.mockResolvedValue([]);
+    mockReadPsbtFile.mockReturnValue(TEST_PSBT_B64);
+    mockDecodePsbtDetail.mockReturnValue(IMPORT_DETAIL);
+    mockImportPsbt.mockResolvedValue({
+      txId: "imported-tx-id",
+      action: "created",
+      psbtB64: TEST_PSBT_B64,
+      updated: true,
+      warnings: [],
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function runImport(extraArgs: string[] = []) {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.option("--json");
+    root.addCommand(txCommand);
+    await root.parseAsync(
+      ["tx", "import", "--wallet", "jk74e3up", "--file", "/tmp/a.psbt", ...extraArgs],
+      { from: "user" },
+    );
+  }
+
+  it("reads the file, imports it with the open electrum client, and prints the created summary", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runImport();
+
+    expect(mockReadPsbtFile).toHaveBeenCalledWith("/tmp/a.psbt");
+    expect(mockImportPsbt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wallet: TEST_WALLET,
+        network: "mainnet",
+        psbtB64: TEST_PSBT_B64,
+        electrum: expect.any(Object),
+      }),
+    );
+    expect(logSpy).toHaveBeenCalledWith("Transaction imported and uploaded to group server.");
+    expect(logSpy).toHaveBeenCalledWith("  Transaction ID: imported-tx-id");
+    expect(logSpy).toHaveBeenCalledWith("  Action: created");
+    expect(logSpy).toHaveBeenCalledWith("  Status: PENDING_SIGNATURES (0/1 signatures)");
+    expect(logSpy).toHaveBeenCalledWith(
+      "\nSign with: nunchuk tx sign --wallet jk74e3up --tx-id imported-tx-id",
+    );
+  });
+
+  it("prints the merged wording and a broadcast hint once ready", async () => {
+    mockImportPsbt.mockResolvedValue({
+      txId: "imported-tx-id",
+      action: "merged",
+      psbtB64: TEST_PSBT_B64,
+      updated: true,
+      warnings: [],
+    });
+    mockDecodePsbtDetail.mockReturnValue({
+      ...IMPORT_DETAIL,
+      signedCount: 1,
+      status: "READY_TO_BROADCAST",
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runImport();
+
+    expect(logSpy).toHaveBeenCalledWith("Transaction PSBT combined and uploaded to group server.");
+    expect(logSpy).toHaveBeenCalledWith(
+      "\nBroadcast with: nunchuk tx broadcast --wallet jk74e3up --tx-id imported-tx-id",
+    );
+  });
+
+  it("prints the unchanged wording and surfaces warnings on stderr", async () => {
+    mockImportPsbt.mockResolvedValue({
+      txId: "imported-tx-id",
+      action: "unchanged",
+      psbtB64: TEST_PSBT_B64,
+      updated: false,
+      warnings: ["Chain unavailable; skipped the spent-input check."],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await runImport();
+
+    expect(logSpy).toHaveBeenCalledWith(
+      "Imported PSBT added no new data. Group server PSBT unchanged.",
+    );
+    expect(errSpy).toHaveBeenCalledWith(
+      "Warning: Chain unavailable; skipped the spent-input check.",
+    );
+  });
+
+  it("emits the action and detail fields as JSON", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runImport(["--json"]);
+
+    const payload = JSON.parse(logSpy.mock.calls[0][0] as string);
+    expect(payload).toMatchObject({
+      txId: "imported-tx-id",
+      action: "created",
+      updated: true,
+      status: "PENDING_SIGNATURES",
+      signatures: "0/1",
+      fee: "308 sat",
+      signers: { "6cbbb5d0": false },
+    });
+  });
+
+  it("reports a wallet mismatch through printError and exits 1", async () => {
+    mockImportPsbt.mockRejectedValue({
+      error: "PSBT_WALLET_MISMATCH",
+      message:
+        "PSBT does not belong to wallet jk74e3up (input 0: abc:0 not an address of wallet jk74e3up)",
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    await expect(runImport()).rejects.toThrow("process.exit");
+
+    expect(errSpy).toHaveBeenCalledWith(
+      "Error: PSBT does not belong to wallet jk74e3up (input 0: abc:0 not an address of wallet jk74e3up)",
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("reports a missing file without contacting the server", async () => {
+    mockReadPsbtFile.mockImplementation(() => {
+      throw { error: "FILE_NOT_FOUND", message: "Could not read file: /tmp/a.psbt" };
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    await expect(runImport()).rejects.toThrow("process.exit");
+
+    expect(errSpy).toHaveBeenCalledWith("Error: Could not read file: /tmp/a.psbt");
+    expect(mockImportPsbt).not.toHaveBeenCalled();
   });
 });

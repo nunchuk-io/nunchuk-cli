@@ -51,7 +51,7 @@ export interface MuSig2SigningContext {
   now?: () => Date;
 }
 
-interface InputDerivationPath {
+export interface InputDerivationPath {
   chain: 0 | 1;
   index: number;
 }
@@ -147,7 +147,7 @@ function inputPathCandidate(path: number[] | undefined): InputDerivationPath | n
   return { chain, index };
 }
 
-function inputDerivationPathCandidates(
+export function inputDerivationPathCandidates(
   input: ReturnType<Transaction["getInput"]>,
 ): InputDerivationPath[] {
   const candidates: InputDerivationPath[] = [];
@@ -177,18 +177,15 @@ function inputDerivationPathCandidates(
   return candidates.sort((a, b) => a.chain - b.chain || a.index - b.index);
 }
 
-function getInputDerivationPath(
-  input: ReturnType<Transaction["getInput"]>,
+// Find the (chain, index) at which the wallet descriptor derives `script`. Tries the
+// candidate paths hinted by the PSBT first, then scans both chains up to maxScan.
+export function findDescriptorPathForScript(
+  script: Uint8Array,
+  candidates: InputDerivationPath[],
   descriptor: string,
   network: Network,
   maxScan = 1000,
 ): InputDerivationPath | null {
-  const script = input.witnessUtxo?.script;
-  const candidates = inputDerivationPathCandidates(input);
-  if (!script) {
-    return candidates.length === 1 ? candidates[0] : null;
-  }
-
   const scriptHex = toHex(script);
   for (const { chain, index } of candidates) {
     try {
@@ -215,6 +212,20 @@ function getInputDerivationPath(
   }
 
   return null;
+}
+
+function getInputDerivationPath(
+  input: ReturnType<Transaction["getInput"]>,
+  descriptor: string,
+  network: Network,
+  maxScan = 1000,
+): InputDerivationPath | null {
+  const script = input.witnessUtxo?.script;
+  const candidates = inputDerivationPathCandidates(input);
+  if (!script) {
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+  return findDescriptorPathForScript(script, candidates, descriptor, network, maxScan);
 }
 
 function deriveMultisigParticipants(
@@ -574,13 +585,22 @@ function addTapScriptSig(
 // would authorize a different transaction. The input type is read from the spent output
 // script, not the PSBT's forgeable taproot hints.
 function assertCanonicalSighash(tx: Transaction, inputIndex: number): void {
-  const input = tx.getInput(inputIndex);
-  const sighash = input.sighashType;
+  assertCanonicalSighashForPrevout(tx, inputIndex, getPrevOut(tx.getInput(inputIndex)).script);
+}
+
+// Same check for a caller that has already resolved the spent output script itself
+// (e.g. from the chain when the PSBT carries no UTXO data).
+export function assertCanonicalSighashForPrevout(
+  tx: Transaction,
+  inputIndex: number,
+  prevoutScript: Uint8Array,
+): void {
+  const sighash = tx.getInput(inputIndex).sighashType;
   if (sighash === undefined) {
     return; // unset — the signing paths default to the canonical value
   }
 
-  const isTaproot = taprootOutputKeyFromScript(getPrevOut(input).script) !== null;
+  const isTaproot = taprootOutputKeyFromScript(prevoutScript) !== null;
   const expected = isTaproot ? SignatureHash.DEFAULT : SignatureHash.ALL;
 
   if (sighash !== expected) {

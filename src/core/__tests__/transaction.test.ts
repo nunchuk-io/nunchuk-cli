@@ -22,6 +22,7 @@ import {
   createTransaction,
   decodePsbtDetail,
   fetchPendingTransaction,
+  fetchPendingTransactionIfExists,
   fetchPendingTransactions,
   fetchPendingTxInputTimelockMetadataBatch,
   fetchPsbtInputTimelockMetadata,
@@ -285,6 +286,70 @@ describe("fetchPendingTransactions", () => {
     await expect(fetchPendingTransaction(client, TEST_WALLET, "deleted-tx")).rejects.toThrow(
       "Transaction not found on server",
     );
+  });
+});
+
+describe("fetchPendingTransactionIfExists", () => {
+  it("returns the pending transaction when the server has it", async () => {
+    const client = {
+      get: vi.fn(async () => ({
+        transaction: await createServerTxEvent("active-tx", createPsbtB64("active")),
+      })),
+    } as unknown as ApiClient;
+
+    await expect(
+      fetchPendingTransactionIfExists(client, TEST_WALLET, "active-tx"),
+    ).resolves.toEqual({ txId: "active-tx", psbt: createPsbtB64("active") });
+  });
+
+  it("resolves null on the backend's 5404 'Transaction not found' error", async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw { error: "5404", message: "Transaction not found: abc123" };
+      }),
+    } as unknown as ApiClient;
+
+    await expect(
+      fetchPendingTransactionIfExists(client, TEST_WALLET, "missing"),
+    ).resolves.toBeNull();
+  });
+
+  it("resolves null for a deleted (empty-PSBT) transaction event", async () => {
+    const client = {
+      get: vi.fn(async () => ({
+        transaction: await createServerTxEvent("deleted-tx", ""),
+      })),
+    } as unknown as ApiClient;
+
+    await expect(
+      fetchPendingTransactionIfExists(client, TEST_WALLET, "deleted-tx"),
+    ).resolves.toBeNull();
+  });
+
+  it("rethrows a 5404 that is not about the transaction (e.g. wallet not found)", async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw { error: "5404", message: "Wallet not found: xyz" };
+      }),
+    } as unknown as ApiClient;
+
+    await expect(fetchPendingTransactionIfExists(client, TEST_WALLET, "missing")).rejects.toEqual({
+      error: "5404",
+      message: "Wallet not found: xyz",
+    });
+  });
+
+  it("rethrows other API errors", async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw { error: "NETWORK_ERROR", message: "offline" };
+      }),
+    } as unknown as ApiClient;
+
+    await expect(fetchPendingTransactionIfExists(client, TEST_WALLET, "missing")).rejects.toEqual({
+      error: "NETWORK_ERROR",
+      message: "offline",
+    });
   });
 });
 

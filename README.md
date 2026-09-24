@@ -131,6 +131,9 @@ nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --psbt <signed-psbt>
 nunchuk tx broadcast --wallet <wallet-id> --tx-id <tx-id>
 
+# Import a PSBT created or signed elsewhere (Sparrow, hardware wallet, script)
+nunchuk tx import --wallet <wallet-id> --file payout.psbt
+
 # For miniscript, optionally choose a path and attach required hash preimages
 nunchuk tx create --wallet <wallet-id> --to <address> --amount 100000 --miniscript-path 0
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --preimage <32-byte-hex>

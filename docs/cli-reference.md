@@ -972,12 +972,43 @@ nunchuk tx sign --wallet w123 --tx-id tx456 --xprv "xprv..."
 # Attach required miniscript hash preimages
 nunchuk tx sign --wallet w123 --tx-id tx456 --preimage <32-byte-hex>
 
-# Or merge an externally signed PSBT
+# Or merge an externally signed PSBT (for large PSBTs, prefer `tx import --file`)
 nunchuk tx sign --wallet w123 --tx-id tx456 --psbt "cHNidP8B..."
 
 # Taproot multisig (MuSig2): run twice — first publishes nonces, second adds partial signatures
 nunchuk tx sign --wallet w123 --tx-id tx456   # → PENDING_NONCE / PENDING_SIGNATURES
 nunchuk tx sign --wallet w123 --tx-id tx456   # → READY_TO_BROADCAST
+```
+
+### `nunchuk tx import`
+
+Import a PSBT file into the wallet's pending transactions. Use this when the transaction was built or signed outside Nunchuk — Sparrow, a hardware wallet's SD card, a script — and you want it to show up on every member's device without touching the mobile app.
+
+The command derives the transaction ID from the PSBT and checks the group server:
+
+- **Not on the server yet** → the PSBT is uploaded as a new pending transaction (`action: created`).
+- **Already pending** → the file is combined with the server copy and the merged PSBT is re-uploaded, so new signatures, nonces, or preimages reach every device (`action: merged`). If the file adds nothing, nothing is uploaded (`action: unchanged`, still exit 0).
+
+Devices pick the transaction up automatically. Sign and broadcast it with `tx sign` / `tx broadcast` as usual.
+
+The file may be a binary `.psbt`, base64 text, or hex text (detected by content). Before uploading, the PSBT is checked: every input must resolve to an address of the wallet, must use the canonical sighash flag, and — when the chain is reachable — must still be an unspent output of that address with the amount the PSBT claims. A PSBT for a different wallet, an already-broadcast transaction, a non-canonical sighash, forged UTXO data, or a raw signed transaction (not a PSBT) is rejected. PSBT v2 is not supported by Nunchuk apps.
+
+| Option                 | Required | Description                                          |
+| ---------------------- | -------- | ---------------------------------------------------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID                                            |
+| `--file <path>`        | Yes      | Path to the PSBT file (binary, base64, or hex text)  |
+
+```bash
+# Import an unsigned PSBT built in Sparrow, then sign and broadcast from the CLI
+nunchuk tx import --wallet w123 --file payout.psbt
+nunchuk tx sign --wallet w123 --tx-id <tx-id>
+nunchuk tx broadcast --wallet w123 --tx-id <tx-id>
+
+# Import a PSBT that was signed on a hardware wallet (merges the signature)
+nunchuk tx import --wallet w123 --file payout-signed.psbt
+
+# Machine-readable result (action: created | merged | unchanged)
+nunchuk tx import --wallet w123 --file payout.psbt --json
 ```
 
 ### `nunchuk tx broadcast`
