@@ -851,17 +851,19 @@ Create a new transaction. Builds a PSBT locally and uploads to the group server 
 | Option                      | Required | Description                                                         |
 | --------------------------- | -------- | ------------------------------------------------------------------- |
 | `--wallet <wallet-id>`      | Yes      | Wallet ID                                                           |
-| `--to <address>`            | Yes      | Recipient Bitcoin address                                           |
-| `--amount <value>`          | Cond.    | Amount to send (default unit: sat). Required unless `--send-all`     |
-| `--send-all`                | No       | Send the entire wallet balance (fee is subtracted from the amount; overrides `--amount`) |
-| `--currency <code>`         | No       | Currency for amount. Supports BTC, USD, and fiat codes              |
+| `--to <address>`            | Cond.    | Recipient Bitcoin address (single recipient). Exactly one of `--to`, `--recipient`, `--recipients-file` is required |
+| `--amount <value>`          | Cond.    | Amount to send to `--to` (default unit: sat). Required with `--to` unless `--send-all` |
+| `--recipient <address:amount[:currency]>` | No | Pay this recipient; repeat for several. The amount is in the row's currency, else `--currency` |
+| `--recipients-file <path>`  | No       | CSV (`address,amount[,currency]`) or JSON file of recipients, for large batches |
+| `--send-all`                | No       | Send the entire wallet balance to `--to` (fee is subtracted from the amount; overrides `--amount`). Single recipient only |
+| `--currency <code>`         | No       | Default currency for every amount in the invocation. Supports BTC, USD, and fiat codes |
 | `--miniscript-path <index>` | No       | Select a miniscript signing path by index                           |
 | `--taproot-script-path`     | No       | Spend a taproot wallet through its script path instead of the key path |
 | `--preimage <hex>`          | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
 | `--fee-rate <sat/vB>`       | No       | Manual fee rate in sat/vB; overrides the auto-estimate              |
 | `--fee-level <level>`       | No       | Fee level for the auto-estimate: `economy`, `standard`, or `priority` |
 | `--anti-fee-sniping`        | No       | Pin `nLockTime` to the current block height (a path's own locktime wins) |
-| `--subtract-fee`            | No       | Subtract the network fee from the amount (recipient receives amount minus fee) |
+| `--subtract-fee`            | No       | Subtract the network fee from the amount(s): split equally across recipients, remainder on the first |
 | `--coin <txid:vout>`        | No       | Spend exactly this coin; repeat for multiple (manual coin selection)  |
 | `--from-tag <name>`         | No       | Restrict automatic selection to coins carrying this tag (case-sensitive) |
 | `--from-collection <name>`  | No       | Restrict automatic selection to a collection's member coins (case-sensitive) |
@@ -874,6 +876,22 @@ When auto-estimating, the fee **level** is resolved by precedence: `--fee-level 
 **Subtract fee from amount.** `--subtract-fee` takes the network fee out of the recipient amount instead of adding it on top of the inputs. The recipient receives `amount - fee`, while the wallet's total spend stays at `amount`. With a change output the recipient gets `amount - fee` and change holds the remainder; without change the would-be change folds into the recipient, which then receives `total inputs - fee`. The send is rejected when the amount cannot cover the fee (`The transaction amount is too small to pay the fee.`) or the reduced recipient output would fall below the dust threshold (`The transaction amount is too small to send after the fee has been deducted.`). The output reports the reduced value (`Recipient receives: <btc>`) and the `recipientAmount` / `subtractFee` JSON fields.
 
 **Send all funds.** `--send-all` sweeps the entire wallet balance to the recipient: it spends every coin, forces `--subtract-fee` on (so the recipient receives `balance - fee`), and produces no change. Exactly one of `--amount` / `--send-all` is required; when both are given, `--amount` is ignored and a warning is printed (`Warning: --amount is ignored when --send-all is set.`). The displayed amount is the swept balance, marked `(send all)`.
+
+**Multiple recipients.** One transaction can pay many addresses (payroll, vendor payouts): one output per recipient plus, usually, one change output. Recipients are given in exactly one of three forms per invocation:
+
+- `--to <address> --amount <value>` — a single recipient (unchanged).
+- `--recipient <address>:<amount>[:<currency>]`, repeated — a few recipients on the command line. `:` never appears in an address, so the split is unambiguous; BIP-21 `bitcoin:` URIs are not accepted.
+- `--recipients-file <path>` — many recipients from a file, detected by content. **CSV**: `address,amount[,currency]` per line, blank lines and `#` comments ignored, an optional `address,amount` header skipped, whitespace and CRLF tolerated, no quoting. **JSON**: an array of `{ "address", "amount", "currency"? }` objects (`amount` may be a number or a string; unknown keys are ignored).
+
+Units resolve per row: the row's own currency, else `--currency`, else `sat`, so a batch may mix `USD`, `EUR`, `BTC`, and sat rows; fiat is converted per row with a single market-rate fetch. Recipients are paid **in the order given** (output index N is row N; the Nunchuk apps sort outputs by address instead, which is cosmetic), and the change output is inserted at a random position. Coin selection targets the sum of all amounts; the change target follows libnunchuk and uses the average recipient amount.
+
+`--subtract-fee` with several recipients splits the fee **equally** across all of them; the first listed recipient also pays the remainder that does not divide evenly (libnunchuk / Bitcoin Core semantics). Each reduced output is re-checked against its dust threshold. `--send-all` is single-recipient only and is rejected with a batch.
+
+Validation happens before any network access: exactly one input form; no `--amount` / `--send-all` with `--recipient` or a file; every address valid for the wallet's network; every amount at least 1 sat; no duplicate address (compared by output script, so a bech32 address in another letter-case still collides); every recipient above its dust threshold; and the estimated signed weight within the 400,000 WU standard limit (checked at create time, not only at broadcast, so co-signers never sign an unbroadcastable batch). Errors name the offending flag (`--recipient #2`) or file row (`payouts.csv line 4`).
+
+Output: with two or more recipients the human output prints a `Recipients (n):` block (each address with its amount and, under `--subtract-fee`, what it receives) and `Amount:` is the sum requested. JSON always carries `recipients: [{ address, amount, receives }]`; the single-recipient fields `recipientAmount` (and `recipient` in `tx draft`) are present only when there is exactly one recipient, so existing scripts see no change. In `--json` mode every failure is a `{ "error", "message" }` object: `INVALID_PARAM` / `FILE_NOT_FOUND` for input validation, `TX_BUILD_FAILED` for anything the transaction builder rejects (dust, insufficient funds, too large).
+
+Practical limits: Windows caps a command line at 8,191 characters (roughly 90 `--recipient` flags), so use a file for large batches. A batch above the standard weight limit must be split across files.
 
 **Anti-fee sniping.** `--anti-fee-sniping` pins the transaction's `nLockTime` to the current block height so the transaction offers no advantage to a miner who might reorganize recent blocks to claim its fee. A spending path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY condition) always takes precedence — the flag only fills a locktime that would otherwise be 0, so a path with a relative timelock (an `older` / OP_CHECKSEQUENCEVERIFY condition, which sets the input sequence instead) still receives a chain-tip locktime. The default input sequence enforces the locktime, and it adds no virtual size, so fees are unchanged. The effective locktime is shown in the output (`Anti-fee sniping: locktime <height>`) and the `lockTime` JSON field. It costs one extra Electrum call (`headersSubscribe`) on the connection `tx create` already holds open.
 
@@ -906,6 +924,10 @@ nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --from-collection "
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --from-tag kyc --from-collection "Exchange A"
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --change-tags none
 nunchuk tx create --wallet w123 --to bc1q... --amount 100000 --change-tags kyc,cold
+nunchuk tx create --wallet w123 --recipient bc1q...aaa:100000 --recipient bc1q...bbb:250000   # two recipients, sats
+nunchuk tx create --wallet w123 --recipient bc1q...aaa:100:USD --recipient bc1q...bbb:0.002:BTC  # per-row units
+nunchuk tx create --wallet w123 --recipients-file payouts.csv                                   # many recipients
+nunchuk tx create --wallet w123 --recipients-file payouts.json --currency USD --subtract-fee    # fee split across recipients
 ```
 
 ### `nunchuk tx fees`
@@ -925,13 +947,13 @@ JSON mode adds the raw sat/kvB values (`prioritySatPerKvB`, `standardSatPerKvB`,
 
 Preview a transaction without creating it. Builds the same PSBT that `tx create` would (coin selection, fee, change), shows the "confirm" details, and **never uploads to the group server or writes storage**.
 
-Takes the **same options as [`tx create`](#nunchuk-tx-create)** — `--wallet`, `--to`, `--amount`, `--send-all`, `--currency`, `--fee-rate`, `--fee-level`, `--anti-fee-sniping`, `--subtract-fee`, `--coin`, `--from-tag`, `--from-collection`, `--change-tags`, `--miniscript-path`, `--taproot-script-path`, `--preimage` — plus one extra:
+Takes the **same options as [`tx create`](#nunchuk-tx-create)** — `--wallet`, `--to`, `--amount`, `--recipient`, `--recipients-file`, `--send-all`, `--currency`, `--fee-rate`, `--fee-level`, `--anti-fee-sniping`, `--subtract-fee`, `--coin`, `--from-tag`, `--from-collection`, `--change-tags`, `--miniscript-path`, `--taproot-script-path`, `--preimage` — plus one extra:
 
 | Option           | Required | Description                                                       |
 | ---------------- | -------- | ----------------------------------------------------------------- |
 | `--fiat <code>`  | No       | Show fiat values alongside BTC for each line (e.g. `--fiat USD`)  |
 
-Because it calls the same builder as `tx create`, the fee/selection are identical. The output shows the recipient and amount, the fee rate and **estimated fee**, the **total amount** (`recipient amount + fee`), the **change** address and value (with the tags it would inherit), and the **input coins** (value + block date + confirmations, marked `(selected manually)` under `--coin`). With `--subtract-fee` it also shows `Recipient receives`; with `--anti-fee-sniping` it shows the effective locktime. Unlike `tx create`, the draft stores no change-tag intent.
+Because it calls the same builder as `tx create`, the fee/selection are identical. The output shows the recipient and amount (or a `Recipients (n):` block for a batch, with per-line fiat values under `--fiat`), the fee rate and **estimated fee**, the **total amount** (sum of the recipient outputs `+ fee`), the **change** address and value (with the tags it would inherit), and the **input coins** (value + block date + confirmations, marked `(selected manually)` under `--coin`). With `--subtract-fee` it also shows `Recipient receives`; with `--anti-fee-sniping` it shows the effective locktime. Unlike `tx create`, the draft stores no change-tag intent.
 
 When `--fee-rate` is omitted the fee is auto-estimated from the live API and may change before you run `tx create` — pass `--fee-rate <sat/vB>` to lock the previewed rate. The fiat lines are best-effort: if the market-rate fetch fails, BTC/sats are still shown and a note is printed.
 
@@ -940,9 +962,10 @@ nunchuk tx draft --wallet w123 --to bc1q... --amount 100000
 nunchuk tx draft --wallet w123 --to bc1q... --send-all
 nunchuk tx draft --wallet w123 --to bc1q... --amount 0.002 --currency BTC --fiat USD
 nunchuk --json tx draft --wallet w123 --to bc1q... --amount 100000 --fee-rate 2
+nunchuk tx draft --wallet w123 --recipients-file payouts.csv --fiat USD
 ```
 
-JSON mode returns `recipient`, `amount`, `recipientAmount`, `fee`, `feeRate`/`feeLevel`, `total`, `changeAddress`/`changeAmount`/`changeTags`, `subtractFee`, `antiFeeSniping`, `lockTime`, `coinSelection`, an `inputs` array (`txid`, `vout`, `amount`, `height`, `confirmations`, `blocktime`), `miniscriptPath`, and `fiat` (or `null`).
+JSON mode returns `recipients` (`address`, `amount`, `receives` per recipient), `recipient` and `recipientAmount` (single recipient only), `amount`, `fee`, `feeRate`/`feeLevel`, `total`, `changeAddress`/`changeAmount`/`changeTags`, `subtractFee`, `antiFeeSniping`, `lockTime`, `coinSelection`, an `inputs` array (`txid`, `vout`, `amount`, `height`, `confirmations`, `blocktime`), `miniscriptPath`, and `fiat` (or `null`; includes a per-recipient `recipients` array).
 
 ### `nunchuk tx sign`
 

@@ -301,6 +301,8 @@ nunchuk tx create --wallet <id> --to <address> --amount <sats> --coin <txid:vout
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-tag kyc          # auto-select only from tagged coins
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-collection "Exchange A"  # auto-select only from a collection
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --change-tags none      # don't tag the change coin
+nunchuk tx create --wallet <id> --recipient <addr1>:100000 --recipient <addr2>:0.002:BTC  # several recipients in one tx
+nunchuk tx create --wallet <id> --recipients-file payouts.csv                          # many recipients from a CSV/JSON file
 ```
 
 Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. When auto-estimating, the **level** is `--fee-level <economy|standard|priority>` (one-shot), else the account's saved default (`config fee-rate set`), else `economy`; `--fee-rate` overrides the level. Run [`tx fees`](#tx-fees) to see the current rates for each level. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
@@ -309,7 +311,9 @@ Fee rate is automatically estimated from the Nunchuk API, or set manually with `
 
 `--subtract-fee` takes the network fee out of the send amount instead of adding it on top, so the recipient receives `amount - fee` and the wallet's total spend stays at `amount`. The output shows the reduced `Recipient receives` value. The send fails if the amount cannot cover the fee or the recipient would drop below the dust threshold.
 
-`--send-all` sweeps the entire wallet balance to the recipient — it spends every coin, forces `--subtract-fee` on (recipient receives `balance - fee`), and leaves no change. Use it instead of `--amount` (exactly one is required); if both are given, `--amount` is ignored with a warning.
+`--send-all` sweeps the entire wallet balance to the recipient — it spends every coin, forces `--subtract-fee` on (recipient receives `balance - fee`), and leaves no change. Use it instead of `--amount` (exactly one is required); if both are given, `--amount` is ignored with a warning. Single recipient only.
+
+**Multiple recipients.** Pay several addresses in one transaction with repeated `--recipient <address>:<amount>[:<currency>]` flags, or `--recipients-file <path>` for a CSV (`address,amount[,currency]`) or JSON (`[{ "address", "amount", "currency"? }]`) file. Each row's unit defaults to `--currency` (then sat), so rows may mix USD, BTC, and sats. Recipients are paid in the order given; `--subtract-fee` splits the fee equally with the remainder on the first recipient; duplicates, dust outputs, and batches over the standard weight limit are rejected before anything is uploaded. Output and JSON for a single recipient are unchanged; batches add a `Recipients (n):` block and a `recipients[]` JSON array. See the [CLI reference](docs/cli-reference.md#nunchuk-tx-create) for the file format and rules.
 
 `--coin <txid:vout>` (repeatable) selects coins manually: the transaction spends **exactly** the chosen coins — no subset optimization, no automatic top-up (a shortfall fails with insufficient funds). Explicitly chosen coins are spent even when locked. Combined with `--send-all`, only the chosen coins are swept. Cannot be combined with `--from-tag` or `--from-collection`.
 
@@ -330,6 +334,7 @@ Shows the current recommended fee rates (priority / standard / economy) from the
 ```bash
 nunchuk tx draft --wallet <id> --to <address> --amount <sats>
 nunchuk tx draft --wallet <id> --to <address> --amount <sats> --fiat USD
+nunchuk tx draft --wallet <id> --recipients-file payouts.csv --fiat USD
 ```
 
 Previews a transaction the way `tx create` would build it — recipient, estimated fee, total amount, change, and the input coins (value + block date) — **without** creating or uploading anything. Takes the same options as `tx create`, plus `--fiat <code>` to show fiat values alongside BTC. It calls the same builder as `tx create`, so the numbers match; when no `--fee-rate` is given the fee is auto-estimated and may change before you run `tx create` (pass `--fee-rate` to lock it).

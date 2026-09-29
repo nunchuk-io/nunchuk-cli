@@ -16,6 +16,25 @@ export function print(data: unknown, cmd: Command): void {
   }
 }
 
+// Normalise anything thrown into the `{ error, message }` shape printError
+// expects. Objects that already carry a string `error` code pass through; a
+// plain Error (or anything else) gets the fallback code, so `--json` callers
+// never see `{}` (JSON.stringify of an Error has no enumerable fields).
+export function toCliError(
+  err: unknown,
+  fallbackCode = "COMMAND_FAILED",
+): { error: string; message: string } {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    typeof (err as { error?: unknown }).error === "string" &&
+    typeof (err as { message?: unknown }).message === "string"
+  ) {
+    return err as { error: string; message: string };
+  }
+  return { error: fallbackCode, message: err instanceof Error ? err.message : String(err) };
+}
+
 export function printError(error: { error: string; message: string }, cmd: Command): void {
   if (cmd.optsWithGlobals().json) {
     console.error(JSON.stringify(error));

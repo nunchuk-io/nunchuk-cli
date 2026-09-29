@@ -56,6 +56,7 @@ import { aggregateWalletPsbtMusig2 } from "./psbt-sign.js";
 import type { AddressType } from "./address-type.js";
 import {
   CFeeRate,
+  MAX_STANDARD_TX_WEIGHT,
   makeCOutput,
   selectCoins,
   type COutput,
@@ -818,12 +819,29 @@ function addGlobalXpubs(psbtBytes: Uint8Array, signers: string[]): Uint8Array {
   return RawPSBTV0.encode(raw);
 }
 
+// One payment output of a transaction: where it goes and how much (sats).
+export interface TxRecipient {
+  address: string;
+  amount: bigint;
+}
+
+// A recipient as settled in the built transaction. `amount` is what was
+// requested; `receives` is the output value, which is lower only when the fee
+// was subtracted from the recipients.
+export interface SettledRecipient extends TxRecipient {
+  receives: bigint;
+}
+
 export interface CreateTransactionParams {
   wallet: WalletData;
   network: Network;
   electrum: ElectrumClient;
-  toAddress: string;
-  amount: bigint;
+  // One or more recipients, paid in the order given. `toAddress` + `amount`
+  // remain as a single-recipient shorthand and are normalised into
+  // `recipients`; pass one form or the other, not both.
+  recipients?: TxRecipient[];
+  toAddress?: string;
+  amount?: bigint;
   miniscriptPath?: number;
   taprootKeyPath?: boolean;
   taprootScriptPath?: boolean;
@@ -839,9 +857,10 @@ export interface CreateTransactionParams {
   // path's own absolute locktime (an `after` / OP_CHECKLOCKTIMEVERIFY
   // condition) always takes precedence.
   antiFeeSniping?: boolean;
-  // Subtract the network fee from the recipient amount instead of adding it on
-  // top, so the recipient receives `amount - fee`. The wallet's total spend
-  // stays at `amount`.
+  // Subtract the network fee from the recipient amounts instead of adding it on
+  // top. The fee is split equally across all recipients, with the first listed
+  // recipient paying the remainder (spender.cpp SFFO semantics). The wallet's
+  // total spend stays at Σ amount.
   subtractFeeFromAmount?: boolean;
   // Sweep the entire wallet balance to the recipient. Overrides `amount` (set to
   // the full balance) and forces `subtractFeeFromAmount` on, so the recipient
@@ -894,10 +913,14 @@ export interface CreateTransactionResult {
   // The transaction's nLockTime (0 when none was applied). Reflects a spending
   // path's absolute locktime or the anti-fee-sniping chain-tip height.
   lockTime: number;
-  // True when the fee was subtracted from the recipient amount.
+  // True when the fee was subtracted from the recipient amounts.
   subtractFee: boolean;
-  // The amount actually sent to the recipient. Equals the requested amount
-  // unless the fee was subtracted from it, in which case it is reduced by the fee.
+  // Every recipient in the order given, with the requested amount and the
+  // value actually placed in its output.
+  recipients: SettledRecipient[];
+  // The amount actually sent to the first recipient (`recipients[0].receives`).
+  // Kept for the single-recipient case, where it equals the requested amount
+  // unless the fee was subtracted from it.
   recipientAmount: bigint;
   changeAddress: string | null;
   // The change output value in sats (0 when there is no change output).
@@ -1485,8 +1508,7 @@ function estimateSignedTxVsize(args: {
   selected: PreparedWalletInput[];
   wallet: WalletData;
   network: Network;
-  toAddress: string;
-  amount: bigint;
+  recipients: TxRecipient[];
   changeAddress: string | null;
   changeAmount: bigint;
   txLockTime: number;
@@ -1501,7 +1523,9 @@ function estimateSignedTxVsize(args: {
   });
 
   for (const prepared of args.selected) tx.addInput(prepared.input);
-  tx.addOutputAddress(args.toAddress, args.amount, btcNet);
+  for (const recipient of args.recipients) {
+    tx.addOutputAddress(recipient.address, recipient.amount, btcNet);
+  }
   if (args.changeAddress && args.changeAmount > 0n) {
     tx.addOutputAddress(args.changeAddress, args.changeAmount, btcNet);
   }
@@ -1564,8 +1588,7 @@ function buildUnifiedTransaction(args: {
   parsed: ReturnType<typeof parseDescriptor>;
   wallet: WalletData;
   network: Network;
-  toAddress: string;
-  amount: bigint;
+  recipients: TxRecipient[];
   changeAddress: string | null;
   changeAmount: bigint;
   changeIndex: number;
@@ -1581,12 +1604,12 @@ function buildUnifiedTransaction(args: {
     disableScriptCheck: true,
   });
 
-  // Recipients first, then insert change at a random position so it isn't a
-  // fixed-index fingerprint (rng.randrange(n + 1)). libnunchuk draws the change
-  // position before shuffling inputs, so keep that RNG order here.
-  const outputs: Array<{ address: string; amount: bigint; isChange: boolean }> = [
-    { address: args.toAddress, amount: args.amount, isChange: false },
-  ];
+  // Recipients first (in the order given), then insert change at a random
+  // position so it isn't a fixed-index fingerprint (rng.randrange(n + 1)).
+  // libnunchuk draws the change position before shuffling inputs, so keep that
+  // RNG order here.
+  const outputs: Array<{ address: string; amount: bigint; isChange: boolean }> =
+    args.recipients.map((r) => ({ address: r.address, amount: r.amount, isChange: false }));
   if (args.changeAddress && args.changeAmount > 0n) {
     const pos = Number(args.rng.randrange(BigInt(outputs.length + 1)));
     outputs.splice(pos, 0, {
@@ -1695,6 +1718,23 @@ export function availableCandidates(
   return capped;
 }
 
+// " (recipient <addr>)" for multi-recipient error messages; empty for a single
+// recipient so the existing wording is unchanged.
+function recipientLabel(recipients: TxRecipient[], index: number): string {
+  return recipients.length > 1 ? ` (recipient ${recipients[index].address})` : "";
+}
+
+// Reject a transaction whose (estimated) weight exceeds the standard relay
+// limit before anything is uploaded or signed. libnunchuk enforces this only at
+// broadcast (nunchukimpl.cpp BroadcastTransaction, "Tx-size").
+function assertStandardWeight(estimatedWeight: number, recipientCount: number): void {
+  if (estimatedWeight > MAX_STANDARD_TX_WEIGHT) {
+    throw new Error(
+      `Transaction too large (${recipientCount} recipients, ~${estimatedWeight} WU; limit ${MAX_STANDARD_TX_WEIGHT}). Split the batch.`,
+    );
+  }
+}
+
 function humanizeSelectionError(error: SelectionError): Error {
   if (error === "max_weight") {
     return new Error(
@@ -1714,6 +1754,7 @@ export async function createTransaction(
     wallet,
     network,
     electrum,
+    recipients: requestedRecipients,
     toAddress,
     amount: requestedAmount,
     miniscriptPath,
@@ -1732,6 +1773,22 @@ export async function createTransaction(
     fromCollection,
     rng = new CryptoRng(),
   } = params;
+  // Normalise the two input forms into one recipient list.
+  let recipients: TxRecipient[];
+  if (requestedRecipients && requestedRecipients.length > 0) {
+    if (toAddress != null || requestedAmount != null) {
+      throw new Error("Internal: pass either recipients or toAddress/amount, not both");
+    }
+    recipients = requestedRecipients;
+  } else {
+    if (toAddress == null) {
+      throw new Error("At least one recipient is required.");
+    }
+    recipients = [{ address: toAddress, amount: requestedAmount ?? 0n }];
+  }
+  if (sendAll && recipients.length !== 1) {
+    throw new Error("--send-all supports a single recipient.");
+  }
   if (fromTag && presetCoins.length > 0) {
     throw new Error(
       "--from-tag cannot be combined with --coin (manual selection spends exactly the chosen coins).",
@@ -1778,6 +1835,38 @@ export async function createTransaction(
     );
   }
   const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
+  // Resolve every recipient's scriptPubKey up front: this validates the address
+  // for the network, lets the selection target size all the outputs, and
+  // catches duplicates (compared by script, so bech32 letter-case collides).
+  const recipientScripts = recipients.map((r) => getOutputScriptForAddress(r.address, btcNet));
+  const seenScripts = new Set<string>();
+  recipients.forEach((r, i) => {
+    const key = Buffer.from(recipientScripts[i]).toString("hex");
+    if (seenScripts.has(key)) {
+      throw new Error(`Duplicate recipient ${r.address}; merge the amounts into one row.`);
+    }
+    seenScripts.add(key);
+  });
+  const txNoinputsSize = computeTxNoinputsSize(recipientScripts.map((s) => s.length));
+  // The recipient outputs alone must fit the standard weight limit; the full
+  // check (with inputs) runs after settlement. libnunchuk only rejects at
+  // broadcast ("Tx-size"), but failing before co-signers sign is kinder.
+  assertStandardWeight(txNoinputsSize * 4, recipients.length);
+  // Reject any recipient output below the dust threshold before touching the
+  // network. Reference: spender.cpp CreateTransaction (IsDust → "Transaction
+  // amount too small"). The message names the recipient only when there is
+  // more than one, so the single-recipient wording is unchanged. Under
+  // send-all the amount is the swept balance, so that check waits for the scan.
+  const discardFeerate = new CFeeRate(3_000n);
+  const recipientDust = recipientScripts.map((s) => getRecipientDust(s, discardFeerate));
+  const assertAboveDust = (values: bigint[]): void => {
+    values.forEach((value, i) => {
+      if (value < recipientDust[i]) {
+        throw new Error(`Transaction amount too small${recipientLabel(recipients, i)}.`);
+      }
+    });
+  };
+  if (!sendAll) assertAboveDust(recipients.map((r) => r.amount));
   const miniscriptPlan =
     parsed.kind === "miniscript" && !taprootKeyPath
       ? selectMiniscriptSpendingPlan(parsed.miniscript!, undefined, miniscriptPath)
@@ -1867,7 +1956,10 @@ export async function createTransaction(
   // only the chosen coins (app behavior: select coins → send max).
   const totalBalance = utxos.reduce((sum, utxo) => sum + utxo.value, 0n);
   const subtractFeeFromAmount = sendAll ? true : requestedSubtractFee;
-  const amount = sendAll ? totalBalance : requestedAmount;
+  // Requested output value per recipient (send-all is single-recipient, so the
+  // swept balance simply replaces that one amount) and their sum.
+  const requestedAmounts = sendAll ? [totalBalance] : recipients.map((r) => r.amount);
+  const amount = requestedAmounts.reduce((s, a) => s + a, 0n);
 
   // Step 2: Fetch full previous transactions for nonWitnessUtxo
   // Reference: FillPsbt adds non_witness_utxo from database (walletdb.cpp:1074-1089)
@@ -1946,22 +2038,18 @@ export async function createTransaction(
   const changeOutputSize = getChangeOutputSize(
     getChangeScriptLen(wallet, network, nextChangeIndex),
   );
-  const recipientScript = getOutputScriptForAddress(toAddress, btcNet);
-  const txNoinputsSize = computeTxNoinputsSize([recipientScript.length]);
-
-  // Reject a recipient output that is below the dust threshold, before selecting
-  // coins. Reference: spender.cpp CreateTransaction (IsDust → "Transaction amount too small").
-  const discardFeerate = new CFeeRate(3_000n);
-  if (amount < getRecipientDust(recipientScript, discardFeerate)) {
-    throw new Error("Transaction amount too small.");
-  }
+  // Dust check on the final requested values (only send-all can still fail
+  // here, since its amount is the swept balance).
+  assertAboveDust(requestedAmounts);
 
   const selectionParams = buildCoinSelectionParams({
     feeRateSatPerKvB: feeRate,
     changeOutputSize,
     changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, discardFeerate),
     txNoinputsSize,
-    paymentValue: amount,
+    // The change target is derived from the *average* recipient amount
+    // (spender.cpp: GenerateChangeTarget(floor(recipients_sum / n))).
+    paymentValue: amount / BigInt(recipients.length),
     subtractFeeOutputs: subtractFeeFromAmount,
     rng,
   });
@@ -2013,18 +2101,24 @@ export async function createTransaction(
 
   // Step 7: Settle change + fee against the actual signed vsize (spender.cpp CreateTransaction).
   const totalIn = selected.reduce((s, p) => s + p.utxo.value, 0n);
-  // Amount placed in the recipient output. Differs from the requested `amount`
-  // only when the fee is subtracted from it, where the recipient absorbs the fee.
-  let recipientOutputAmount = amount;
+  // Recipient outputs as requested; the vsize does not depend on the values,
+  // so this list sizes every estimate below.
+  const requestedOutputs: TxRecipient[] = recipients.map((r, i) => ({
+    address: r.address,
+    amount: requestedAmounts[i],
+  }));
+  // Value placed in each recipient output. Differs from the requested amounts
+  // only when the fee is subtracted from them.
+  let receives = [...requestedAmounts];
   let txChangeAddress: string | null;
   let changeAmount: bigint;
   let fee: bigint;
 
   if (subtractFeeFromAmount) {
-    // The recipient pays the fee. Inputs only covered the recipient amount, so
-    // change = totalIn - amount (independent of the fee), and the recipient
-    // output is then reduced by the fee. Reference: spender.cpp CreateTransaction
-    // (reduce output values for subtract-fee-from-amount).
+    // The recipients pay the fee. Inputs only covered Σ amount, so change =
+    // totalIn - Σ amount (independent of the fee), and the recipient outputs are
+    // then reduced. Reference: spender.cpp CreateTransaction (reduce output
+    // values for subtract-fee-from-amount).
     const rawChange = totalIn - amount;
     if (rawChange >= selectionParams.minViableChange) {
       txChangeAddress = changeAddress;
@@ -2037,8 +2131,7 @@ export async function createTransaction(
       selected,
       wallet,
       network,
-      toAddress,
-      amount,
+      recipients: requestedOutputs,
       changeAddress: txChangeAddress,
       changeAmount,
       txLockTime,
@@ -2046,17 +2139,31 @@ export async function createTransaction(
       taprootKeyPath,
     });
     fee = selectionParams.effectiveFeerate.getFee(vsize);
-    // The recipient receives everything not going to change or fees. With change
-    // this is amount - fee; without change the would-be change folds in.
-    recipientOutputAmount = totalIn - changeAmount - fee;
-    if (recipientOutputAmount < 0n) {
-      throw new Error("The transaction amount is too small to pay the fee.");
-    }
-    if (recipientOutputAmount < getRecipientDust(recipientScript, discardFeerate)) {
-      throw new Error(
-        "The transaction amount is too small to send after the fee has been deducted.",
-      );
-    }
+    // to_reduce = fee_needed - current_fee. With change this is the fee; without
+    // change the would-be change is already "paid" as fee, so to_reduce shrinks
+    // (and may go negative, folding the surplus back into the recipients). The
+    // split is equal per recipient, remainder on the first; BigInt division
+    // truncates toward zero like C++, so the negative case matches too.
+    const toReduce = fee - (totalIn - amount - changeAmount);
+    const n = BigInt(recipients.length);
+    const each = toReduce / n;
+    const remainder = toReduce % n;
+    receives = requestedAmounts.map((value, i) => value - each - (i === 0 ? remainder : 0n));
+    receives.forEach((value, i) => {
+      if (value < 0n) {
+        throw new Error(
+          `The transaction amount is too small to pay the fee${recipientLabel(recipients, i)}.`,
+        );
+      }
+      if (value < recipientDust[i]) {
+        throw new Error(
+          `The transaction amount is too small to send after the fee has been deducted${recipientLabel(
+            recipients,
+            i,
+          )}.`,
+        );
+      }
+    });
   } else {
     // Default path: the sender adds the fee on top. Recompute the signed vsize
     // and adjust the change output to absorb any fee overpayment.
@@ -2073,8 +2180,7 @@ export async function createTransaction(
               selected,
               wallet,
               network,
-              toAddress,
-              amount,
+              recipients: requestedOutputs,
               changeAddress,
               changeAmount: sel.result.getChange(
                 selectionParams.minViableChange,
@@ -2100,8 +2206,7 @@ export async function createTransaction(
         selected,
         wallet,
         network,
-        toAddress,
-        amount,
+        recipients: requestedOutputs,
         changeAddress: null,
         changeAmount: 0n,
         txLockTime,
@@ -2115,13 +2220,34 @@ export async function createTransaction(
     }
   }
 
+  const settledOutputs: TxRecipient[] = recipients.map((r, i) => ({
+    address: r.address,
+    amount: receives[i],
+  }));
+
+  // The signed transaction must stay under the standard weight limit. The
+  // dummy-witness vsize is an upper bound, so vsize * 4 is a safe weight bound.
+  assertStandardWeight(
+    estimateSignedTxVsize({
+      selected,
+      wallet,
+      network,
+      recipients: settledOutputs,
+      changeAddress: txChangeAddress,
+      changeAmount,
+      txLockTime,
+      miniscriptPlan: miniscriptPlan ?? null,
+      taprootKeyPath,
+    }) * 4,
+    recipients.length,
+  );
+
   const tx: Transaction = buildUnifiedTransaction({
     selected,
     parsed,
     wallet,
     network,
-    toAddress,
-    amount: recipientOutputAmount,
+    recipients: settledOutputs,
     changeAddress: txChangeAddress,
     changeAmount,
     changeIndex: nextChangeIndex,
@@ -2148,7 +2274,12 @@ export async function createTransaction(
     feeLevel: usingManualFeeRate ? undefined : feeLevel,
     lockTime: txLockTime,
     subtractFee: subtractFeeFromAmount,
-    recipientAmount: recipientOutputAmount,
+    recipients: recipients.map((r, i) => ({
+      address: r.address,
+      amount: requestedAmounts[i],
+      receives: receives[i],
+    })),
+    recipientAmount: receives[0],
     changeAddress: txChangeAddress,
     changeAmount,
     selectedInputs: selected.map((p) => ({

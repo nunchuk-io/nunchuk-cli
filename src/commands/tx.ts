@@ -59,9 +59,17 @@ import {
   ServerTxResponse,
   type PendingTx,
   type PendingTxDetail,
+  type SettledRecipient,
+  type TxRecipient,
   type WalletOutputClassifier,
   type PendingTxInputTimelockMetadata,
 } from "../core/transaction.js";
+import {
+  parseRecipientOption,
+  parseRecipientsFile,
+  resolveRecipients,
+  type RawRecipient,
+} from "../core/recipients.js";
 import {
   formatBtc,
   formatSats,
@@ -77,7 +85,7 @@ import {
   normalizeCurrency,
   type MarketRates,
 } from "../core/currency.js";
-import { print, printError } from "../output.js";
+import { print, printError, toCliError } from "../output.js";
 
 function parseMiniscriptPathOption(value: string): number {
   const parsed = Number(value);
@@ -154,6 +162,114 @@ async function resolveSendAmount(
     throw new Error("Amount must convert to at least 1 sat");
   }
   return sendAmount;
+}
+
+// Parse a repeatable --recipient <address>:<amount>[:<currency>] flag.
+function parseRecipientFlag(value: string, previous: RawRecipient[]): RawRecipient[] {
+  try {
+    return [...previous, parseRecipientOption(value, previous.length + 1)];
+  } catch (err) {
+    throw new InvalidArgumentError(toCliError(err).message);
+  }
+}
+
+// What `tx create` / `tx draft` hand to createTransaction. The --to form keeps
+// the toAddress/amount shorthand so the single-recipient path is untouched;
+// --recipient / --recipients-file resolve to an explicit list.
+interface RecipientInput {
+  toAddress?: string;
+  amount?: bigint;
+  recipients?: TxRecipient[];
+  sendAll: boolean;
+}
+
+interface RecipientOptions {
+  to?: string;
+  amount?: string;
+  currency?: string;
+  sendAll?: boolean;
+  recipient: RawRecipient[];
+  recipientsFile?: string;
+}
+
+function invalidParam(message: string): { error: string; message: string } {
+  return { error: "INVALID_PARAM", message };
+}
+
+// Enforce the input-form exclusivity rules and resolve the recipients. Runs
+// before the Electrum scan, so every validation error is cheap and structured.
+async function resolveTxRecipients(
+  options: RecipientOptions,
+  network: Network,
+): Promise<RecipientInput> {
+  const useTo = options.to != null;
+  const useFlags = options.recipient.length > 0;
+  const useFile = options.recipientsFile != null;
+  const forms = [useTo, useFlags, useFile].filter(Boolean).length;
+  if (forms !== 1) {
+    throw invalidParam("Provide exactly one of --to, --recipient, or --recipients-file.");
+  }
+  const sendAll = Boolean(options.sendAll);
+  if (useTo) {
+    return { toAddress: options.to, amount: await resolveSendAmount(options, sendAll), sendAll };
+  }
+  if (sendAll) {
+    throw invalidParam("--send-all supports a single recipient (--to).");
+  }
+  if (options.amount != null) {
+    throw invalidParam(
+      "--amount applies to --to only; put each amount in the --recipient value or file row.",
+    );
+  }
+  const raw = useFile ? parseRecipientsFile(options.recipientsFile!) : options.recipient;
+  const recipients = await resolveRecipients(raw, network, {
+    defaultCurrency: options.currency,
+  });
+  return { recipients, sendAll: false };
+}
+
+// Gross amount on the payment side: Σ requested amounts, or the swept balance
+// (first recipient's output + fee) under --send-all.
+function grossAmountOf(
+  result: { recipients: SettledRecipient[]; recipientAmount: bigint; fee: bigint },
+  sendAll: boolean,
+): bigint {
+  return sendAll
+    ? result.recipientAmount + result.fee
+    : result.recipients.reduce((s, r) => s + r.amount, 0n);
+}
+
+// Print the recipient line(s). One recipient keeps today's `Recipient:` line;
+// more print an indexed block with each requested amount and, under
+// --subtract-fee, what each actually receives.
+function printRecipientLines(
+  recipients: SettledRecipient[],
+  subtractFee: boolean,
+  fiat: (sats: bigint) => string = () => "",
+): void {
+  if (recipients.length === 1) {
+    console.log(`  Recipient: ${recipients[0].address}`);
+    return;
+  }
+  console.log(`  Recipients (${recipients.length}):`);
+  for (const r of recipients) {
+    const receives = subtractFee
+      ? ` → receives ${formatBtc(r.receives)} (${formatSats(r.receives)})${fiat(r.receives)}`
+      : "";
+    console.log(
+      `    ${r.address}  ${formatBtc(r.amount)} (${formatSats(r.amount)})${fiat(r.amount)}${receives}`,
+    );
+  }
+}
+
+function recipientsToJson(
+  recipients: SettledRecipient[],
+): Array<{ address: string; amount: string; receives: string }> {
+  return recipients.map((r) => ({
+    address: r.address,
+    amount: r.amount.toString(),
+    receives: r.receives.toString(),
+  }));
 }
 
 // Resolve the change coin's inherited tags for a built transaction. Returns
@@ -464,15 +580,25 @@ txCommand
   .command("create")
   .description("Create a new transaction")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--to <address>", "Recipient address")
-  .option("--amount <value>", "Amount to send (required unless --send-all)")
+  .option("--to <address>", "Recipient address (single recipient)")
+  .option("--amount <value>", "Amount to send to --to (required unless --send-all)")
+  .option(
+    "--recipient <address:amount[:currency]>",
+    "Pay this recipient; repeat for several. Amount is in the row's currency, else --currency",
+    parseRecipientFlag,
+    [] as RawRecipient[],
+  )
+  .option(
+    "--recipients-file <path>",
+    "CSV (address,amount[,currency]) or JSON file of recipients for large batches",
+  )
   .option(
     "--send-all",
-    "Send the entire wallet balance (the fee is subtracted from the amount; overrides --amount)",
+    "Send the entire wallet balance to --to (the fee is subtracted from the amount; overrides --amount)",
   )
   .option(
     "--currency <code>",
-    "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
+    "Default currency for every amount (default: sat). Supports BTC, USD, and fiat codes",
   )
   .option(
     "--preimage <hex>",
@@ -505,7 +631,7 @@ txCommand
   )
   .option(
     "--subtract-fee",
-    "Subtract the network fee from the amount so the recipient receives amount minus fee",
+    "Subtract the network fee from the amount(s); split equally, remainder on the first recipient",
   )
   .option(
     "--coin <txid:vout>",
@@ -537,8 +663,8 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        const sendAll = Boolean(options.sendAll);
-        const sendAmount = await resolveSendAmount(options, sendAll);
+        const requested = await resolveTxRecipients(options, network);
+        const sendAll = requested.sendAll;
         // Effective fee level for the auto-estimate: one-shot --fee-level wins,
         // else the account's saved default, else the built-in default (economy).
         const feeLevel =
@@ -558,8 +684,9 @@ txCommand
           wallet,
           network,
           electrum,
-          toAddress: options.to,
-          amount: sendAmount,
+          toAddress: requested.toAddress,
+          amount: requested.amount,
+          recipients: requested.recipients,
           sendAll,
           miniscriptPath: options.miniscriptPath,
           taprootScriptPath: options.taprootScriptPath,
@@ -592,7 +719,8 @@ txCommand
         // Under send-all there is no requested amount; the gross amount sent is
         // the swept balance (recipient + fee). recipientAmount + fee also equals
         // the requested amount in the normal subtract case, so this is uniform.
-        const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
+        const grossAmount = grossAmountOf(result, sendAll);
+        const singleRecipient = result.recipients.length === 1;
         const manualSelection = options.coin.length > 0;
 
         // Validate the change-tag choice before uploading anything.
@@ -639,7 +767,10 @@ txCommand
               })),
               subtractFee: result.subtractFee,
               amount: grossAmount.toString(),
-              recipientAmount: result.recipientAmount.toString(),
+              recipients: recipientsToJson(result.recipients),
+              // Single-recipient field kept only when there is one recipient,
+              // so existing scripts see no change.
+              ...(singleRecipient ? { recipientAmount: result.recipientAmount.toString() } : {}),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               changeAddress: result.changeAddress,
@@ -661,13 +792,13 @@ txCommand
           }`,
         );
         console.log(`  Fee: ${formatBtc(result.fee)} (${formatSats(result.fee)})`);
-        console.log(`  Recipient: ${options.to}`);
+        printRecipientLines(result.recipients, result.subtractFee);
         console.log(
           `  Amount: ${formatBtc(grossAmount)} (${formatSats(grossAmount)})${
             sendAll ? " (send all)" : ""
           }`,
         );
-        if (result.subtractFee) {
+        if (result.subtractFee && singleRecipient) {
           console.log(
             `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
               result.recipientAmount,
@@ -698,7 +829,7 @@ txCommand
         electrum.close();
       }
     } catch (err) {
-      printError(err as { error: string; message: string }, cmd);
+      printError(toCliError(err, "TX_BUILD_FAILED"), cmd);
     }
   });
 
@@ -708,15 +839,25 @@ txCommand
   .command("draft")
   .description("Preview a transaction (fee, total, change, input coins) without creating it")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
-  .requiredOption("--to <address>", "Recipient address")
-  .option("--amount <value>", "Amount to send (required unless --send-all)")
+  .option("--to <address>", "Recipient address (single recipient)")
+  .option("--amount <value>", "Amount to send to --to (required unless --send-all)")
+  .option(
+    "--recipient <address:amount[:currency]>",
+    "Pay this recipient; repeat for several. Amount is in the row's currency, else --currency",
+    parseRecipientFlag,
+    [] as RawRecipient[],
+  )
+  .option(
+    "--recipients-file <path>",
+    "CSV (address,amount[,currency]) or JSON file of recipients for large batches",
+  )
   .option(
     "--send-all",
-    "Send the entire wallet balance (the fee is subtracted from the amount; overrides --amount)",
+    "Send the entire wallet balance to --to (the fee is subtracted from the amount; overrides --amount)",
   )
   .option(
     "--currency <code>",
-    "Currency for amount (default: sat). Supports BTC, USD, and fiat codes",
+    "Default currency for every amount (default: sat). Supports BTC, USD, and fiat codes",
   )
   .option(
     "--preimage <hex>",
@@ -749,7 +890,7 @@ txCommand
   )
   .option(
     "--subtract-fee",
-    "Subtract the network fee from the amount so the recipient receives amount minus fee",
+    "Subtract the network fee from the amount(s); split equally, remainder on the first recipient",
   )
   .option(
     "--coin <txid:vout>",
@@ -780,8 +921,8 @@ txCommand
         await electrum.connect(server.host, server.port, server.protocol);
         await electrum.serverVersion("nunchuk-cli", "1.4");
 
-        const sendAll = Boolean(options.sendAll);
-        const sendAmount = await resolveSendAmount(options, sendAll);
+        const requested = await resolveTxRecipients(options, network);
+        const sendAll = requested.sendAll;
 
         const feeLevel =
           options.feeLevel ?? getDefaultFeeLevel(loadConfig(), email) ?? DEFAULT_FEE_LEVEL;
@@ -801,8 +942,9 @@ txCommand
           wallet,
           network,
           electrum,
-          toAddress: options.to,
-          amount: sendAmount,
+          toAddress: requested.toAddress,
+          amount: requested.amount,
+          recipients: requested.recipients,
           sendAll,
           miniscriptPath: options.miniscriptPath,
           taprootScriptPath: options.taprootScriptPath,
@@ -833,7 +975,8 @@ txCommand
         });
         // Under send-all the gross amount sent is the swept balance (recipient +
         // fee); otherwise it is the requested amount.
-        const grossAmount = sendAll ? result.recipientAmount + result.fee : sendAmount;
+        const grossAmount = grossAmountOf(result, sendAll);
+        const singleRecipient = result.recipients.length === 1;
         const manualSelection = options.coin.length > 0;
 
         // Preview the change coin's inherited tags; nothing is stored on draft.
@@ -867,9 +1010,9 @@ txCommand
           };
         });
 
-        // Total spend on the payment side: recipient + fee (= amount + fee, or
-        // just `amount` under --subtract-fee since the fee comes out of it).
-        const total = result.recipientAmount + result.fee;
+        // Total spend on the payment side: Σ recipient outputs + fee (= Σ amount
+        // + fee, or just Σ amount under --subtract-fee since the fee comes out of it).
+        const total = result.recipients.reduce((s, r) => s + r.receives, 0n) + result.fee;
 
         // Optional fiat display.
         let fiatCode: string | null = null;
@@ -902,11 +1045,14 @@ txCommand
         if (globals.json) {
           print(
             {
-              recipient: options.to,
+              // Single-recipient fields kept only when there is one recipient,
+              // so existing scripts see no change.
+              ...(singleRecipient ? { recipient: result.recipients[0].address } : {}),
               sendAll,
               amount: grossAmount.toString(),
               amountBtc: formatBtc(grossAmount),
-              recipientAmount: result.recipientAmount.toString(),
+              recipients: recipientsToJson(result.recipients),
+              ...(singleRecipient ? { recipientAmount: result.recipientAmount.toString() } : {}),
               fee: result.fee.toString(),
               feeBtc: formatBtc(result.fee),
               feeRate: formatFeeRateSatPerVb(result.feeRateSatPerKvB),
@@ -941,6 +1087,11 @@ txCommand
                       fee: fiatValue(result.fee),
                       total: fiatValue(total),
                       change: fiatValue(result.changeAmount),
+                      recipients: result.recipients.map((r) => ({
+                        address: r.address,
+                        amount: fiatValue(r.amount),
+                        receives: fiatValue(r.receives),
+                      })),
                     }
                   : null,
             },
@@ -950,13 +1101,13 @@ txCommand
         }
 
         console.log("Draft transaction (not created)");
-        console.log(`  Recipient: ${options.to}`);
+        printRecipientLines(result.recipients, result.subtractFee, fiat);
         console.log(
           `  Amount: ${formatBtc(grossAmount)} (${formatSats(grossAmount)})${fiat(grossAmount)}${
             sendAll ? " (send all)" : ""
           }`,
         );
-        if (result.subtractFee) {
+        if (result.subtractFee && singleRecipient) {
           console.log(
             `  Recipient receives: ${formatBtc(result.recipientAmount)} (${formatSats(
               result.recipientAmount,
@@ -1004,7 +1155,7 @@ txCommand
         electrum.close();
       }
     } catch (err) {
-      printError(err as { error: string; message: string }, cmd);
+      printError(toCliError(err, "TX_BUILD_FAILED"), cmd);
     }
   });
 
