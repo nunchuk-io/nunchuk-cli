@@ -1718,15 +1718,12 @@ export function availableCandidates(
   return capped;
 }
 
-// " (recipient <addr>)" for multi-recipient error messages; empty for a single
-// recipient so the existing wording is unchanged.
+// Names the recipient in an error message only when there are several.
 function recipientLabel(recipients: TxRecipient[], index: number): string {
   return recipients.length > 1 ? ` (recipient ${recipients[index].address})` : "";
 }
 
-// Reject a transaction whose (estimated) weight exceeds the standard relay
-// limit before anything is uploaded or signed. libnunchuk enforces this only at
-// broadcast (nunchukimpl.cpp BroadcastTransaction, "Tx-size").
+// Fail early on a transaction the network would not relay (weight > 400,000 WU).
 function assertStandardWeight(estimatedWeight: number, recipientCount: number): void {
   if (estimatedWeight > MAX_STANDARD_TX_WEIGHT) {
     throw new Error(
@@ -1835,9 +1832,7 @@ export async function createTransaction(
     );
   }
   const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
-  // Resolve every recipient's scriptPubKey up front: this validates the address
-  // for the network, lets the selection target size all the outputs, and
-  // catches duplicates (compared by script, so bech32 letter-case collides).
+  // Output scripts up front: validates each address and catches duplicates.
   const recipientScripts = recipients.map((r) => getOutputScriptForAddress(r.address, btcNet));
   const seenScripts = new Set<string>();
   recipients.forEach((r, i) => {
@@ -1848,15 +1843,10 @@ export async function createTransaction(
     seenScripts.add(key);
   });
   const txNoinputsSize = computeTxNoinputsSize(recipientScripts.map((s) => s.length));
-  // The recipient outputs alone must fit the standard weight limit; the full
-  // check (with inputs) runs after settlement. libnunchuk only rejects at
-  // broadcast ("Tx-size"), but failing before co-signers sign is kinder.
+  // Outputs alone must fit the weight limit (non-witness bytes weigh 4 WU
+  // each); the full check with inputs runs after settlement.
   assertStandardWeight(txNoinputsSize * 4, recipients.length);
-  // Reject any recipient output below the dust threshold before touching the
-  // network. Reference: spender.cpp CreateTransaction (IsDust → "Transaction
-  // amount too small"). The message names the recipient only when there is
-  // more than one, so the single-recipient wording is unchanged. Under
-  // send-all the amount is the swept balance, so that check waits for the scan.
+  // Dust check before the scan; send-all's amount is only known after it.
   const discardFeerate = new CFeeRate(3_000n);
   const recipientDust = recipientScripts.map((s) => getRecipientDust(s, discardFeerate));
   const assertAboveDust = (values: bigint[]): void => {
@@ -2047,8 +2037,7 @@ export async function createTransaction(
     changeOutputSize,
     changeOutputDust: getChangeDust(wallet, network, nextChangeIndex, discardFeerate),
     txNoinputsSize,
-    // The change target is derived from the *average* recipient amount
-    // (spender.cpp: GenerateChangeTarget(floor(recipients_sum / n))).
+    // Change target is drawn from the average recipient amount.
     paymentValue: amount / BigInt(recipients.length),
     subtractFeeOutputs: subtractFeeFromAmount,
     rng,
@@ -2066,8 +2055,7 @@ export async function createTransaction(
 
   // When the fee is subtracted from the recipient amount, inputs only need to
   // cover the amount itself — the fee comes out of the recipient output, so the
-  // not-input fees drop out of the selection target (spender.cpp: not_input_fees
-  // = getFee(subtract_fee_outputs ? 0 : tx_noinputs_size)).
+  // not-input fees drop out of the selection target.
   const notInputFees = selectionParams.effectiveFeerate.getFee(
     subtractFeeFromAmount ? 0 : txNoinputsSize,
   );
@@ -2101,24 +2089,19 @@ export async function createTransaction(
 
   // Step 7: Settle change + fee against the actual signed vsize (spender.cpp CreateTransaction).
   const totalIn = selected.reduce((s, p) => s + p.utxo.value, 0n);
-  // Recipient outputs as requested; the vsize does not depend on the values,
-  // so this list sizes every estimate below.
+  // Output list for size estimates (values do not affect size).
   const requestedOutputs: TxRecipient[] = recipients.map((r, i) => ({
     address: r.address,
     amount: requestedAmounts[i],
   }));
-  // Value placed in each recipient output. Differs from the requested amounts
-  // only when the fee is subtracted from them.
+  // Final output values; lower than requested only under subtract-fee.
   let receives = [...requestedAmounts];
   let txChangeAddress: string | null;
   let changeAmount: bigint;
   let fee: bigint;
 
   if (subtractFeeFromAmount) {
-    // The recipients pay the fee. Inputs only covered Σ amount, so change =
-    // totalIn - Σ amount (independent of the fee), and the recipient outputs are
-    // then reduced. Reference: spender.cpp CreateTransaction (reduce output
-    // values for subtract-fee-from-amount).
+    // Recipients pay the fee: change = totalIn - Σ amount, then outputs are reduced.
     const rawChange = totalIn - amount;
     if (rawChange >= selectionParams.minViableChange) {
       txChangeAddress = changeAddress;
@@ -2139,11 +2122,9 @@ export async function createTransaction(
       taprootKeyPath,
     });
     fee = selectionParams.effectiveFeerate.getFee(vsize);
-    // to_reduce = fee_needed - current_fee. With change this is the fee; without
-    // change the would-be change is already "paid" as fee, so to_reduce shrinks
-    // (and may go negative, folding the surplus back into the recipients). The
-    // split is equal per recipient, remainder on the first; BigInt division
-    // truncates toward zero like C++, so the negative case matches too.
+    // Split the fee equally, remainder on the first recipient. Without change
+    // the dropped change already counts as fee, so toReduce can be negative and
+    // the surplus flows back to the recipients (division truncates toward 0).
     const toReduce = fee - (totalIn - amount - changeAmount);
     const n = BigInt(recipients.length);
     const each = toReduce / n;
@@ -2225,8 +2206,7 @@ export async function createTransaction(
     amount: receives[i],
   }));
 
-  // The signed transaction must stay under the standard weight limit. The
-  // dummy-witness vsize is an upper bound, so vsize * 4 is a safe weight bound.
+  // The signed transaction must fit the standard weight limit (vsize × 4 ≥ weight).
   assertStandardWeight(
     estimateSignedTxVsize({
       selected,

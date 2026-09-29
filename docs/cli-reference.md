@@ -880,10 +880,12 @@ When auto-estimating, the fee **level** is resolved by precedence: `--fee-level 
 **Multiple recipients.** One transaction can pay many addresses (payroll, vendor payouts): one output per recipient plus, usually, one change output. Recipients are given in exactly one of three forms per invocation:
 
 - `--to <address> --amount <value>` — a single recipient (unchanged).
-- `--recipient <address>:<amount>[:<currency>]`, repeated — a few recipients on the command line. `:` never appears in an address, so the split is unambiguous; BIP-21 `bitcoin:` URIs are not accepted.
+- `--recipient <address>:<amount>[:<currency>]`, repeated — a few recipients on the command line. `:` never appears in an address, so the split is unambiguous. A BIP-21 payment URI (`bitcoin:<address>?amount=<btc>…`, what QR codes and invoices contain) is accepted whole in place of `<address>:<amount>`; quote it, since `?` and `&` are shell characters.
 - `--recipients-file <path>` — many recipients from a file, detected by content. **CSV**: `address,amount[,currency]` per line, blank lines and `#` comments ignored, an optional `address,amount` header skipped, whitespace and CRLF tolerated, no quoting. **JSON**: an array of `{ "address", "amount", "currency"? }` objects (`amount` may be a number or a string; unknown keys are ignored).
 
-Units resolve per row: the row's own currency, else `--currency`, else `sat`, so a batch may mix `USD`, `EUR`, `BTC`, and sat rows; fiat is converted per row with a single market-rate fetch. Recipients are paid **in the order given** (output index N is row N; the Nunchuk apps sort outputs by address instead, which is cosmetic), and the change output is inserted at a random position. Coin selection targets the sum of all amounts; the change target follows libnunchuk and uses the average recipient amount.
+Units resolve per row: the row's own currency, else `--currency`, else `sat`, so a batch may mix `USD`, `EUR`, `BTC`, and sat rows; fiat is converted per row with a single market-rate fetch.
+
+**BIP-21 URIs.** Anywhere an address is accepted (`--recipient`, the CSV address column, the JSON `address` field) a `bitcoin:` URI may be given instead. Its `amount` parameter is in BTC and, when present, is the row's amount: a row may not also give its own amount or currency (error). A URI without `amount` needs the row's amount as usual. `label` and `message` are ignored; a `req-` parameter the CLI does not understand is rejected, as the standard requires (the mobile app is more lenient here). The scheme and a bech32 address may be upper-case. In a CSV, a URI row whose amount is in the URI may have just the one column; percent-encode any comma inside a label.
 
 `--subtract-fee` with several recipients splits the fee **equally** across all of them; the first listed recipient also pays the remainder that does not divide evenly (libnunchuk / Bitcoin Core semantics). Each reduced output is re-checked against its dust threshold. `--send-all` is single-recipient only and is rejected with a batch.
 
@@ -928,6 +930,7 @@ nunchuk tx create --wallet w123 --recipient bc1q...aaa:100000 --recipient bc1q..
 nunchuk tx create --wallet w123 --recipient bc1q...aaa:100:USD --recipient bc1q...bbb:0.002:BTC  # per-row units
 nunchuk tx create --wallet w123 --recipients-file payouts.csv                                   # many recipients
 nunchuk tx create --wallet w123 --recipients-file payouts.json --currency USD --subtract-fee    # fee split across recipients
+nunchuk tx create --wallet w123 --recipient "bitcoin:bc1q...aaa?amount=0.001" --recipient bc1q...bbb:250000  # BIP-21 URI
 ```
 
 ### `nunchuk tx fees`
@@ -1005,7 +1008,7 @@ nunchuk tx sign --wallet w123 --tx-id tx456   # → READY_TO_BROADCAST
 
 ### `nunchuk tx import`
 
-Import a PSBT file into the wallet's pending transactions. Use this when the transaction was built or signed outside Nunchuk — Sparrow, a hardware wallet's SD card, a script — and you want it to show up on every member's device without touching the mobile app.
+Import a PSBT file into the wallet's pending transactions.
 
 The command derives the transaction ID from the PSBT and checks the group server:
 
@@ -1022,7 +1025,7 @@ The file may be a binary `.psbt`, base64 text, or hex text (detected by content)
 | `--file <path>`        | Yes      | Path to the PSBT file (binary, base64, or hex text)  |
 
 ```bash
-# Import an unsigned PSBT built in Sparrow, then sign and broadcast from the CLI
+# Import an unsigned PSBT, then sign and broadcast from the CLI
 nunchuk tx import --wallet w123 --file payout.psbt
 nunchuk tx sign --wallet w123 --tx-id <tx-id>
 nunchuk tx broadcast --wallet w123 --tx-id <tx-id>

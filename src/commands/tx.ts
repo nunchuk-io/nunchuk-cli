@@ -173,9 +173,8 @@ function parseRecipientFlag(value: string, previous: RawRecipient[]): RawRecipie
   }
 }
 
-// What `tx create` / `tx draft` hand to createTransaction. The --to form keeps
-// the toAddress/amount shorthand so the single-recipient path is untouched;
-// --recipient / --recipients-file resolve to an explicit list.
+// Recipient input for createTransaction: `--to` keeps the toAddress/amount
+// shorthand; `--recipient` / `--recipients-file` give an explicit list.
 interface RecipientInput {
   toAddress?: string;
   amount?: bigint;
@@ -239,9 +238,7 @@ function grossAmountOf(
     : result.recipients.reduce((s, r) => s + r.amount, 0n);
 }
 
-// Print the recipient line(s). One recipient keeps today's `Recipient:` line;
-// more print an indexed block with each requested amount and, under
-// --subtract-fee, what each actually receives.
+// One recipient prints the `Recipient:` line; several print a `Recipients (n):` block.
 function printRecipientLines(
   recipients: SettledRecipient[],
   subtractFee: boolean,

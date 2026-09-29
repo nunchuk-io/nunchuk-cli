@@ -1915,6 +1915,30 @@ describe("tx create / tx draft with multiple recipients", () => {
     );
   });
 
+  it("accepts a BIP-21 URI as a --recipient, with its amount in BTC", async () => {
+    const { parse } = await run([
+      "tx",
+      "draft",
+      "--wallet",
+      "jk74e3up",
+      "--recipient",
+      `bitcoin:${ADDR_A}?amount=0.001&label=Row%201`,
+      "--recipient",
+      `${ADDR_B}:250000`,
+      "--currency",
+      "usd", // must not apply to the URI amount
+    ]);
+    await parse;
+    expect(mockCreateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recipients: [
+          { address: ADDR_A, amount: 100_000n },
+          { address: ADDR_B, amount: expect.any(BigInt) },
+        ],
+      }),
+    );
+  });
+
   it("rejects a malformed --recipient value and a missing recipients file", async () => {
     const malformed = await run(["tx", "create", "--wallet", "jk74e3up", "--recipient", ADDR_A]);
     await expect(malformed.parse).rejects.toThrow(/expected <address>:<amount>\[:<currency>\]/);

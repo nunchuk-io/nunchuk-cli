@@ -16,10 +16,8 @@ export function print(data: unknown, cmd: Command): void {
   }
 }
 
-// Normalise anything thrown into the `{ error, message }` shape printError
-// expects. Objects that already carry a string `error` code pass through; a
-// plain Error (or anything else) gets the fallback code, so `--json` callers
-// never see `{}` (JSON.stringify of an Error has no enumerable fields).
+// Normalise a thrown value into `{ error, message }`. A plain Error gets the
+// fallback code so `--json` callers never see `{}`.
 export function toCliError(
   err: unknown,
   fallbackCode = "COMMAND_FAILED",

@@ -35,24 +35,102 @@ function invalid(message: string): RecipientsError {
   return { error: "INVALID_PARAM", message };
 }
 
-// -- --recipient <address>:<amount>[:<currency>] --
+// -- BIP-21 payment URIs: bitcoin:<address>[?amount=<btc>&label=…&message=…] --
 
-const RECIPIENT_SHAPE = "<address>:<amount>[:<currency>]";
+export interface ParsedBtcUri {
+  address: string;
+  // The `amount` parameter, always in BTC per BIP-21; absent when not given.
+  amountBtc?: string;
+}
 
-// Parse one `--recipient` value. `ordinal` is 1-based and only used for the
-// error label. A BIP-21 `bitcoin:` URI or any other shape fails here.
-export function parseRecipientOption(value: string, ordinal: number): RawRecipient {
-  const parts = value.split(":").map((p) => p.trim());
-  if (/^bitcoin$/i.test(parts[0] ?? "")) {
+export function isBtcUri(value: string): boolean {
+  return /^bitcoin:/i.test(value.trim());
+}
+
+// Parse a BIP-21 URI. `label` and `message` are ignored; an unknown `req-`
+// parameter is rejected, as the standard requires.
+export function parseBtcUri(value: string, source: string): ParsedBtcUri {
+  const match = /^bitcoin:([^?#]*)(?:\?([^#]*))?/i.exec(value.trim());
+  if (!match) {
+    throw invalid(`Invalid BIP-21 URI "${value}" (${source}).`);
+  }
+  const address = decodeURIComponent(match[1]).trim();
+  if (address.length === 0) {
+    throw invalid(`Invalid BIP-21 URI "${value}" (${source}): missing address.`);
+  }
+  let amountBtc: string | undefined;
+  for (const pair of (match[2] ?? "").split("&").filter((p) => p.length > 0)) {
+    const eq = pair.indexOf("=");
+    const key = decodeURIComponent(eq < 0 ? pair : pair.slice(0, eq));
+    const val = eq < 0 ? "" : decodeURIComponent(pair.slice(eq + 1));
+    if (key === "amount") {
+      if (amountBtc !== undefined) {
+        throw invalid(`Invalid BIP-21 URI "${value}" (${source}): duplicate amount parameter.`);
+      }
+      if (val.trim().length === 0) {
+        throw invalid(`Invalid BIP-21 URI "${value}" (${source}): empty amount parameter.`);
+      }
+      amountBtc = val.trim();
+    } else if (/^req-/i.test(key)) {
+      throw invalid(
+        `Invalid BIP-21 URI "${value}" (${source}): unsupported required parameter "${key}".`,
+      );
+    }
+    // label, message, and other optional parameters are ignored.
+  }
+  return { address, amountBtc };
+}
+
+// Combine a possibly-URI address with a row's own amount/currency into a raw
+// recipient. A URI amount is BTC and must be the only amount for the row.
+function rowFromAddressField(
+  addressField: string,
+  amountInput: string | undefined,
+  currency: string | undefined,
+  source: string,
+  shapeHint: string,
+): RawRecipient {
+  if (!isBtcUri(addressField)) {
+    if (amountInput === undefined || amountInput.length === 0) {
+      throw invalid(`${source}: expected ${shapeHint}.`);
+    }
+    return { address: addressField, amountInput, currency, source };
+  }
+  const uri = parseBtcUri(addressField, source);
+  if (uri.amountBtc !== undefined) {
+    if ((amountInput !== undefined && amountInput.length > 0) || currency) {
+      throw invalid(
+        `${source}: the bitcoin: URI already carries an amount (in BTC); remove the row's amount and currency.`,
+      );
+    }
+    return { address: uri.address, amountInput: uri.amountBtc, currency: "BTC", source };
+  }
+  if (amountInput === undefined || amountInput.length === 0) {
     throw invalid(
-      `Invalid --recipient "${value}": expected ${RECIPIENT_SHAPE} (BIP-21 "bitcoin:" URIs are not accepted).`,
+      `${source}: the bitcoin: URI has no amount; add ?amount=<btc> to it or give an amount.`,
     );
   }
+  return { address: uri.address, amountInput, currency, source };
+}
+
+// -- --recipient <address>:<amount>[:<currency>] | <bitcoin: URI> --
+
+const RECIPIENT_SHAPE = "<address>:<amount>[:<currency>] or a bitcoin: URI with ?amount=";
+
+// Parse one `--recipient` value. `ordinal` is 1-based and only used for the
+// error label. A BIP-21 URI is taken whole (it contains ':' itself) and must
+// carry its own amount.
+export function parseRecipientOption(value: string, ordinal: number): RawRecipient {
+  const source = `--recipient #${ordinal}`;
+  if (isBtcUri(value)) {
+    return rowFromAddressField(value.trim(), undefined, undefined, source, RECIPIENT_SHAPE);
+  }
+  const parts = value.split(":").map((p) => p.trim());
   if ((parts.length !== 2 && parts.length !== 3) || parts.some((p) => p.length === 0)) {
     throw invalid(`Invalid --recipient "${value}": expected ${RECIPIENT_SHAPE}.`);
   }
   const [address, amountInput, currency] = parts;
-  return { address, amountInput, currency, source: `--recipient #${ordinal}` };
+  return { address, amountInput, currency, source };
 }
 
 // -- Recipients file (CSV or JSON, detected by content) --
@@ -96,21 +174,25 @@ function parseCsvRecipients(text: string, filePath: string): RawRecipient[] {
       headerSeen = true;
       continue;
     }
+    // 1 column is allowed only for a bitcoin: URI that carries its amount.
     if (
-      (fields.length !== 2 && fields.length !== 3) ||
+      fields.length > 3 ||
       fields[0].length === 0 ||
-      fields[1].length === 0
+      (!isBtcUri(fields[0]) && (fields.length < 2 || fields[1].length === 0))
     ) {
       throw invalid(
         `Recipients file ${filePath} line ${lineNo}: expected address,amount[,currency].`,
       );
     }
-    rows.push({
-      address: fields[0],
-      amountInput: fields[1],
-      currency: fields[2] ? fields[2] : undefined,
-      source: `${filePath} line ${lineNo}`,
-    });
+    rows.push(
+      rowFromAddressField(
+        fields[0],
+        fields[1],
+        fields[2] ? fields[2] : undefined,
+        `${filePath} line ${lineNo}`,
+        "address,amount[,currency]",
+      ),
+    );
   }
   return rows;
 }
@@ -136,33 +218,34 @@ function parseJsonRecipients(text: string, filePath: string): RawRecipient[] {
     if (typeof address !== "string" || address.trim().length === 0) {
       throw invalid(`${source}: "address" must be a non-empty string.`);
     }
-    let amountInput: string;
+    let amountInput: string | undefined;
     if (typeof amount === "string" && amount.trim().length > 0) {
       amountInput = amount.trim();
     } else if (typeof amount === "number" && Number.isFinite(amount)) {
       // Stringify so the amount goes through the same exact-decimal parsers as
       // a CSV field; floats never reach the sat arithmetic.
       amountInput = String(amount);
+    } else if (amount === undefined && isBtcUri(address)) {
+      amountInput = undefined; // may come from the URI
     } else {
       throw invalid(`${source}: "amount" must be a number or a numeric string.`);
     }
     if (currency !== undefined && (typeof currency !== "string" || currency.trim() === "")) {
       throw invalid(`${source}: "currency" must be a non-empty string when present.`);
     }
-    return {
-      address: address.trim(),
+    return rowFromAddressField(
+      address.trim(),
       amountInput,
-      currency: typeof currency === "string" ? currency.trim() : undefined,
+      typeof currency === "string" ? currency.trim() : undefined,
       source,
-    };
+      '"address" plus "amount" (or a bitcoin: URI with ?amount=)',
+    );
   });
 }
 
 // -- Resolution: units, amounts, addresses, duplicates --
 
-// scriptPubKey for an address on the given network; throws for a malformed or
-// wrong-network address. Same check createTransaction performs, done earlier
-// so the error can name the row.
+// scriptPubKey for an address; throws for a malformed or wrong-network address.
 function outputScriptForAddress(address: string, network: Network): Uint8Array {
   const btcNet = network === "mainnet" ? NETWORK : TEST_NETWORK;
   const tx = new Transaction({ allowUnknownInputs: true, disableScriptCheck: true });
@@ -179,10 +262,8 @@ export interface ResolveRecipientsOptions {
   fetchRates?: () => Promise<MarketRates>;
 }
 
-// Turn raw rows into validated recipients, in input order. Unit precedence per
-// row: the row's own currency, then `defaultCurrency`, then sat. Rejects an
-// unknown currency, an amount below 1 sat, an invalid address for the network,
-// and a duplicate address (compared by output script).
+// Validate raw rows into recipients, in input order. Unit per row: the row's
+// currency, else `defaultCurrency`, else sat. Duplicates are compared by script.
 export async function resolveRecipients(
   raw: RawRecipient[],
   network: Network,

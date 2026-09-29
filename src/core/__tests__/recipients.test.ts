@@ -43,12 +43,11 @@ describe("parseRecipientOption", () => {
     });
   });
 
-  it("rejects a missing amount, an empty part, and a BIP-21 URI by shape", () => {
+  it("rejects a missing amount, an empty part, and too many parts by shape", () => {
     const expected = /expected <address>:<amount>\[:<currency>\]/;
     expect(() => parseRecipientOption(P2WPKH, 1)).toThrow(expected);
     expect(() => parseRecipientOption(":5", 1)).toThrow(expected);
     expect(() => parseRecipientOption(`${P2WPKH}:100:`, 1)).toThrow(expected);
-    expect(() => parseRecipientOption(`bitcoin:${P2WPKH}?amount=0.01`, 1)).toThrow(expected);
     expect(() => parseRecipientOption(`${P2WPKH}:1:usd:extra`, 1)).toThrow(expected);
   });
 
@@ -59,9 +58,100 @@ describe("parseRecipientOption", () => {
     } catch (err) {
       expect(err).toEqual({
         error: "INVALID_PARAM",
-        message: 'Invalid --recipient "nope": expected <address>:<amount>[:<currency>].',
+        message:
+          'Invalid --recipient "nope": expected <address>:<amount>[:<currency>] or a bitcoin: URI with ?amount=.',
       });
     }
+  });
+
+  it("accepts a BIP-21 URI with an amount, taken whole and in BTC", () => {
+    expect(parseRecipientOption(`bitcoin:${P2WPKH}?amount=0.001`, 1)).toEqual({
+      address: P2WPKH,
+      amountInput: "0.001",
+      currency: "BTC",
+      source: "--recipient #1",
+    });
+    // Upper-case scheme and address (QR style), label and message ignored.
+    expect(
+      parseRecipientOption(
+        `BITCOIN:${P2WPKH.toUpperCase()}?amount=0.5&label=Payroll%20row%201&message=Q3`,
+        2,
+      ),
+    ).toEqual({
+      address: P2WPKH.toUpperCase(),
+      amountInput: "0.5",
+      currency: "BTC",
+      source: "--recipient #2",
+    });
+  });
+
+  it("rejects a BIP-21 URI without an amount, with a req- parameter, or with a duplicate amount", () => {
+    expect(() => parseRecipientOption(`bitcoin:${P2WPKH}`, 1)).toThrow(/URI has no amount/);
+    expect(() => parseRecipientOption(`bitcoin:${P2WPKH}?label=x`, 1)).toThrow(/URI has no amount/);
+    expect(() => parseRecipientOption(`bitcoin:${P2WPKH}?amount=1&req-foo=bar`, 1)).toThrow(
+      /unsupported required parameter "req-foo"/,
+    );
+    expect(() => parseRecipientOption(`bitcoin:${P2WPKH}?amount=1&amount=2`, 1)).toThrow(
+      /duplicate amount parameter/,
+    );
+    expect(() => parseRecipientOption(`bitcoin:?amount=1`, 1)).toThrow(/missing address/);
+    expect(() => parseRecipientOption(`bitcoin:${P2WPKH}?amount=`, 1)).toThrow(
+      /empty amount parameter/,
+    );
+  });
+});
+
+describe("BIP-21 URIs in recipients files", () => {
+  it("accepts a URI in the CSV address column, alone or with the row's own amount", () => {
+    const file = writeTemp(
+      "uri.csv",
+      [
+        `bitcoin:${P2WPKH}?amount=0.001`,
+        `bitcoin:${P2WSH}?amount=0.002&label=Row%202,`,
+        `bitcoin:${P2TR},250,USD`,
+      ].join("\n"),
+    );
+    expect(parseRecipientsFile(file)).toEqual([
+      { address: P2WPKH, amountInput: "0.001", currency: "BTC", source: `${file} line 1` },
+      { address: P2WSH, amountInput: "0.002", currency: "BTC", source: `${file} line 2` },
+      { address: P2TR, amountInput: "250", currency: "USD", source: `${file} line 3` },
+    ]);
+  });
+
+  it("rejects a CSV row that gives both a URI amount and its own amount or currency", () => {
+    const both = writeTemp("both.csv", `bitcoin:${P2WPKH}?amount=0.001,100000\n`);
+    expect(() => parseRecipientsFile(both)).toThrow(/URI already carries an amount/);
+    const cur = writeTemp("cur.csv", `bitcoin:${P2WPKH}?amount=0.001,,USD\n`);
+    expect(() => parseRecipientsFile(cur)).toThrow(/URI already carries an amount/);
+    const none = writeTemp("none.csv", `bitcoin:${P2WPKH}\n`);
+    expect(() => parseRecipientsFile(none)).toThrow(/URI has no amount/);
+  });
+
+  it("accepts a URI in the JSON address field with the same rules", () => {
+    const file = writeTemp(
+      "uri.json",
+      JSON.stringify([
+        { address: `bitcoin:${P2WPKH}?amount=0.001` },
+        { address: `bitcoin:${P2WSH}`, amount: 5000 },
+      ]),
+    );
+    expect(parseRecipientsFile(file)).toEqual([
+      { address: P2WPKH, amountInput: "0.001", currency: "BTC", source: `${file} item 1` },
+      { address: P2WSH, amountInput: "5000", currency: undefined, source: `${file} item 2` },
+    ]);
+    const conflict = writeTemp(
+      "conflict.json",
+      JSON.stringify([{ address: `bitcoin:${P2WPKH}?amount=0.001`, amount: 1 }]),
+    );
+    expect(() => parseRecipientsFile(conflict)).toThrow(/URI already carries an amount/);
+    const missing = writeTemp("missing.json", JSON.stringify([{ address: P2WPKH }]));
+    expect(() => parseRecipientsFile(missing)).toThrow(/"amount" must be a number/);
+  });
+
+  it("resolves a URI amount as BTC even when --currency says otherwise", async () => {
+    const rows = [parseRecipientOption(`bitcoin:${P2WPKH}?amount=0.001`, 1)];
+    const recipients = await resolveRecipients(rows, "mainnet", { defaultCurrency: "USD" });
+    expect(recipients).toEqual([{ address: P2WPKH, amount: 100_000n }]);
   });
 });
 
