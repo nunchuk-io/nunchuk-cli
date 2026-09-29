@@ -281,6 +281,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | `tx create`    | Create a new transaction, optionally selecting miniscript path/preimages                      |
 | `tx draft`     | Preview a transaction (fee, total, change, input coins) without creating it                    |
 | `tx sign`      | Sign a transaction locally, attach miniscript preimages, or merge a signed PSBT with `--psbt` |
+| `tx import`    | Import a PSBT file created or signed elsewhere; creates or merges the pending transaction     |
 | `tx broadcast` | Broadcast a fully signed transaction                                                          |
 | `tx list`      | List transactions for a wallet                                                                |
 | `tx get`       | Get transaction details                                                                       |
@@ -350,6 +351,14 @@ nunchuk tx sign --wallet <id> --tx-id <txid> --psbt <signed-psbt-base64> # merge
 ```
 
 Taproot multisig spends use **MuSig2** and need two signing rounds: the first `tx sign` publishes the signer's nonce (`PENDING_NONCE` → `PENDING_SIGNATURES`), the second produces its partial signature (`READY_TO_BROADCAST`). Taproot miniscript (`multi_a`) and non-taproot wallets sign in one pass.
+
+#### `tx import`
+
+```bash
+nunchuk tx import --wallet <id> --file payout.psbt      # binary, base64, or hex PSBT file
+```
+
+Imports a PSBT built or signed outside Nunchuk. The txid is derived from the file: if the transaction is not on the group server yet it is uploaded as a new pending transaction (`created`); if it is already pending, the file is merged with the server copy so new signatures reach every device (`merged`, or `unchanged` when the file adds nothing). Before uploading, every input must belong to the wallet, be unspent with the claimed amount, and use the canonical sighash; raw signed transactions and PSBT v2 are rejected. Use it instead of `tx sign --psbt` when you do not know the txid or the PSBT is too large for the command line.
 
 #### `tx broadcast`
 
