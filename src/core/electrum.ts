@@ -325,14 +325,18 @@ export function parseBlockTime(headerHex: string): number {
   return bytes.readUInt32LE(0);
 }
 
-// Convert Bitcoin address to Electrum scripthash
+// Convert an output script (scriptPubKey) to an Electrum scripthash
 // Reference: libnunchuk src/utils/addressutils.hpp:64-72
+export function scriptToScripthash(scriptPubKey: Uint8Array): string {
+  const hash = sha256(scriptPubKey);
+  const reversed = new Uint8Array(hash).reverse();
+  return Buffer.from(reversed).toString("hex");
+}
+
+// Convert Bitcoin address to Electrum scripthash
 export function addressToScripthash(address: string, network: Network): string {
   const net = network === "mainnet" ? NETWORK : TEST_NETWORK;
   const addrCodec = Address(net);
   const decoded = addrCodec.decode(address);
-  const scriptPubKey = OutScript.encode(decoded);
-  const hash = sha256(scriptPubKey);
-  const reversed = new Uint8Array(hash).reverse();
-  return Buffer.from(reversed).toString("hex");
+  return scriptToScripthash(OutScript.encode(decoded));
 }

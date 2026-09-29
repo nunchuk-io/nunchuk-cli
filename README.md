@@ -131,6 +131,9 @@ nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id>
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --psbt <signed-psbt>
 nunchuk tx broadcast --wallet <wallet-id> --tx-id <tx-id>
 
+# Import a PSBT created or signed elsewhere (Sparrow, hardware wallet, script)
+nunchuk tx import --wallet <wallet-id> --file payout.psbt
+
 # For miniscript, optionally choose a path and attach required hash preimages
 nunchuk tx create --wallet <wallet-id> --to <address> --amount 100000 --miniscript-path 0
 nunchuk tx sign --wallet <wallet-id> --tx-id <tx-id> --preimage <32-byte-hex>
@@ -278,6 +281,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 | `tx create`    | Create a new transaction, optionally selecting miniscript path/preimages                      |
 | `tx draft`     | Preview a transaction (fee, total, change, input coins) without creating it                    |
 | `tx sign`      | Sign a transaction locally, attach miniscript preimages, or merge a signed PSBT with `--psbt` |
+| `tx import`    | Import a PSBT file created or signed elsewhere; creates or merges the pending transaction     |
 | `tx broadcast` | Broadcast a fully signed transaction                                                          |
 | `tx list`      | List transactions for a wallet                                                                |
 | `tx get`       | Get transaction details                                                                       |
@@ -298,6 +302,8 @@ nunchuk tx create --wallet <id> --to <address> --amount <sats> --coin <txid:vout
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-tag kyc          # auto-select only from tagged coins
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --from-collection "Exchange A"  # auto-select only from a collection
 nunchuk tx create --wallet <id> --to <address> --amount <sats> --change-tags none      # don't tag the change coin
+nunchuk tx create --wallet <id> --recipient <addr1>:100000 --recipient <addr2>:0.002:BTC  # several recipients in one tx
+nunchuk tx create --wallet <id> --recipients-file payouts.csv                          # many recipients from a CSV/JSON file
 ```
 
 Fee rate is automatically estimated from the Nunchuk API, or set manually with `--fee-rate <sat/vB>`. When auto-estimating, the **level** is `--fee-level <economy|standard|priority>` (one-shot), else the account's saved default (`config fee-rate set`), else `economy`; `--fee-rate` overrides the level. Run [`tx fees`](#tx-fees) to see the current rates for each level. For taproot wallets the key path (MuSig2 aggregate) is used by default; `--taproot-script-path` forces a tapscript spend.
@@ -306,7 +312,9 @@ Fee rate is automatically estimated from the Nunchuk API, or set manually with `
 
 `--subtract-fee` takes the network fee out of the send amount instead of adding it on top, so the recipient receives `amount - fee` and the wallet's total spend stays at `amount`. The output shows the reduced `Recipient receives` value. The send fails if the amount cannot cover the fee or the recipient would drop below the dust threshold.
 
-`--send-all` sweeps the entire wallet balance to the recipient — it spends every coin, forces `--subtract-fee` on (recipient receives `balance - fee`), and leaves no change. Use it instead of `--amount` (exactly one is required); if both are given, `--amount` is ignored with a warning.
+`--send-all` sweeps the entire wallet balance to the recipient — it spends every coin, forces `--subtract-fee` on (recipient receives `balance - fee`), and leaves no change. Use it instead of `--amount` (exactly one is required); if both are given, `--amount` is ignored with a warning. Single recipient only.
+
+**Multiple recipients.** Pay several addresses in one transaction with repeated `--recipient <address>:<amount>[:<currency>]` flags, or `--recipients-file <path>` for a CSV (`address,amount[,currency]`) or JSON (`[{ "address", "amount", "currency"? }]`) file. Each row's unit defaults to `--currency` (then sat), so rows may mix USD, BTC, and sats. A BIP-21 `bitcoin:` URI is accepted in place of an address; its `amount` is in BTC and replaces the row's amount. Recipients are paid in the order given; `--subtract-fee` splits the fee equally with the remainder on the first recipient; duplicates, dust outputs, and batches over the standard weight limit are rejected before anything is uploaded. See the [CLI reference](docs/cli-reference.md#nunchuk-tx-create) for the file format and rules.
 
 `--coin <txid:vout>` (repeatable) selects coins manually: the transaction spends **exactly** the chosen coins — no subset optimization, no automatic top-up (a shortfall fails with insufficient funds). Explicitly chosen coins are spent even when locked. Combined with `--send-all`, only the chosen coins are swept. Cannot be combined with `--from-tag` or `--from-collection`.
 
@@ -327,6 +335,7 @@ Shows the current recommended fee rates (priority / standard / economy) from the
 ```bash
 nunchuk tx draft --wallet <id> --to <address> --amount <sats>
 nunchuk tx draft --wallet <id> --to <address> --amount <sats> --fiat USD
+nunchuk tx draft --wallet <id> --recipients-file payouts.csv --fiat USD
 ```
 
 Previews a transaction the way `tx create` would build it — recipient, estimated fee, total amount, change, and the input coins (value + block date) — **without** creating or uploading anything. Takes the same options as `tx create`, plus `--fiat <code>` to show fiat values alongside BTC. It calls the same builder as `tx create`, so the numbers match; when no `--fee-rate` is given the fee is auto-estimated and may change before you run `tx create` (pass `--fee-rate` to lock it).
@@ -342,6 +351,14 @@ nunchuk tx sign --wallet <id> --tx-id <txid> --psbt <signed-psbt-base64> # merge
 ```
 
 Taproot multisig spends use **MuSig2** and need two signing rounds: the first `tx sign` publishes the signer's nonce (`PENDING_NONCE` → `PENDING_SIGNATURES`), the second produces its partial signature (`READY_TO_BROADCAST`). Taproot miniscript (`multi_a`) and non-taproot wallets sign in one pass.
+
+#### `tx import`
+
+```bash
+nunchuk tx import --wallet <id> --file payout.psbt      # binary, base64, or hex PSBT file
+```
+
+Imports a PSBT built or signed outside Nunchuk. The txid is derived from the file: if the transaction is not on the group server yet it is uploaded as a new pending transaction (`created`); if it is already pending, the file is merged with the server copy so new signatures reach every device (`merged`, or `unchanged` when the file adds nothing). Before uploading, every input must belong to the wallet, be unspent with the claimed amount, and use the canonical sighash; raw signed transactions and PSBT v2 are rejected. Use it instead of `tx sign --psbt` when you do not know the txid or the PSBT is too large for the command line.
 
 #### `tx broadcast`
 

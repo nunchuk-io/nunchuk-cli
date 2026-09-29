@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { HDKey } from "@scure/bip32";
-import { hex } from "@scure/base";
+import { base58check, bech32, bech32m, hex } from "@scure/base";
 import { Transaction, TEST_NETWORK } from "@scure/btc-signer";
 import { ripemd160 } from "@noble/hashes/legacy.js";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -22,6 +22,7 @@ import {
   createTransaction,
   decodePsbtDetail,
   fetchPendingTransaction,
+  fetchPendingTransactionIfExists,
   fetchPendingTransactions,
   fetchPendingTxInputTimelockMetadataBatch,
   fetchPsbtInputTimelockMetadata,
@@ -285,6 +286,70 @@ describe("fetchPendingTransactions", () => {
     await expect(fetchPendingTransaction(client, TEST_WALLET, "deleted-tx")).rejects.toThrow(
       "Transaction not found on server",
     );
+  });
+});
+
+describe("fetchPendingTransactionIfExists", () => {
+  it("returns the pending transaction when the server has it", async () => {
+    const client = {
+      get: vi.fn(async () => ({
+        transaction: await createServerTxEvent("active-tx", createPsbtB64("active")),
+      })),
+    } as unknown as ApiClient;
+
+    await expect(
+      fetchPendingTransactionIfExists(client, TEST_WALLET, "active-tx"),
+    ).resolves.toEqual({ txId: "active-tx", psbt: createPsbtB64("active") });
+  });
+
+  it("resolves null on the backend's 5404 'Transaction not found' error", async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw { error: "5404", message: "Transaction not found: abc123" };
+      }),
+    } as unknown as ApiClient;
+
+    await expect(
+      fetchPendingTransactionIfExists(client, TEST_WALLET, "missing"),
+    ).resolves.toBeNull();
+  });
+
+  it("resolves null for a deleted (empty-PSBT) transaction event", async () => {
+    const client = {
+      get: vi.fn(async () => ({
+        transaction: await createServerTxEvent("deleted-tx", ""),
+      })),
+    } as unknown as ApiClient;
+
+    await expect(
+      fetchPendingTransactionIfExists(client, TEST_WALLET, "deleted-tx"),
+    ).resolves.toBeNull();
+  });
+
+  it("rethrows a 5404 that is not about the transaction (e.g. wallet not found)", async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw { error: "5404", message: "Wallet not found: xyz" };
+      }),
+    } as unknown as ApiClient;
+
+    await expect(fetchPendingTransactionIfExists(client, TEST_WALLET, "missing")).rejects.toEqual({
+      error: "5404",
+      message: "Wallet not found: xyz",
+    });
+  });
+
+  it("rethrows other API errors", async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw { error: "NETWORK_ERROR", message: "offline" };
+      }),
+    } as unknown as ApiClient;
+
+    await expect(fetchPendingTransactionIfExists(client, TEST_WALLET, "missing")).rejects.toEqual({
+      error: "NETWORK_ERROR",
+      message: "offline",
+    });
   });
 });
 
@@ -3811,5 +3876,454 @@ describe("createTransaction miniscript", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe("createTransaction multiple recipients", () => {
+  // Three distinct wallet-external P2WSH addresses (index 10..12) as recipients.
+  const RECIPIENTS = deriveDescriptorAddresses(TEST_WALLET.descriptor, "testnet", 0, 10, 3);
+
+  // A syntactically valid testnet P2WPKH address with an arbitrary 20-byte
+  // program — cheap to mint in bulk for the weight-limit test.
+  function fakeP2wpkhAddress(i: number): string {
+    const program = new Uint8Array(20);
+    program[16] = (i >>> 24) & 0xff;
+    program[17] = (i >>> 16) & 0xff;
+    program[18] = (i >>> 8) & 0xff;
+    program[19] = i & 0xff;
+    return bech32.encode("tb", [0, ...bech32.toWords(program)]);
+  }
+
+  function offline<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  function outputAmounts(tx: Transaction): bigint[] {
+    return Array.from({ length: tx.outputsLength }, (_, i) => tx.getOutput(i).amount!);
+  }
+
+  function totalInputs(tx: Transaction): bigint {
+    let total = 0n;
+    for (let i = 0; i < tx.inputsLength; i++) total += tx.getInput(i).witnessUtxo!.amount;
+    return total;
+  }
+
+  it("pays every recipient in the order given and conserves value (default path)", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [
+      80_000n,
+      35_000n,
+      30_000n,
+      25_000n,
+    ]);
+    await offline(async () => {
+      const recipients = [
+        { address: RECIPIENTS[0], amount: 10_000n },
+        { address: RECIPIENTS[1], amount: 12_000n },
+        { address: RECIPIENTS[2], amount: 14_000n },
+      ];
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        recipients,
+        rng: new SeededRng(3),
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+
+      // Recipient outputs keep their requested values and their order; change
+      // (the only output with wallet metadata) sits somewhere among them.
+      const changeIdx = findChangeOutputIndex(tx);
+      const amounts = outputAmounts(tx);
+      expect(amounts.filter((_, i) => i !== changeIdx)).toEqual([10_000n, 12_000n, 14_000n]);
+      expect(amounts[changeIdx]).toBe(result.changeAmount);
+      expect(tx.outputsLength).toBe(4);
+
+      // Value conservation: inputs = Σ recipients + change + fee.
+      expect(totalInputs(tx) - amounts.reduce((s, a) => s + a, 0n)).toBe(result.fee);
+      expect(result.recipients).toEqual(recipients.map((r) => ({ ...r, receives: r.amount })));
+      expect(result.recipientAmount).toBe(10_000n);
+      expect(result.subtractFee).toBe(false);
+    });
+  });
+
+  it("randomises the change position across all n + 1 slots", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [80_000n]);
+    await offline(async () => {
+      const positions = new Set<number>();
+      for (let seed = 0; seed < 40; seed++) {
+        const result = await createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          recipients: [
+            { address: RECIPIENTS[0], amount: 10_000n },
+            { address: RECIPIENTS[1], amount: 12_000n },
+            { address: RECIPIENTS[2], amount: 14_000n },
+          ],
+          rng: new SeededRng(seed),
+        });
+        const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+        positions.add(findChangeOutputIndex(tx));
+      }
+      expect([...positions].sort()).toEqual([0, 1, 2, 3]);
+    });
+  });
+
+  it("splits a subtracted fee equally with the remainder on the first recipient", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [80_000n, 35_000n]);
+    await offline(async () => {
+      const amounts = [10_000n, 12_000n, 14_000n];
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        recipients: RECIPIENTS.map((address, i) => ({ address, amount: amounts[i] })),
+        subtractFeeFromAmount: true,
+        rng: new SeededRng(1),
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      const totalIn = totalInputs(tx);
+      const sum = 36_000n;
+
+      // spender.cpp: to_reduce = fee_needed - current_fee, split equally,
+      // remainder on the first recipient.
+      expect(result.changeAddress).not.toBeNull();
+      const toReduce = result.fee - (totalIn - sum - result.changeAmount);
+      expect(toReduce).toBe(result.fee); // with change, current_fee == 0 before reduction
+      const each = toReduce / 3n;
+      const rem = toReduce % 3n;
+      const receives = result.recipients.map((r) => r.receives);
+      expect(receives).toEqual(amounts.map((a, i) => a - each - (i === 0 ? rem : 0n)));
+      expect(receives[0]).toBeLessThanOrEqual(receives[1] - 2_000n + 0n); // first pays the remainder
+      // Σ receives + change + fee = Σ inputs, and the outputs carry `receives`.
+      expect(receives.reduce((s, v) => s + v, 0n) + result.changeAmount + result.fee).toBe(totalIn);
+      const changeIdx = findChangeOutputIndex(tx);
+      expect(outputAmounts(tx).filter((_, i) => i !== changeIdx)).toEqual(receives);
+      expect(result.recipientAmount).toBe(receives[0]);
+    });
+  });
+
+  it("folds a dropped change output back into the recipients (negative to_reduce)", async () => {
+    // One 40 000 sat coin; recipients sum to 39 700 so the raw change (300 sat)
+    // is below minimum viable change (330 sat for P2WSH) and is dropped. That
+    // 300 sat already exceeds the fee, so to_reduce is negative and the surplus
+    // goes back to the recipients — exactly spender.cpp:458 semantics.
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    await offline(async () => {
+      const amounts = [13_000n, 13_000n, 13_700n];
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        recipients: RECIPIENTS.map((address, i) => ({ address, amount: amounts[i] })),
+        subtractFeeFromAmount: true,
+        rng: new SeededRng(1),
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      expect(result.changeAddress).toBeNull();
+      expect(tx.outputsLength).toBe(3);
+      expect(result.fee).toBeLessThan(300n);
+
+      const toReduce = result.fee - 300n; // negative
+      expect(toReduce).toBeLessThan(0n);
+      const each = toReduce / 3n; // truncates toward zero, like C++
+      const rem = toReduce % 3n;
+      const receives = result.recipients.map((r) => r.receives);
+      expect(receives).toEqual(amounts.map((a, i) => a - each - (i === 0 ? rem : 0n)));
+      expect(receives.reduce((s, v) => s + v, 0n)).toBe(40_000n - result.fee);
+      expect(outputAmounts(tx)).toEqual(receives);
+    });
+  });
+
+  it("rejects a dust recipient before selection, naming it", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    await offline(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          recipients: [
+            { address: RECIPIENTS[0], amount: 10_000n },
+            { address: RECIPIENTS[1], amount: 100n },
+          ],
+        }),
+      ).rejects.toThrow(`Transaction amount too small (recipient ${RECIPIENTS[1]}).`);
+      expect(electrum.getTransactionBatch).not.toHaveBeenCalled();
+    });
+  });
+
+  it("rejects a recipient whose output falls below dust after the fee is subtracted, naming it", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    await offline(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          recipients: [
+            { address: RECIPIENTS[0], amount: 20_000n },
+            { address: RECIPIENTS[1], amount: 340n }, // just above P2WSH dust (330)
+          ],
+          subtractFeeFromAmount: true,
+        }),
+      ).rejects.toThrow(
+        `The transaction amount is too small to send after the fee has been deducted (recipient ${RECIPIENTS[1]}).`,
+      );
+    });
+  });
+
+  it("rejects duplicate recipients, an empty list, and send-all with several recipients", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    await offline(async () => {
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          recipients: [
+            { address: RECIPIENTS[0], amount: 1_000n },
+            { address: RECIPIENTS[0], amount: 2_000n },
+          ],
+        }),
+      ).rejects.toThrow(/Duplicate recipient/);
+      await expect(
+        createTransaction({ wallet: TEST_WALLET, network: "testnet", electrum, recipients: [] }),
+      ).rejects.toThrow(/At least one recipient/);
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          recipients: [
+            { address: RECIPIENTS[0], amount: 1_000n },
+            { address: RECIPIENTS[1], amount: 2_000n },
+          ],
+          sendAll: true,
+        }),
+      ).rejects.toThrow(/--send-all supports a single recipient/);
+    });
+  });
+
+  it("rejects a batch whose outputs alone exceed the standard weight limit, before scanning", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [40_000n]);
+    await offline(async () => {
+      const recipients = Array.from({ length: 4_000 }, (_, i) => ({
+        address: fakeP2wpkhAddress(i),
+        amount: 1_000n,
+      }));
+      await expect(
+        createTransaction({ wallet: TEST_WALLET, network: "testnet", electrum, recipients }),
+      ).rejects.toThrow(/Transaction too large \(4000 recipients/);
+      expect(electrum.listUnspentBatch).not.toHaveBeenCalled();
+    });
+  });
+
+  it("keeps the toAddress/amount shorthand equivalent to a one-element recipient list", async () => {
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [80_000n, 35_000n]);
+    await offline(async () => {
+      const viaShorthand = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        toAddress: TEST_RECIPIENT,
+        amount: 10_000n,
+        rng: new SeededRng(7),
+      });
+      const viaList = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        recipients: [{ address: TEST_RECIPIENT, amount: 10_000n }],
+        rng: new SeededRng(7),
+      });
+      expect(viaList.psbtB64).toBe(viaShorthand.psbtB64);
+      expect(viaShorthand.recipients).toEqual([
+        { address: TEST_RECIPIENT, amount: 10_000n, receives: 10_000n },
+      ]);
+      await expect(
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          toAddress: TEST_RECIPIENT,
+          amount: 10_000n,
+          recipients: [{ address: TEST_RECIPIENT, amount: 10_000n }],
+        }),
+      ).rejects.toThrow(/either recipients or toAddress/);
+    });
+  });
+});
+
+describe("createTransaction recipient output script types", () => {
+  // Syntactically valid testnet addresses of every output shape, built from
+  // fixed byte programs (no key material needed to *pay* an address). Each
+  // comes with the scriptPubKey it must decode to.
+  type ScriptType = "P2WPKH" | "P2WSH" | "P2TR" | "P2SH" | "P2PKH";
+  const b58 = base58check(sha256);
+  function fakeAddress(type: ScriptType, fill: number): { address: string; script: Uint8Array } {
+    const prog = (len: number) => new Uint8Array(len).fill(fill);
+    switch (type) {
+      case "P2WPKH": {
+        const p = prog(20);
+        return {
+          address: bech32.encode("tb", [0, ...bech32.toWords(p)]),
+          script: concatBytes([new Uint8Array([0x00, 0x14]), p]),
+        };
+      }
+      case "P2WSH": {
+        const p = prog(32);
+        return {
+          address: bech32.encode("tb", [0, ...bech32.toWords(p)]),
+          script: concatBytes([new Uint8Array([0x00, 0x20]), p]),
+        };
+      }
+      case "P2TR": {
+        // A valid x-only point (the BIP341 "nothing up my sleeve" key) so any
+        // curve check on decode passes; the fill byte varies the last byte.
+        const p = hex.decode("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0");
+        return {
+          address: bech32m.encode("tb", [1, ...bech32m.toWords(p)]),
+          script: concatBytes([new Uint8Array([0x51, 0x20]), p]),
+        };
+      }
+      case "P2SH": {
+        const h = prog(20);
+        return {
+          address: b58.encode(concatBytes([new Uint8Array([0xc4]), h])),
+          script: concatBytes([new Uint8Array([0xa9, 0x14]), h, new Uint8Array([0x87])]),
+        };
+      }
+      case "P2PKH": {
+        const h = prog(20);
+        return {
+          address: b58.encode(concatBytes([new Uint8Array([0x6f]), h])),
+          script: concatBytes([
+            new Uint8Array([0x76, 0xa9, 0x14]),
+            h,
+            new Uint8Array([0x88, 0xac]),
+          ]),
+        };
+      }
+    }
+  }
+
+  // Bitcoin Core dust at the 3 sat/vB discard rate: 3 × (output size + 67 for a
+  // witness output, 148 for a legacy one).
+  const DUST: Record<ScriptType, bigint> = {
+    P2WPKH: 294n,
+    P2WSH: 330n,
+    P2TR: 330n,
+    P2SH: 540n,
+    P2PKH: 546n,
+  };
+  const OUTPUT_SIZE: Record<ScriptType, number> = {
+    P2WPKH: 31,
+    P2WSH: 43,
+    P2TR: 43,
+    P2SH: 32,
+    P2PKH: 34,
+  };
+  const TYPES: ScriptType[] = ["P2WPKH", "P2WSH", "P2TR", "P2SH", "P2PKH"];
+  const ANCHOR = deriveDescriptorAddresses(TEST_WALLET.descriptor, "testnet", 0, 10, 1)[0];
+
+  function offline<T>(fn: () => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as typeof fetch;
+    return fn().finally(() => {
+      globalThis.fetch = originalFetch;
+    });
+  }
+
+  it.each(TYPES)("applies the %s dust threshold to a recipient of that type", async (type) => {
+    const { address } = fakeAddress(type, 0x11);
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [80_000n]);
+    await offline(async () => {
+      const build = (amount: bigint) =>
+        createTransaction({
+          wallet: TEST_WALLET,
+          network: "testnet",
+          electrum,
+          recipients: [
+            { address: ANCHOR, amount: 10_000n },
+            { address, amount },
+          ],
+          rng: new SeededRng(1),
+        });
+      await expect(build(DUST[type] - 1n)).rejects.toThrow(
+        `Transaction amount too small (recipient ${address}).`,
+      );
+      const ok = await build(DUST[type]);
+      expect(ok.recipients[1]).toEqual({ address, amount: DUST[type], receives: DUST[type] });
+    });
+  });
+
+  it("pays one recipient of each script type in order, with the exact scriptPubKeys", async () => {
+    const recipients = TYPES.map((type, i) => ({ type, ...fakeAddress(type, 0x20 + i) }));
+    const amounts = [2_000n, 3_000n, 4_000n, 5_000n, 6_000n];
+    const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [80_000n, 35_000n]);
+    await offline(async () => {
+      const result = await createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        recipients: recipients.map((r, i) => ({ address: r.address, amount: amounts[i] })),
+        rng: new SeededRng(5),
+      });
+      const tx = Transaction.fromPSBT(Buffer.from(result.psbtB64, "base64"));
+      const changeIdx = findChangeOutputIndex(tx);
+      const outputs = Array.from({ length: tx.outputsLength }, (_, i) => tx.getOutput(i)).filter(
+        (_, i) => i !== changeIdx,
+      );
+      expect(outputs.map((o) => hex.encode(o.script!))).toEqual(
+        recipients.map((r) => hex.encode(r.script)),
+      );
+      expect(outputs.map((o) => o.amount)).toEqual(amounts);
+
+      let totalIn = 0n;
+      for (let i = 0; i < tx.inputsLength; i++) totalIn += tx.getInput(i).witnessUtxo!.amount;
+      let totalOut = 0n;
+      for (let i = 0; i < tx.outputsLength; i++) totalOut += tx.getOutput(i).amount!;
+      expect(totalIn - totalOut).toBe(result.fee);
+    });
+  });
+
+  it("changes only the fee, by the output-size delta, when recipient types change", async () => {
+    // Same amounts, same coins, same RNG seed: one batch of five P2WPKH
+    // recipients versus one recipient of each type. The coin choice must be
+    // identical; the fee differs by exactly the extra output bytes at 1 sat/vB
+    // (the mock Electrum estimate), because outputs carry no witness discount.
+    const amounts = [2_000n, 3_000n, 4_000n, 5_000n, 6_000n];
+    const build = async (types: ScriptType[]) => {
+      const { electrum } = createMultiUtxoElectrumMock(TEST_WALLET.descriptor, [80_000n, 35_000n]);
+      return createTransaction({
+        wallet: TEST_WALLET,
+        network: "testnet",
+        electrum,
+        recipients: types.map((type, i) => ({
+          address: fakeAddress(type, 0x30 + i).address,
+          amount: amounts[i],
+        })),
+        rng: new SeededRng(9),
+      });
+    };
+    await offline(async () => {
+      const allWpkh = await build(["P2WPKH", "P2WPKH", "P2WPKH", "P2WPKH", "P2WPKH"]);
+      const mixed = await build(TYPES);
+      expect(mixed.selectedInputs).toEqual(allWpkh.selectedInputs);
+      expect(mixed.changeAddress).toBe(allWpkh.changeAddress);
+      const extraBytes = TYPES.reduce((s, t) => s + OUTPUT_SIZE[t], 0) - 5 * OUTPUT_SIZE.P2WPKH;
+      expect(extraBytes).toBe(28);
+      expect(mixed.fee - allWpkh.fee).toBe(BigInt(extraBytes));
+      expect(allWpkh.changeAmount - mixed.changeAmount).toBe(BigInt(extraBytes));
+    });
   });
 });
