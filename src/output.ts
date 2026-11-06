@@ -7,6 +7,38 @@ import { loadConfig, getEphemeralKeypair, getNetwork } from "./core/config.js";
 import { listWallets } from "./core/storage.js";
 import { isRecord } from "./core/utils.js";
 import { getGroupReplaceWalletId } from "./core/wallet-replacement.js";
+import type { PendingTxDetail } from "./core/transaction.js";
+
+/**
+ * Human-readable summary of a pending transaction, printed before an
+ * irreversible step (signing or broadcasting) so the person at the keyboard
+ * sees what they are approving. Text mode only; --json output is unchanged.
+ */
+export function printTxSummary(
+  detail: PendingTxDetail,
+  wallet: { name: string; m: number; n: number },
+  options: { signaturesToAdd?: number } = {},
+): void {
+  const recipients = detail.outputs.filter((o) => !o.isChange);
+  const change = detail.outputs.filter((o) => o.isChange);
+  console.log(`Wallet:      ${wallet.name} (${wallet.m}-of-${wallet.n})`);
+  console.log(recipients.length === 1 ? "Recipient:" : `Recipients (${recipients.length}):`);
+  for (const r of recipients) {
+    console.log(`  ${r.address ?? "unknown"}  ${r.amountBtc} (${r.amount})`);
+  }
+  for (const c of change) {
+    console.log(`Change:      ${c.address ?? "unknown"}  ${c.amountBtc} (${c.amount})`);
+  }
+  console.log(`Send:        ${detail.subAmountBtc} (${detail.subAmount})`);
+  console.log(`Fee:         ${detail.feeBtc} (${detail.fee})`);
+  const toAdd = options.signaturesToAdd ?? 0;
+  const completes = toAdd > 0 && detail.signedCount + toAdd >= detail.requiredCount;
+  console.log(
+    `Signatures:  ${detail.signedCount}/${detail.requiredCount}${
+      completes ? " — this signature completes the threshold" : ""
+    }`,
+  );
+}
 
 export function print(data: unknown, cmd: Command): void {
   if (cmd.optsWithGlobals().json) {

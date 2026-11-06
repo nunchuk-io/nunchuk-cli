@@ -43,8 +43,8 @@ nunchuk network tip
 # Generate a software signing key
 nunchuk key generate --name "Alice"
 
-# Import an existing BIP39 mnemonic
-nunchuk key import --name "Alice Backup" <bip39 words>
+# Import an existing BIP39 mnemonic (typed at a masked prompt, or --stdin / --file)
+nunchuk key import --name "Alice Backup"
 
 # Derive signer info for a stored key
 nunchuk key info --fingerprint <xfp>
@@ -199,7 +199,7 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 
 | Command       | Description                                                           |
 | ------------- | --------------------------------------------------------------------- |
-| `auth login`  | Authenticate with API key (use `--api-key` for non-interactive login) |
+| `auth login`  | Authenticate with API key (prompt, `--api-key-stdin`, `NUNCHUK_API_KEY`, or `--api-key`) |
 | `auth status` | Show authentication status for the selected network                   |
 | `auth logout` | Remove the stored API key for the selected network                    |
 
@@ -215,8 +215,8 @@ For full command documentation, see [docs/cli-reference.md](docs/cli-reference.m
 
 | Command        | Description                                             |
 | -------------- | ------------------------------------------------------- |
-| `key generate` | Generate a new BIP39 mnemonic and save locally          |
-| `key import`   | Import an existing BIP39 mnemonic and save locally      |
+| `key generate` | Generate a new BIP39 mnemonic and save locally (terminal, or `--show-mnemonic`) |
+| `key import`   | Import an existing BIP39 mnemonic and save locally (prompt, `--stdin`, `--file`) |
 | `key info`     | Derive signer info from a stored key, mnemonic, or xprv |
 | `key list`     | List locally stored keys                                |
 
@@ -345,7 +345,8 @@ Previews a transaction the way `tx create` would build it — recipient, estimat
 ```bash
 nunchuk tx sign --wallet <id> --tx-id <txid>                             # auto-detect
 nunchuk tx sign --wallet <id> --tx-id <txid> --fingerprint <xfp>         # specific key
-nunchuk tx sign --wallet <id> --tx-id <txid> --xprv <extended-private-key>
+nunchuk tx sign --wallet <id> --tx-id <txid> --xprv-stdin < key.txt      # xprv from stdin
+nunchuk tx sign --wallet <id> --tx-id <txid> --yes                        # skip the [y/N] question
 nunchuk tx sign --wallet <id> --tx-id <txid> --preimage <32-byte-hex>    # miniscript hash preimage
 nunchuk tx sign --wallet <id> --tx-id <txid> --psbt <signed-psbt-base64> # merge signed PSBT
 ```
@@ -465,8 +466,14 @@ When the protocol is omitted, the CLI tries `ssl://` first, then `tcp://`, and o
 | Option                | Description                       |
 | --------------------- | --------------------------------- |
 | `--json`              | Output in JSON format             |
-| `--api-key <key>`     | Override stored API key           |
+| `--api-key <key>`     | Override stored API key (prefer the `NUNCHUK_API_KEY` environment variable) |
 | `--network <network>` | Override network for this command |
+
+## Secrets and Irreversible Actions
+
+API keys, seed phrases, extended private keys (`xprv`), and BIP39 passphrases should not be typed on the command line: arguments are visible to other processes, saved in shell history, and recorded by agent runtimes. Every command that needs one accepts it at a masked prompt, on standard input (`--api-key-stdin`, `--xprv-stdin`, `--mnemonic-stdin`, `--passphrase-stdin`, `key import --stdin`), from a file (`key import --file`), or, for the API key, from `NUNCHUK_API_KEY`. The old options still work; seed phrases, `xprv` values, and passphrases on the command line print a warning. `key generate` refuses to print seed words into a pipe unless `--show-mnemonic` is given.
+
+`tx sign` and `tx broadcast` print a summary of the transaction and, at a terminal, ask for confirmation. `--yes` skips the question; `NUNCHUK_REQUIRE_YES=1` makes `--yes` mandatory. Scripts and agents without a terminal see no prompt. See `docs/cli-reference.md`, "Secrets and the command line".
 
 ## Webhooks
 

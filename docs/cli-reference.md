@@ -38,7 +38,20 @@ Fields in `config.json`:
 - `mainnet.email` / `testnet.email` — Active user profile pointer for that network
 - `mainnet.electrumServer` / `testnet.electrumServer` — Optional custom Electrum endpoint override
 
-API key resolution order: `--api-key` flag > `NUNCHUK_API_KEY` env var > selected network profile.
+API key resolution order: `--api-key` flag > `NUNCHUK_API_KEY` environment variable > selected network profile. `nunchuk auth login` resolves the key it stores as `--api-key` > `--api-key-stdin` > `NUNCHUK_API_KEY` > masked prompt.
+
+## Secrets and the command line
+
+Four values are secrets: the API key, BIP39 seed phrases (mnemonics), extended private keys (`xprv`), and BIP39 passphrases. Command-line arguments are not a safe place for them: every process on the machine can read them (`ps`, `/proc/<pid>/cmdline`), the shell saves them in its history file, and agent runtimes record the whole command in their transcripts. Every command that takes a secret therefore offers safer channels, in order of preference:
+
+1. **Masked prompt.** Omit the value at an interactive terminal and type it when asked; keystrokes are not echoed or stored.
+2. **Standard input.** The `--<name>-stdin` options (`--api-key-stdin`, `--mnemonic-stdin`, `--xprv-stdin`, `--passphrase-stdin`, `key import --stdin`) read the value from a pipe or file redirect: `nunchuk key import --stdin < seed.txt`. Only the file name appears on the command line. When one command reads several values this way, the key material comes first and the passphrase second, one per line.
+3. **File.** `key import --file <path>` reads the words from a file that is never modified.
+4. **Environment variable.** `NUNCHUK_API_KEY` is honoured by every command, including `auth login`. It is hidden from other users' process listings but is plain text wherever it is defined and is inherited by every program started from the same shell, so load it from a secret store rather than typing it inline.
+
+The original options (`--api-key`, `--mnemonic`, `--xprv`, `--passphrase`, seed words after `key import`) keep working. When a seed phrase, `xprv`, or passphrase is passed on the command line, one warning line is printed to standard error; standard output and `--json` results are unchanged. The API key, which can be revoked and reissued from the developer portal, prints no warning.
+
+`key generate` prints seed words that must be backed up. When its standard output is not a terminal (a pipe, a file, an agent runtime) it refuses to generate unless `--show-mnemonic` is given, so no key is ever created without someone seeing its backup words.
 
 Network resolution order: `--network` flag > config file > `mainnet` default.
 
@@ -55,16 +68,25 @@ Manage authentication with the Nunchuk API.
 
 ### `nunchuk auth login`
 
-Authenticate with your API secret key. Use `--api-key <key>` for non-interactive login, or omit it to enter the key in the prompt. The key is validated by calling the Nunchuk API (`/v1.1/developer/me`), and the user's email, ID, and name are saved under the selected network in config. On first login for a given network, an ephemeral Curve25519 keypair is automatically generated and saved for that network. This keypair is used for end-to-end encryption of group wallet data.
+Authenticate with your API secret key. At a terminal, omit the key and type it at the masked prompt. For automation, pipe it in with `--api-key-stdin` or set `NUNCHUK_API_KEY`; the `--api-key` flag still works. When no key is given and standard input is not a terminal, the command exits 1 naming those alternatives. The key is validated by calling the Nunchuk API (`/v1.1/developer/me`), and the user's email, ID, and name are saved under the selected network in config. On first login for a given network, an ephemeral Curve25519 keypair is automatically generated and saved for that network. This keypair is used for end-to-end encryption of group wallet data.
 
 Running login again will update the selected network config but preserve that network's existing ephemeral keypair. Mainnet and testnet store separate API keys and separate ephemeral keypairs.
 
-```bash
-nunchuk auth login --api-key <api-secret-key>
+| Option            | Required | Description                                                      |
+| ----------------- | -------- | ---------------------------------------------------------------- |
+| `--api-key-stdin` | No       | Read the API secret key from the first line of standard input    |
 
-# Or interactive:
+```bash
+# Interactive (recommended for people):
 nunchuk auth login
 # Enter API secret key: ****
+
+# Automation: from a secret file or a secret store
+nunchuk auth login --api-key-stdin < api-key.txt
+NUNCHUK_API_KEY=... nunchuk auth login   # prints "Using API key from NUNCHUK_API_KEY." on stderr
+
+# Still supported; the key is visible to other processes and saved in shell history
+nunchuk auth login --api-key <api-secret-key>
 ```
 
 Output:
@@ -764,7 +786,8 @@ If enough signatures are collected, the server applies the policy change and del
 | `<wallet-id>`         | Yes      | Wallet ID                        |
 | `--dummy-tx-id <id>`  | Yes      | Dummy transaction ID             |
 | `--fingerprint <xfp>` | No       | Fingerprint of a stored key      |
-| `--xprv <xprv>`       | No       | Extended private key for signing |
+| `--xprv <xprv>`       | No       | Extended private key for signing (prints a warning; prefer `--xprv-stdin`) |
+| `--xprv-stdin`        | No       | Read the extended private key from the first line of standard input |
 
 ```bash
 # Auto-sign with all matching stored keys
@@ -775,9 +798,9 @@ nunchuk wallet dummy-tx sign w123 \
 nunchuk wallet dummy-tx sign w123 \
   --dummy-tx-id 694364702230188032 --fingerprint 73c5da0a
 
-# Or provide xprv directly
+# Or provide the xprv on standard input
 nunchuk wallet dummy-tx sign w123 \
-  --dummy-tx-id 694364702230188032 --xprv "tprv..."
+  --dummy-tx-id 694364702230188032 --xprv-stdin < key.txt
 ```
 
 ### `nunchuk wallet dummy-tx cancel <wallet-id>`
@@ -974,6 +997,8 @@ JSON mode returns `recipients` (`address`, `amount`, `receives` per recipient), 
 
 Sign a transaction. By default, this fetches the PSBT from the group server, signs matching inputs locally, and re-uploads the merged result. You can also pass `--psbt <base64>` to merge an externally signed PSBT into the current pending transaction. Upload only happens when the merge adds new data.
 
+**Signing is usually the point of no return.** Once the uploaded signatures reach the wallet threshold, any device on the wallet, or a Platform key policy with auto-broadcast, can broadcast without you. Before signing locally the command prints a summary (wallet, recipients, change, send amount, fee, signature count, and whether this signature completes the threshold). At an interactive terminal it then asks `Sign this transaction? [y/N]`; pass `--yes` to skip the question. From a script or agent (no terminal) there is no prompt and the command behaves as before. Set `NUNCHUK_REQUIRE_YES=1` to make `--yes` mandatory everywhere. In `--json` mode the output is unchanged and no summary is printed.
+
 **Taproot multisig (MuSig2) requires two signing rounds.** Taproot multisig uses `musig(...)` aggregates (on the key path, and — for wallets up to 5 signers — on the tapscript leaves too), so the spend goes through `PENDING_NONCE` → `PENDING_SIGNATURES` → `READY_TO_BROADCAST`. The first `tx sign` from a signer publishes its public nonce (the tx stays `PENDING_NONCE` until every required signer has contributed a nonce); running `tx sign` again produces that signer's partial signature. So with local keys you typically run `tx sign` twice. Taproot **miniscript** (`multi_a`), large taproot multisig that falls back to `sortedmulti_a`, and non-taproot wallets sign in a single pass per signer and do not use nonces.
 
 | Option                 | Required | Description                                                         |
@@ -982,8 +1007,10 @@ Sign a transaction. By default, this fetches the PSBT from the group server, sig
 | `--tx-id <tx-id>`      | Yes      | Transaction ID                                                      |
 | `--psbt <psbt>`        | No       | Signed PSBT to merge into the current pending transaction           |
 | `--fingerprint <xfp>`  | No       | Fingerprint of a stored key                                         |
-| `--xprv <xprv>`        | No       | Extended private key for signing                                    |
+| `--xprv <xprv>`        | No       | Extended private key for signing (prints a warning; prefer `--xprv-stdin`) |
+| `--xprv-stdin`         | No       | Read the extended private key from the first line of standard input |
 | `--preimage <hex>`     | No       | Attach a 32-byte miniscript hash preimage; repeat or comma-separate |
+| `-y, --yes`            | No       | Skip the confirmation prompt shown at an interactive terminal       |
 
 ```bash
 # Auto-sign with all matching stored keys
@@ -992,8 +1019,11 @@ nunchuk tx sign --wallet w123 --tx-id tx456
 # Sign with a specific stored key
 nunchuk tx sign --wallet w123 --tx-id tx456 --fingerprint 73c5da0a
 
-# Or provide xprv directly
-nunchuk tx sign --wallet w123 --tx-id tx456 --xprv "xprv..."
+# Or provide the xprv on standard input (never on the command line)
+nunchuk tx sign --wallet w123 --tx-id tx456 --xprv-stdin < key.txt
+
+# Skip the terminal confirmation after the details were reviewed
+nunchuk tx sign --wallet w123 --tx-id tx456 --yes
 
 # Attach required miniscript hash preimages
 nunchuk tx sign --wallet w123 --tx-id tx456 --preimage <32-byte-hex>
@@ -1039,17 +1069,19 @@ nunchuk tx import --wallet w123 --file payout.psbt --json
 
 ### `nunchuk tx broadcast`
 
-Broadcast a fully signed transaction to the network.
+Broadcast a fully signed transaction to the network. Broadcasting cannot be undone: the command first prints a summary (wallet, recipients, change, send amount, fee, signatures) and, at an interactive terminal, asks `Broadcast this transaction? [y/N]`. Pass `--yes` to skip the question. From a script or agent there is no prompt. `NUNCHUK_REQUIRE_YES=1` makes `--yes` mandatory. In `--json` mode the output is unchanged and no summary is printed.
 
-| Option                 | Required | Description    |
-| ---------------------- | -------- | -------------- |
-| `--wallet <wallet-id>` | Yes      | Wallet ID      |
-| `--tx-id <tx-id>`      | Yes      | Transaction ID |
+| Option                 | Required | Description                                                   |
+| ---------------------- | -------- | ------------------------------------------------------------- |
+| `--wallet <wallet-id>` | Yes      | Wallet ID                                                     |
+| `--tx-id <tx-id>`      | Yes      | Transaction ID                                                |
+| `-y, --yes`            | No       | Skip the confirmation prompt shown at an interactive terminal |
 
 If the transaction has a pending change-tag intent (see `tx create --change-tags`), the broadcast applies it to the change coin immediately. This is an optimization — transactions broadcast elsewhere (mobile app, backend auto-broadcast) are reconciled at the next coin scan.
 
 ```bash
-nunchuk tx broadcast --wallet w123 --tx-id tx456
+nunchuk tx broadcast --wallet w123 --tx-id tx456          # asks [y/N] at a terminal
+nunchuk tx broadcast --wallet w123 --tx-id tx456 --yes    # no question
 ```
 
 ### `nunchuk tx list`
@@ -1196,16 +1228,18 @@ Generate and manage software signing keys (BIP39 mnemonics).
 
 ### `nunchuk key generate`
 
-Generate a new BIP39 mnemonic and save to local storage. The mnemonic is displayed once — back it up securely.
+Generate a new BIP39 mnemonic and save to local storage. The mnemonic is displayed once — back it up securely. Because that display is the only chance to back the key up, the command refuses to run when standard output is not a terminal (a pipe, a file redirect, an agent runtime) unless `--show-mnemonic` is given; nothing is created when it refuses.
 
-| Option            | Required | Default     | Description                |
-| ----------------- | -------- | ----------- | -------------------------- |
-| `--name <name>`   | No       | `My key #N` | Name for the key           |
-| `--words <count>` | No       | `24`        | Number of words (12 or 24) |
+| Option            | Required | Default     | Description                                                      |
+| ----------------- | -------- | ----------- | ---------------------------------------------------------------- |
+| `--name <name>`   | No       | `My key #N` | Name for the key                                                 |
+| `--words <count>` | No       | `24`        | Number of words (12 or 24)                                       |
+| `--show-mnemonic` | No       | —           | Print the seed words even when output is not a terminal          |
 
 ```bash
 nunchuk key generate
 nunchuk key generate --name "Alice" --words 12
+nunchuk key generate --json --show-mnemonic > key.json   # piped output needs the opt-in
 ```
 
 Output:
@@ -1222,20 +1256,26 @@ Key saved to local storage.
 
 ### `nunchuk key import`
 
-Import an existing BIP39 mnemonic and save it to local encrypted storage. The mnemonic is not printed after import.
+Import an existing BIP39 mnemonic and save it to local encrypted storage. The mnemonic is not printed after import. Give the words in exactly one way: at the masked prompt (omit them at a terminal), on standard input (`--stdin`), from a file (`--file`), or as arguments. Arguments still work but print a warning on standard error, because they end up in shell history and process listings.
 
-| Argument        | Required | Description                                           |
-| --------------- | -------- | ----------------------------------------------------- |
-| `<bip39 words>` | Yes      | BIP39 mnemonic words, quoted or space-separated       |
+| Argument        | Required | Description                                                         |
+| --------------- | -------- | ------------------------------------------------------------------- |
+| `[bip39 words]` | No       | BIP39 mnemonic words, quoted or space-separated (prints a warning) |
 
-| Option          | Required | Default     | Description      |
-| --------------- | -------- | ----------- | ---------------- |
-| `--name <name>` | No       | `My key #N` | Name for the key |
+| Option          | Required | Default     | Description                                            |
+| --------------- | -------- | ----------- | ------------------------------------------------------ |
+| `--name <name>` | No       | `My key #N` | Name for the key                                       |
+| `--stdin`       | No       | —           | Read the mnemonic from the first line of standard input |
+| `--file <path>` | No       | —           | Read the mnemonic from a file (the file is not changed) |
 
 ```bash
-nunchuk key import --name "Alice Backup" "abandon abandon abandon ... about"
-nunchuk key import abandon abandon abandon ... about
+nunchuk key import --name "Alice Backup"          # Enter seed words: (not echoed)
+nunchuk key import --stdin < seed.txt
+nunchuk key import --file seed.txt
+nunchuk key import abandon abandon abandon ... about   # works; warns on stderr
 ```
+
+From a pipe with no `--stdin` or `--file`, the command fails with `MISSING_PARAM`.
 
 If the imported mnemonic derives to a fingerprint that already exists locally, the command fails with `ALREADY_EXISTS` and leaves the stored key unchanged. Stored imports use the standard empty BIP39 passphrase; passphrase-protected derivation remains available through `nunchuk key info --mnemonic ... --passphrase ...`.
 
@@ -1256,11 +1296,15 @@ Derive signer info (fingerprint, path, xpub, descriptor) from a stored key, mnem
 | `--fingerprint <xfp>`       | Conditionally | —               | Fingerprint of a stored key                       |
 | `--mnemonic <words>`        | Conditionally | —               | BIP39 mnemonic (wrap in quotes)                   |
 | `--xprv <xprv>`             | Conditionally | —               | BIP32 master extended private key                 |
-| `--passphrase <passphrase>` | No            | —               | BIP39 passphrase (only with --mnemonic)           |
+| `--passphrase <passphrase>` | No            | —               | BIP39 passphrase (only with a mnemonic)           |
+| `--mnemonic-stdin`          | Conditionally | —               | Read the mnemonic from standard input (line 1)    |
+| `--xprv-stdin`              | Conditionally | —               | Read the master xprv from standard input (line 1) |
+| `--passphrase-stdin`        | No            | —               | Read the passphrase from standard input (line 2 when the key also comes from stdin, else line 1) |
+| `--passphrase-prompt`       | No            | —               | Ask for the passphrase at a masked prompt (terminal only) |
 | `--address-type <type>`     | No            | `NATIVE_SEGWIT` | Address type for derivation                       |
 | `--path <path>`             | No            | —               | Custom derivation path (overrides --address-type) |
 
-Provide exactly one of `--fingerprint`, `--mnemonic`, or `--xprv`.
+Provide exactly one key source: `--fingerprint`, `--mnemonic`, `--mnemonic-stdin`, `--xprv`, or `--xprv-stdin`. At a terminal with no source given, the command asks for the seed words at a masked prompt. Give the passphrase in at most one way. `--passphrase-prompt` cannot be combined with any `-stdin` option, because the pipe has taken standard input. `--mnemonic`, `--xprv`, and `--passphrase` on the command line print one combined warning on standard error.
 
 ```bash
 # Derive from a stored key
@@ -1272,8 +1316,14 @@ nunchuk key info --fingerprint 73c5da0a --address-type TAPROOT
 # Derive from a provided mnemonic
 nunchuk key info --mnemonic "abandon abandon abandon ... about"
 
-# Derive from a mnemonic with passphrase
+# Derive from a mnemonic with passphrase (both on the command line: works, warns)
 nunchuk key info --mnemonic "abandon ..." --passphrase "secret"
+
+# Same, without anything on the command line: line 1 = words, line 2 = passphrase
+printf '%s\n%s\n' "abandon ..." "secret" | nunchuk key info --mnemonic-stdin --passphrase-stdin
+
+# At a terminal: asks for the seed words, then the passphrase
+nunchuk key info --passphrase-prompt
 
 # Derive at a custom path (h hardened suffixes are accepted)
 nunchuk key info --fingerprint 73c5da0a --path "m/48'/0'/1'/2'"

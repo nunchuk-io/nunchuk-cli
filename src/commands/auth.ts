@@ -13,49 +13,41 @@ import {
 import { generateKeypair } from "../core/crypto.js";
 import { ApiClient } from "../core/api-client.js";
 import { print, printError } from "../output.js";
-
-async function promptSecret(prompt: string): Promise<string> {
-  process.stdout.write(prompt);
-  return new Promise((resolve) => {
-    const stdin = process.stdin;
-    const wasRaw = stdin.isRaw;
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding("utf-8");
-
-    let input = "";
-    const onData = (ch: string) => {
-      if (ch === "\r" || ch === "\n") {
-        stdin.setRawMode(wasRaw ?? false);
-        stdin.pause();
-        stdin.removeListener("data", onData);
-        process.stdout.write("\n");
-        resolve(input.trim());
-      } else if (ch === "\u007F" || ch === "\b") {
-        // backspace
-        if (input.length > 0) {
-          input = input.slice(0, -1);
-        }
-      } else if (ch === "\u0003") {
-        // Ctrl+C
-        process.exit(0);
-      } else {
-        input += ch;
-      }
-    };
-    stdin.on("data", onData);
-  });
-}
+import { isInteractiveInput, promptSecret, readStdinLines } from "../core/prompt.js";
 
 export const authCommand = new Command("auth").description("Authenticate with the Nunchuk API");
 
 authCommand
   .command("login")
   .description("Login with API secret key")
-  .action(async (_options, cmd) => {
+  .option("--api-key-stdin", "Read the API secret key from the first line of standard input")
+  .action(async (options, cmd) => {
     try {
       const globals = cmd.optsWithGlobals();
-      const apiKey = globals.apiKey || (await promptSecret("Enter API secret key: "));
+      // Resolution order: --api-key flag > --api-key-stdin > NUNCHUK_API_KEY > masked prompt.
+      // The flag stays first so existing automation sees no change.
+      let apiKey: string | undefined = globals.apiKey;
+      if (!apiKey && options.apiKeyStdin) {
+        apiKey = (await readStdinLines(1))[0];
+      }
+      if (!apiKey && process.env.NUNCHUK_API_KEY) {
+        apiKey = process.env.NUNCHUK_API_KEY;
+        console.error("Using API key from NUNCHUK_API_KEY.");
+      }
+      if (!apiKey) {
+        if (!isInteractiveInput()) {
+          printError(
+            {
+              error: "NOT_INTERACTIVE",
+              message:
+                "No API key given and standard input is not a terminal. Use --api-key-stdin, set NUNCHUK_API_KEY, or run at a terminal.",
+            },
+            cmd,
+          );
+          return;
+        }
+        apiKey = await promptSecret("Enter API secret key: ");
+      }
       if (!apiKey) {
         printError({ error: "INVALID_KEY", message: "API key cannot be empty" }, cmd);
         return;
