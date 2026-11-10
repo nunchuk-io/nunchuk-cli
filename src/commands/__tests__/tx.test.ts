@@ -4,6 +4,7 @@ import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WalletData } from "../../core/storage.js";
+import { descriptorChecksum } from "../../core/descriptor.js";
 
 const {
   mockCombinePendingPsbt,
@@ -25,7 +26,23 @@ const {
   mockReadPsbtFile,
   mockRemoveMusigNonce,
   mockUploadTransaction,
+  mockDeleteTransaction,
+  mockElectrumBroadcast,
+  mockElectrumConnect,
+  mockIsInteractiveInput,
+  mockPromptYesNo,
+  mockResolveSignerKeys,
+  mockResolveXprvOption,
+  mockSignWithKey,
 } = vi.hoisted(() => ({
+  mockSignWithKey: vi.fn(),
+  mockDeleteTransaction: vi.fn(),
+  mockElectrumBroadcast: vi.fn(),
+  mockElectrumConnect: vi.fn(),
+  mockIsInteractiveInput: vi.fn(() => false),
+  mockPromptYesNo: vi.fn(),
+  mockResolveSignerKeys: vi.fn(),
+  mockResolveXprvOption: vi.fn(async (o: { xprv?: string }) => ({ xprv: o.xprv })),
   mockCombinePendingPsbt: vi.fn(),
   mockCreateTransaction: vi.fn(),
   mockDecodePsbtDetail: vi.fn(),
@@ -93,6 +110,21 @@ vi.mock("../../core/change-intents.js", () => ({
   storeChangeTagIntent: mockStoreChangeTagIntent,
 }));
 
+vi.mock("../../core/psbt-sign.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../core/psbt-sign.js")>()),
+  signWalletPsbtWithKey: mockSignWithKey,
+}));
+
+vi.mock("../../core/signer-key.js", () => ({
+  resolveSignerKeys: mockResolveSignerKeys,
+}));
+
+vi.mock("../../core/prompt.js", () => ({
+  isInteractiveInput: mockIsInteractiveInput,
+  promptYesNo: mockPromptYesNo,
+  resolveXprvOption: mockResolveXprvOption,
+}));
+
 vi.mock("../../core/psbt-import.js", () => ({
   importPsbt: mockImportPsbt,
   readPsbtFile: mockReadPsbtFile,
@@ -101,8 +133,9 @@ vi.mock("../../core/psbt-import.js", () => ({
 vi.mock("../../core/electrum.js", () => ({
   ElectrumClient: vi.fn(
     class MockElectrumClient {
+      broadcast = mockElectrumBroadcast;
       close = vi.fn();
-      connect = vi.fn();
+      connect = mockElectrumConnect;
       headersSubscribe = mockHeadersSubscribe;
       serverVersion = vi.fn();
     },
@@ -116,7 +149,7 @@ vi.mock("../../core/transaction.js", () => ({
   combinePendingPsbt: mockCombinePendingPsbt,
   createTransaction: mockCreateTransaction,
   decodePsbtDetail: mockDecodePsbtDetail,
-  deleteTransaction: vi.fn(),
+  deleteTransaction: mockDeleteTransaction,
   fetchConfirmedTransactions: vi.fn(),
   fetchPendingTransaction: mockFetchPendingTransaction,
   fetchPendingTransactions: vi.fn(),
@@ -1957,4 +1990,296 @@ describe("tx create / tx draft with multiple recipients", () => {
     );
     expect(mockCreateTransaction).not.toHaveBeenCalled();
   });
+});
+
+describe("tx sign confirmation gate", () => {
+  // The signed-already check parses the wallet descriptor, which needs its checksum.
+  const SIGN_WALLET: WalletData = {
+    ...TEST_WALLET,
+    descriptor: `${TEST_WALLET.descriptor}#${descriptorChecksum(TEST_WALLET.descriptor)}`,
+  };
+  const DETAIL = {
+    fee: "308 sat",
+    feeBtc: "0.00000308 BTC",
+    outputs: [
+      {
+        address: "bc1qrecipient",
+        amount: "20000000 sat",
+        amountBtc: "0.20000000 BTC",
+        isChange: false,
+      },
+      { address: "bc1qchange", amount: "5000000 sat", amountBtc: "0.05000000 BTC", isChange: true },
+    ],
+    requiredCount: 1,
+    signers: { "6cbbb5d0": false },
+    signedCount: 0,
+    status: "PENDING_SIGNATURES",
+    subAmount: "20000000 sat",
+    subAmountBtc: "0.20000000 BTC",
+    txId: "tx-id",
+  };
+  const envBackup = process.env.NUNCHUK_REQUIRE_YES;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    delete process.env.NUNCHUK_REQUIRE_YES;
+    mockIsInteractiveInput.mockReturnValue(false);
+    mockResolveXprvOption.mockImplementation(async (o: { xprv?: string }) => ({ xprv: o.xprv }));
+    mockLoadWallet.mockReturnValue(SIGN_WALLET);
+    mockFetchPendingTransaction.mockResolvedValue({ psbt: TEST_PSBT_B64, txId: "tx-id" });
+    mockDecodePsbtDetail.mockReturnValue(DETAIL);
+    mockCombinePendingPsbt.mockReturnValue({ changed: true, psbtB64: TEST_PSBT_B64 });
+    mockResolveSignerKeys.mockReturnValue({
+      matched: [{ signerKey: {}, signerXfp: "6cbbb5d0", keyName: "Key A" }],
+    });
+  });
+
+  afterEach(() => {
+    if (envBackup === undefined) delete process.env.NUNCHUK_REQUIRE_YES;
+    else process.env.NUNCHUK_REQUIRE_YES = envBackup;
+    vi.restoreAllMocks();
+  });
+
+  async function runSign(extra: string[] = []): Promise<void> {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.option("--json", "Output in JSON format");
+    root.addCommand(txCommand);
+    await root.parseAsync(["tx", "sign", "--wallet", "jk74e3up", "--tx-id", "tx-id", ...extra], {
+      from: "user",
+    });
+  }
+
+  it("shows the decoded summary and stops without signing when the user answers no", async () => {
+    mockIsInteractiveInput.mockReturnValue(true);
+    mockPromptYesNo.mockResolvedValue("no");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runSign();
+
+    const output = logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Wallet:      Wallet 1 (0-of-1)");
+    expect(output).toContain("  bc1qrecipient  0.20000000 BTC (20000000 sat)");
+    expect(output).toContain("Change:      bc1qchange  0.05000000 BTC (5000000 sat)");
+    expect(output).toContain("Fee:         0.00000308 BTC (308 sat)");
+    expect(output).toContain("Signatures:  0/1 — this signature completes the threshold");
+    expect(output).toContain("Not signed.");
+    expect(mockPromptYesNo).toHaveBeenCalledWith("Sign this transaction? [y/N] ");
+    expect(mockCombinePendingPsbt).not.toHaveBeenCalled();
+    expect(mockUploadTransaction).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("signs without any prompt when standard input is not a terminal", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runSign();
+
+    expect(mockPromptYesNo).not.toHaveBeenCalled();
+    expect(mockSignWithKey).toHaveBeenCalledTimes(1);
+    expect(mockUploadTransaction).toHaveBeenCalledWith(
+      expect.anything(),
+      SIGN_WALLET,
+      TEST_PSBT_B64,
+      "tx-id",
+    );
+  }, 20_000);
+
+  it("signs without a prompt at a terminal when --yes is given", async () => {
+    mockIsInteractiveInput.mockReturnValue(true);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runSign(["--yes"]);
+
+    expect(mockPromptYesNo).not.toHaveBeenCalled();
+    expect(mockSignWithKey).toHaveBeenCalledTimes(1);
+    // The summary is still printed in text mode so the person sees what was signed.
+    expect(logSpy.mock.calls.flat().join("\n")).toContain("Wallet:      Wallet 1 (0-of-1)");
+  }, 20_000);
+
+  it("prints no summary and asks nothing in --json mode", async () => {
+    mockIsInteractiveInput.mockReturnValue(true);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runSign(["--json"]);
+
+    expect(mockPromptYesNo).not.toHaveBeenCalled();
+    expect(mockSignWithKey).toHaveBeenCalledTimes(1);
+    const printed = logSpy.mock.calls.flat().join("\n");
+    expect(printed).not.toContain("Wallet:");
+    expect(JSON.parse(printed)).toEqual(
+      expect.objectContaining({ txId: "tx-id", updated: true, status: "PENDING_SIGNATURES" }),
+    );
+  }, 20_000);
+
+  it("refuses without --yes when NUNCHUK_REQUIRE_YES=1, even from a pipe", async () => {
+    process.env.NUNCHUK_REQUIRE_YES = "1";
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    await expect(runSign()).rejects.toThrow("process.exit");
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errSpy.mock.calls.flat().join("\n")).toContain(
+      "Re-run with --yes after the user has confirmed these details.",
+    );
+    expect(mockUploadTransaction).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("passes the key from --xprv-stdin to the signer resolver", async () => {
+    mockResolveXprvOption.mockResolvedValue({ xprv: "xprv-from-stdin" });
+    mockIsInteractiveInput.mockReturnValue(true);
+    mockPromptYesNo.mockResolvedValue("no");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runSign(["--xprv-stdin"]);
+
+    expect(mockResolveXprvOption).toHaveBeenCalledWith(
+      expect.objectContaining({ xprvStdin: true }),
+    );
+    expect(mockResolveSignerKeys).toHaveBeenCalledWith(
+      { xprv: "xprv-from-stdin", fingerprint: undefined },
+      "user@example.com",
+      "mainnet",
+      SIGN_WALLET.signers,
+    );
+  }, 20_000);
+
+  it("rejects --psbt together with --xprv-stdin", async () => {
+    mockResolveXprvOption.mockResolvedValue({ xprv: "xprv-from-stdin" });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    await expect(runSign(["--psbt", TEST_PSBT_B64, "--xprv-stdin"])).rejects.toThrow(
+      "process.exit",
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(mockUploadTransaction).not.toHaveBeenCalled();
+  }, 20_000);
+});
+
+describe("tx broadcast confirmation gate", () => {
+  const DETAIL = {
+    fee: "308 sat",
+    feeBtc: "0.00000308 BTC",
+    outputs: [
+      {
+        address: "bc1qrecipient",
+        amount: "20000000 sat",
+        amountBtc: "0.20000000 BTC",
+        isChange: false,
+      },
+    ],
+    requiredCount: 1,
+    signers: { "6cbbb5d0": true },
+    signedCount: 1,
+    status: "READY_TO_BROADCAST",
+    subAmount: "20000000 sat",
+    subAmountBtc: "0.20000000 BTC",
+    txId: "tx-id",
+  };
+  const envBackup = process.env.NUNCHUK_REQUIRE_YES;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.resetModules();
+    delete process.env.NUNCHUK_REQUIRE_YES;
+    mockIsInteractiveInput.mockReturnValue(false);
+    mockLoadWallet.mockReturnValue(TEST_WALLET);
+    mockFetchPendingTransaction.mockResolvedValue({ psbt: TEST_PSBT_B64, txId: "tx-id" });
+    mockDecodePsbtDetail.mockReturnValue(DETAIL);
+  });
+
+  afterEach(() => {
+    if (envBackup === undefined) delete process.env.NUNCHUK_REQUIRE_YES;
+    else process.env.NUNCHUK_REQUIRE_YES = envBackup;
+    vi.restoreAllMocks();
+  });
+
+  async function runBroadcast(extra: string[] = []): Promise<void> {
+    const { txCommand } = await import("../tx.js");
+    const root = new Command();
+    root.exitOverride();
+    root.option("--json", "Output in JSON format");
+    root.addCommand(txCommand);
+    await root.parseAsync(
+      ["tx", "broadcast", "--wallet", "jk74e3up", "--tx-id", "tx-id", ...extra],
+      { from: "user" },
+    );
+  }
+
+  it("shows the summary and sends nothing when the user answers no", async () => {
+    mockIsInteractiveInput.mockReturnValue(true);
+    mockPromptYesNo.mockResolvedValue("no");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runBroadcast();
+
+    const output = logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Recipient:");
+    expect(output).toContain("  bc1qrecipient  0.20000000 BTC (20000000 sat)");
+    expect(output).toContain("Signatures:  1/1");
+    expect(output).not.toContain("completes the threshold");
+    expect(output).toContain("Not broadcast.");
+    expect(mockPromptYesNo).toHaveBeenCalledWith("Broadcast this transaction? [y/N] ");
+    expect(mockElectrumConnect).not.toHaveBeenCalled();
+    expect(mockElectrumBroadcast).not.toHaveBeenCalled();
+    expect(mockDeleteTransaction).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("fails with CONFIRMATION_TIMEOUT when nobody answers", async () => {
+    mockIsInteractiveInput.mockReturnValue(true);
+    mockPromptYesNo.mockResolvedValue("timeout");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    await expect(runBroadcast()).rejects.toThrow("process.exit");
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errSpy.mock.calls.flat().join("\n")).toContain(
+      "No confirmation received; re-run with --yes.",
+    );
+    expect(mockElectrumBroadcast).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("refuses without --yes when NUNCHUK_REQUIRE_YES=1 and prints a JSON error in --json mode", async () => {
+    process.env.NUNCHUK_REQUIRE_YES = "1";
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    await expect(runBroadcast(["--json"])).rejects.toThrow("process.exit");
+
+    expect(JSON.parse(String(errSpy.mock.calls[0][0]))).toEqual({
+      error: "CONFIRMATION_REQUIRED",
+      message: "Re-run with --yes after the user has confirmed these details.",
+    });
+    expect(vi.mocked(console.log)).not.toHaveBeenCalled(); // no summary in --json mode
+    expect(mockElectrumBroadcast).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("does not prompt and prints no summary in --json mode from a pipe", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+
+    // Finalizing the fixture PSBT fails later; what matters is what happened before that.
+    await runBroadcast(["--json"]).catch(() => undefined);
+
+    expect(mockPromptYesNo).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain("Wallet:");
+  }, 20_000);
 });

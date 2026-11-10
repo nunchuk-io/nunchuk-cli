@@ -92,7 +92,9 @@ export function resolveSignerKeys(
   // Mode 3: auto-detect from all stored keys
   const storedKeys = listKeys(email, network);
   if (storedKeys.length === 0) {
-    return { error: "No stored keys. Please provide --xprv" };
+    return {
+      error: "No stored keys. Import one with `nunchuk key import`, or provide --xprv-stdin",
+    };
   }
 
   const matched: MatchedSignerKey[] = [];
@@ -106,7 +108,10 @@ export function resolveSignerKeys(
   }
 
   if (matched.length === 0) {
-    return { error: "No stored key matches any signer in this wallet. Please provide --xprv" };
+    return {
+      error:
+        "No stored key matches any signer in this wallet. Import the matching key with `nunchuk key import`, or provide --xprv-stdin",
+    };
   }
 
   return { matched };

@@ -289,6 +289,10 @@ describe("change-tag intent reconciliation (scan time)", () => {
     bootstrap(email);
     createTag(email, NET, WALLET_ID, "old");
     createTag(email, NET, WALLET_ID, "new");
+    // Relative dates: intents older than the 90-day retention window are pruned
+    // before matching, so fixed dates would make this test expire.
+    const daysAgo = (n: number): string =>
+      new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
     mutateCoinControl(email, NET, WALLET_ID, (doc) => {
       const idOf = (name: string): number => doc.tags.find((t) => t.name === name)!.id;
       doc.changeTagIntents.push(
@@ -296,13 +300,13 @@ describe("change-tag intent reconciliation (scan time)", () => {
           address: CHANGE_ADDR,
           amount: "1000",
           tagIds: [idOf("old")],
-          createdAt: "2026-07-01T00:00:00.000Z",
+          createdAt: daysAgo(2),
         },
         {
           address: CHANGE_ADDR,
           amount: "2000",
           tagIds: [idOf("new")],
-          createdAt: "2026-07-02T00:00:00.000Z",
+          createdAt: daysAgo(1),
         },
       );
     });

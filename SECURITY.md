@@ -7,6 +7,10 @@ Only the latest release receives security fixes.
 Please upgrade to the newest version (`npm install -g nunchuk-cli@latest`)
 and confirm the issue still exists before reporting.
 
+## Scope
+
+The CLI cannot protect values passed as command-line arguments; they are visible to other local processes and to shell history. Safer input channels are documented in `docs/cli-reference.md` under "Secrets and the command line".
+
 ## Reporting a Vulnerability
 
 Please do NOT report security vulnerabilities through public GitHub issues,

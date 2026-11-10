@@ -85,7 +85,8 @@ import {
   normalizeCurrency,
   type MarketRates,
 } from "../core/currency.js";
-import { print, printError, toCliError } from "../output.js";
+import { print, printError, printTxSummary, toCliError } from "../output.js";
+import { isInteractiveInput, promptYesNo, resolveXprvOption } from "../core/prompt.js";
 
 function parseMiniscriptPathOption(value: string): number {
   const parsed = Number(value);
@@ -436,6 +437,43 @@ function getGlobals(cmd: Command): { apiKey: string; network: Network; email: st
     network: getNetwork(globals.network),
     email: requireEmail(globals.network),
   };
+}
+
+// Gate for the irreversible steps (signing, broadcasting). Returns true when the
+// command may proceed. `--yes` always proceeds. NUNCHUK_REQUIRE_YES=1 makes
+// `--yes` mandatory. Otherwise a human at a terminal is asked; a script or agent
+// (no terminal) proceeds as before. In --json mode nothing is printed to stdout.
+async function confirmIrreversible(
+  question: string,
+  yes: boolean | undefined,
+  cmd: Command,
+  declinedMessage: string,
+): Promise<boolean> {
+  if (yes) return true;
+  if (process.env.NUNCHUK_REQUIRE_YES === "1") {
+    printError(
+      {
+        error: "CONFIRMATION_REQUIRED",
+        message: "Re-run with --yes after the user has confirmed these details.",
+      },
+      cmd,
+    );
+    return false;
+  }
+  if (!isInteractiveInput() || cmd.optsWithGlobals().json) return true;
+  const answer = await promptYesNo(`${question} [y/N] `);
+  if (answer === "timeout") {
+    printError(
+      { error: "CONFIRMATION_TIMEOUT", message: "No confirmation received; re-run with --yes." },
+      cmd,
+    );
+    return false;
+  }
+  if (answer === "no") {
+    console.log(declinedMessage);
+    return false;
+  }
+  return true;
 }
 
 function requireWallet(email: string, network: Network, walletId: string): WalletData {
@@ -1176,6 +1214,7 @@ txCommand
   .requiredOption("--tx-id <tx-id>", "Transaction ID")
   .option("--psbt <psbt>", "Signed PSBT to merge into the current pending transaction")
   .option("--xprv <xprv>", "Extended private key for signing")
+  .option("--xprv-stdin", "Read the extended private key from the first line of standard input")
   .option("--fingerprint <xfp>", "Fingerprint of a stored key")
   .option(
     "--preimage <hex>",
@@ -1183,26 +1222,34 @@ txCommand
     parsePreimageOption,
     [],
   )
+  .option("-y, --yes", "Skip the confirmation prompt shown at an interactive terminal")
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
       const wallet = requireWallet(email, network, options.wallet);
       const client = new ApiClient(apiKey, network);
 
+      const xprvResolved = await resolveXprvOption(options);
+      if ("error" in xprvResolved) {
+        printError({ error: "INVALID_PARAM", message: xprvResolved.error }, cmd);
+        return;
+      }
+      const xprv = xprvResolved.xprv;
+
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
       let nextPsbtB64: string;
       const hasPreimages = Array.isArray(options.preimage) && options.preimage.length > 0;
-      const hasExplicitSigner = Boolean(options.xprv || options.fingerprint);
+      const hasExplicitSigner = Boolean(xprv || options.fingerprint);
       const wantsLocalSigning = !options.psbt && (hasExplicitSigner || !hasPreimages);
       let didAddPreimages = false;
       let didLocalSign = false;
 
       if (options.psbt) {
-        if (options.xprv || options.fingerprint) {
+        if (xprv || options.fingerprint) {
           printError(
             {
               error: "INVALID_PARAM",
-              message: "--psbt cannot be used with --xprv or --fingerprint",
+              message: "--psbt cannot be used with --xprv, --xprv-stdin, or --fingerprint",
             },
             cmd,
           );
@@ -1221,7 +1268,12 @@ txCommand
           allowUnknown: true,
         });
         if (wantsLocalSigning) {
-          const resolved = resolveSignerKeys(options, email, network, wallet.signers);
+          const resolved = resolveSignerKeys(
+            { xprv, fingerprint: options.fingerprint },
+            email,
+            network,
+            wallet.signers,
+          );
           if ("error" in resolved) {
             printError({ error: "INVALID_PARAM", message: resolved.error }, cmd);
             return;
@@ -1237,6 +1289,31 @@ txCommand
               .join(", ");
             printError({ error: "ALREADY_SIGNED", message: `Already signed by: ${names}` }, cmd);
             return;
+          }
+
+          // Signing is the point of no return once enough signatures exist: the
+          // upload lets any device, or an auto-broadcast Platform key, broadcast.
+          // Show what is about to be signed and, at a terminal, ask first.
+          if (toSign.length > 0) {
+            if (!cmd.optsWithGlobals().json) {
+              const preview = decodePsbtDetail(
+                pendingTx.psbt,
+                network,
+                wallet.m,
+                wallet.signers,
+                wallet.descriptor,
+              );
+              if (preview) {
+                printTxSummary(preview, wallet, { signaturesToAdd: toSign.length });
+              }
+            }
+            const proceed = await confirmIrreversible(
+              "Sign this transaction?",
+              options.yes,
+              cmd,
+              "Not signed.",
+            );
+            if (!proceed) return;
           }
 
           for (const matched of toSign) {
@@ -1468,6 +1545,7 @@ txCommand
   .description("Broadcast a fully signed transaction")
   .requiredOption("--wallet <wallet-id>", "Wallet ID")
   .requiredOption("--tx-id <tx-id>", "Transaction ID")
+  .option("-y, --yes", "Skip the confirmation prompt shown at an interactive terminal")
   .action(async (options, cmd) => {
     try {
       const { apiKey, network, email } = getGlobals(cmd);
@@ -1475,6 +1553,29 @@ txCommand
       const client = new ApiClient(apiKey, network);
 
       const pendingTx = await fetchPendingTransaction(client, wallet, options.txId);
+
+      // Broadcasting cannot be undone. Show the decoded transaction and, at a
+      // terminal, ask before touching the network.
+      if (!cmd.optsWithGlobals().json) {
+        const preview = decodePsbtDetail(
+          pendingTx.psbt,
+          network,
+          wallet.m,
+          wallet.signers,
+          wallet.descriptor,
+        );
+        if (preview) {
+          printTxSummary(preview, wallet);
+        }
+      }
+      const proceed = await confirmIrreversible(
+        "Broadcast this transaction?",
+        options.yes,
+        cmd,
+        "Not broadcast.",
+      );
+      if (!proceed) return;
+
       const tx = Transaction.fromPSBT(Buffer.from(pendingTx.psbt, "base64"), {
         allowUnknown: true,
       });

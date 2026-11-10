@@ -23,6 +23,7 @@ import {
 } from "../core/storage.js";
 import type { WalletData } from "../core/storage.js";
 import { print, printError, printTable, printSandboxResult, printWalletResult } from "../output.js";
+import { resolveXprvOption } from "../core/prompt.js";
 import {
   buildWalletDescriptorForParsed,
   buildExternalDescriptorForParsed,
@@ -900,6 +901,7 @@ dummyTxCommand
   .argument("<wallet-id>", "Wallet ID")
   .requiredOption("--dummy-tx-id <id>", "Dummy transaction ID")
   .option("--xprv <xprv>", "Extended private key for signing")
+  .option("--xprv-stdin", "Read the extended private key from the first line of standard input")
   .option("--fingerprint <xfp>", "Fingerprint of a stored key")
   .action(async (walletId, options, cmd) => {
     try {
@@ -907,7 +909,17 @@ dummyTxCommand
       const wallet = requireWallet(email, network, walletId);
       const client = new ApiClient(apiKey, network);
 
-      const resolved = resolveSignerKeys(options, email, network, wallet.signers);
+      const xprvResolved = await resolveXprvOption(options);
+      if ("error" in xprvResolved) {
+        printError({ error: "INVALID_PARAM", message: xprvResolved.error }, cmd);
+        return;
+      }
+      const resolved = resolveSignerKeys(
+        { xprv: xprvResolved.xprv, fingerprint: options.fingerprint },
+        email,
+        network,
+        wallet.signers,
+      );
       if ("error" in resolved) {
         printError({ error: "INVALID_PARAM", message: resolved.error }, cmd);
         return;
